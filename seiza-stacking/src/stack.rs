@@ -516,6 +516,7 @@ pub struct LiveStacker {
     pub(crate) reference: LinearImage,
     reference_metadata: FrameMetadata,
     pub(crate) registrar: Registrar,
+    alignment_reference: Option<LinearImage>,
     /// Per-channel noise of the reference frame, the unit of frame weights.
     /// Empty when frames are weighted equally.
     reference_noise: Vec<f32>,
@@ -533,28 +534,30 @@ pub struct LiveStacker {
     /// The Bayer layout the reference was demosaiced from, when this stack
     /// prepared it; a stack reopened from a context does not know it.
     pub(crate) reference_cfa: Option<BayerLayout>,
+    /// Whether the prepared reference is also the first admitted image.
+    pub(crate) reference_is_integrated: bool,
+}
+
+enum ReferenceContribution {
+    Integrated(Option<BayerLayout>),
+    External {
+        image: LinearImage,
+        registrar: Box<Registrar>,
+        noise: Vec<f32>,
+    },
 }
 
 impl LiveStacker {
     /// Start a stack from a reference FITS frame, calibrating and preparing it
     /// as the immutable alignment target.
     pub fn new(
-        mut reference: FitsFrame,
+        reference: FitsFrame,
         calibration: CalibrationMasters,
         options: StackOptions,
     ) -> Result<Self> {
-        calibration.validate_light_frame(&reference)?;
         let source = crate::replay::FrameSource::of(&reference);
         let reference_metadata = reference.metadata();
-        calibration.apply(
-            &mut reference.image,
-            reference.exposure_seconds,
-            reference.bayer,
-        )?;
-        if let Some(filter) = &options.cosmetic {
-            crate::cosmetic::suppress_impulses(&mut reference.image, reference.bayer, filter)?;
-        }
-        let (reference, cfa) = reference.into_prepared_with_layout(options.demosaic)?;
+        let (reference, cfa) = prepare_reference(reference, &calibration, &options)?;
         let mut stacker = Self::from_prepared(
             reference.image,
             reference.headers,
@@ -562,10 +565,70 @@ impl LiveStacker {
             calibration,
             options,
             FrameInputMode::CalibrateAndPrepare,
-            cfa,
+            ReferenceContribution::Integrated(cfa),
         )?;
         stacker.ledger.set_reference_source(source);
         Ok(stacker)
+    }
+
+    /// Start an empty stack on an external alignment grid. The calibrated
+    /// channel reference supplies normalization and noise weighting, after
+    /// registration onto that grid. The external image supplies only star
+    /// positions, output dimensions, and WCS; its brightness is never used.
+    /// Push all lights explicitly, including the channel reference.
+    pub fn with_reference_image(
+        reference: FitsFrame,
+        channel_reference: FitsFrame,
+        calibration: CalibrationMasters,
+        options: StackOptions,
+    ) -> Result<Self> {
+        options.validate()?;
+        let metadata = channel_reference.metadata();
+        let (channel, _) = prepare_reference(channel_reference, &calibration, &options)?;
+        let noise = if options.weighting.is_equal() {
+            Vec::new()
+        } else {
+            measure_reference_noise(&channel.image)?
+        };
+        let (alignment, _) = reference.into_prepared_with_layout(options.demosaic)?;
+        let registrar = Registrar::new(&alignment.image, options.registration.clone())?;
+        // Use the regular registration gates, with no photometric comparison
+        // to the external image. This image is a target, not an observation.
+        let geometry_options = StackOptions {
+            normalization: NormalizationMode::None,
+            weighting: FrameWeighting::Equal,
+            cfa_integration: CfaIntegration::Demosaic,
+            ..options.clone()
+        };
+        let registered = match prepare_frame(
+            &alignment.image,
+            &registrar,
+            &geometry_options,
+            &[],
+            channel.image,
+            None,
+            None,
+        )? {
+            PreparedFrame::Ready(ready) => ready.registered,
+            PreparedFrame::Rejected(reason) => {
+                return Err(Error::Stack(format!(
+                    "channel reference could not be aligned to the reference image: {reason}"
+                )));
+            }
+        };
+        Self::from_prepared(
+            registered,
+            alignment.headers,
+            metadata,
+            calibration,
+            options,
+            FrameInputMode::CalibrateAndPrepare,
+            ReferenceContribution::External {
+                image: alignment.image,
+                registrar: Box::new(registrar),
+                noise,
+            },
+        )
     }
 
     /// Start a stack from an already-prepared linear reference, with no
@@ -580,7 +643,7 @@ impl LiveStacker {
             CalibrationMasters::default(),
             options,
             FrameInputMode::PreparedOnly,
-            None,
+            ReferenceContribution::Integrated(None),
         )
     }
 
@@ -605,7 +668,7 @@ impl LiveStacker {
             CalibrationMasters::default(),
             options,
             FrameInputMode::PreparedOnly,
-            None,
+            ReferenceContribution::Integrated(None),
         )
     }
 
@@ -616,44 +679,63 @@ impl LiveStacker {
         calibration: CalibrationMasters,
         options: StackOptions,
         input_mode: FrameInputMode,
-        reference_cfa: Option<BayerLayout>,
+        contribution: ReferenceContribution,
     ) -> Result<Self> {
         options.validate()?;
         let configuration_fingerprint =
             stack_configuration_fingerprint(&options, &calibration, input_mode)?;
-        let registrar = Registrar::new(&reference, options.registration.clone())?;
-        let reference_noise = if options.weighting.is_equal() {
-            Vec::new()
-        } else {
-            measure_reference_noise(&reference)?
+        let reference_is_integrated = matches!(contribution, ReferenceContribution::Integrated(_));
+        let (registrar, reference_noise, reference_cfa, alignment_reference) = match contribution {
+            ReferenceContribution::Integrated(cfa) => (
+                Registrar::new(&reference, options.registration.clone())?,
+                if options.weighting.is_equal() {
+                    Vec::new()
+                } else {
+                    measure_reference_noise(&reference)?
+                },
+                cfa,
+                None,
+            ),
+            ReferenceContribution::External {
+                image,
+                registrar,
+                noise,
+            } => (*registrar, noise, None, Some(image)),
         };
         let mut accumulator =
             Accumulator::new(reference.sample_count(), !options.weighting.is_equal());
-        // The reference is the unit of weight: it integrates with weight 1.
-        // Under Bayer drizzle it contributes its own photosites, like every
-        // later frame, while the demosaiced image stays the alignment target.
-        match reference_cfa.filter(|_| options.cfa_integration == CfaIntegration::BayerDrizzle) {
-            Some(layout) => {
-                let photosites = crate::registration::resample_region_photosites(
-                    &reference,
-                    reference.width,
-                    reference.height,
-                    ReferenceRegion {
-                        x: 0,
-                        y: 0,
-                        width: reference.width,
-                        height: reference.height,
-                    },
-                    SimilarityTransform::IDENTITY,
-                    layout,
-                )?;
-                accumulator.integrate(&photosites.data, RejectionMode::None, None);
-            }
-            None => {
-                accumulator.integrate(&reference.data, RejectionMode::None, None);
+        if reference_is_integrated {
+            // The reference is the unit of weight: it integrates with weight 1.
+            // Under Bayer drizzle it contributes its own photosites, like every
+            // later frame, while the demosaiced image stays the alignment target.
+            match reference_cfa.filter(|_| options.cfa_integration == CfaIntegration::BayerDrizzle)
+            {
+                Some(layout) => {
+                    let photosites = crate::registration::resample_region_photosites(
+                        &reference,
+                        reference.width,
+                        reference.height,
+                        ReferenceRegion {
+                            x: 0,
+                            y: 0,
+                            width: reference.width,
+                            height: reference.height,
+                        },
+                        SimilarityTransform::IDENTITY,
+                        layout,
+                    )?;
+                    accumulator.integrate(&photosites.data, RejectionMode::None, None);
+                }
+                None => {
+                    accumulator.integrate(&reference.data, RejectionMode::None, None);
+                }
             }
         }
-        let mut ledger = crate::replay::Ledger::new(&reference);
+        let mut ledger = if reference_is_integrated {
+            crate::replay::Ledger::new(&reference)
+        } else {
+            crate::replay::Ledger::legacy()
+        };
         if !reference_noise.is_empty() {
             ledger.set_reference_weighting(&reference_noise);
         }
@@ -663,10 +745,11 @@ impl LiveStacker {
             reference,
             reference_metadata,
             registrar,
+            alignment_reference,
             reference_noise,
             accumulator,
             reference_headers,
-            accepted_frames: 1,
+            accepted_frames: u32::from(reference_is_integrated),
             rejected_frames: 0,
             input_paths: Vec::new(),
             input_mode,
@@ -674,6 +757,7 @@ impl LiveStacker {
             ledger,
             frame_cache: None,
             reference_cfa,
+            reference_is_integrated,
         })
     }
 
@@ -729,11 +813,17 @@ impl LiveStacker {
     pub fn open_context(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let restored = context::read(path)?;
-        let registrar = Registrar::new(&restored.reference, restored.options.registration.clone())
-            .map_err(|error| Error::StackContextRead {
-                path: path.to_path_buf(),
-                message: error.to_string(),
-            })?;
+        let registrar = Registrar::new(
+            restored
+                .alignment_reference
+                .as_ref()
+                .unwrap_or(&restored.reference),
+            restored.options.registration.clone(),
+        )
+        .map_err(|error| Error::StackContextRead {
+            path: path.to_path_buf(),
+            message: error.to_string(),
+        })?;
         let configuration_fingerprint = stack_configuration_fingerprint(
             &restored.options,
             &restored.calibration,
@@ -745,6 +835,7 @@ impl LiveStacker {
             reference: restored.reference,
             reference_metadata: restored.reference_metadata,
             registrar,
+            alignment_reference: restored.alignment_reference,
             reference_noise: restored.reference_noise,
             accumulator: Accumulator {
                 mean: restored.mean,
@@ -764,6 +855,7 @@ impl LiveStacker {
                 .unwrap_or_else(crate::replay::Ledger::legacy),
             frame_cache: None,
             reference_cfa: None,
+            reference_is_integrated: restored.reference_is_integrated,
         })
     }
 
@@ -784,6 +876,8 @@ impl LiveStacker {
         context::write(
             path,
             context::ContextWriteState {
+                reference_is_integrated: self.reference_is_integrated,
+                alignment_reference: self.alignment_reference.as_ref(),
                 options: &self.options,
                 calibration: &self.calibration,
                 reference: &self.reference,
@@ -844,8 +938,12 @@ impl LiveStacker {
     pub fn set_calibration(&mut self, calibration: CalibrationMasters) -> Result<()> {
         self.require_fits_input_mode()?;
         calibration.validate_master_set_signatures()?;
-        crate::context::validate_calibration(&self.reference, &calibration)
-            .map_err(Error::Calibration)?;
+        crate::context::validate_calibration(
+            &self.reference,
+            &calibration,
+            self.reference_is_integrated,
+        )
+        .map_err(Error::Calibration)?;
         let configuration_fingerprint =
             stack_configuration_fingerprint(&self.options, &calibration, self.input_mode)?;
         self.calibration = calibration;
@@ -1242,8 +1340,25 @@ impl LiveStacker {
     }
 }
 
-/// Measure the reference frame's per-channel noise, which weighted stacks
-/// need before they can weigh any other frame.
+/// Calibrate and prepare a light used as a channel's photometric target.
+fn prepare_reference(
+    mut reference: FitsFrame,
+    calibration: &CalibrationMasters,
+    options: &StackOptions,
+) -> Result<(FitsFrame, Option<BayerLayout>)> {
+    calibration.validate_light_frame(&reference)?;
+    calibration.apply(
+        &mut reference.image,
+        reference.exposure_seconds,
+        reference.bayer,
+    )?;
+    if let Some(filter) = &options.cosmetic {
+        crate::cosmetic::suppress_impulses(&mut reference.image, reference.bayer, filter)?;
+    }
+    reference.into_prepared_with_layout(options.demosaic)
+}
+
+/// Measure noise before any registration resampling changes its variance.
 fn measure_reference_noise(reference: &LinearImage) -> Result<Vec<f32>> {
     crate::snr::frame_noise(reference)
         .filter(|noise| noise.iter().all(|value| value.is_finite() && *value > 0.0))
@@ -2128,6 +2243,137 @@ mod tests {
     }
 
     #[test]
+    fn external_reference_replays_cached_uncached_and_restored_lights() {
+        let directory = tempfile::tempdir().unwrap();
+        let light = stacking_star_field(160, 128);
+        let mut reference = stacking_star_field(176, 144);
+        for value in &mut reference.data {
+            *value = *value * 2.0 + 500.0;
+        }
+        let reference_path = directory.path().join("reference.fits");
+        crate::write_processed_image_fits_f32(&reference_path, &reference, &[], &[]).unwrap();
+        let paths = (0..3)
+            .map(|index| {
+                let path = directory.path().join(format!("light-{index}.fits"));
+                crate::write_processed_image_fits_f32(
+                    &path,
+                    &offset_image(&light, index as f32),
+                    &[],
+                    &[],
+                )
+                .unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        let bits = |image: &LinearImage| image.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        for normalization in [
+            NormalizationMode::None,
+            NormalizationMode::LocalBackground { tile_size: 32 },
+        ] {
+            let options = StackOptions {
+                normalization,
+                weighting: FrameWeighting::inverse_noise_variance(),
+                ..StackOptions::default()
+            };
+            let make = || {
+                LiveStacker::with_reference_image(
+                    FitsFrame::open(&reference_path).unwrap(),
+                    FitsFrame::open(&paths[0]).unwrap(),
+                    CalibrationMasters::new(
+                        Some(LinearImage::new(160, 128, 1, vec![0.0; 160 * 128]).unwrap()),
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                    options.clone(),
+                )
+                .unwrap()
+            };
+            let mut uncached = make();
+            let mut cached = make();
+            assert_eq!(
+                cached.reference_noise(),
+                measure_reference_noise(&light).unwrap()
+            );
+            assert_eq!(cached.view().accepted_frames, 0);
+            assert!(cached.view().coverage.iter().all(|&count| count == 0));
+            cached
+                .retain_frames_for_reintegration(Some(directory.path()))
+                .unwrap();
+            for path in &paths {
+                assert!(matches!(
+                    uncached.push_fits(path).unwrap(),
+                    FrameDisposition::Accepted(_)
+                ));
+                assert!(matches!(
+                    cached.push_fits(path).unwrap(),
+                    FrameDisposition::Accepted(_)
+                ));
+            }
+            assert_eq!(
+                bits(&uncached.snapshot().unwrap().image),
+                bits(&cached.snapshot().unwrap().image)
+            );
+            let context = directory.path().join("external.seiza-stack");
+            cached.save_context(&context).unwrap();
+            let mut restored = LiveStacker::open_context(&context).unwrap();
+            assert_eq!(
+                bits(restored.alignment_reference.as_ref().unwrap()),
+                bits(&reference)
+            );
+            restored
+                .retain_frames_for_reintegration(Some(directory.path()))
+                .unwrap();
+            let batch = crate::BatchStackOptions {
+                scratch_directory: Some(directory.path().to_path_buf()),
+                ..Default::default()
+            };
+            let expected = uncached.reintegrate(&batch, |_, _, _| {}).unwrap().snapshot;
+            assert_eq!(expected.accepted_frames, 3);
+            for stacker in [&cached, &restored] {
+                let actual = stacker.reintegrate(&batch, |_, _, _| {}).unwrap().snapshot;
+                assert_eq!(actual.accepted_frames, 3);
+                assert_eq!(bits(&actual.image), bits(&expected.image));
+                assert_eq!(actual.coverage, expected.coverage);
+            }
+            let offset = if matches!(normalization, NormalizationMode::None) {
+                1.0
+            } else {
+                0.0
+            };
+            assert!(
+                (expected.image.data[70 * 176 + 70] - light.data[70 * 160 + 70] - offset).abs()
+                    < 0.1
+            );
+            let (replayed, drizzled) = cached
+                .reintegrate_drizzled(
+                    &batch,
+                    &crate::DrizzleOptions {
+                        scale: 1,
+                        drop_shrink: Some(1.0),
+                    },
+                    |_, _, _| {},
+                )
+                .unwrap();
+            assert_eq!(replayed.snapshot.accepted_frames, 3);
+            assert_eq!((drizzled.image.width, drizzled.image.height), (176, 144));
+            let extra = directory.path().join("extra.fits");
+            crate::write_processed_image_fits_f32(&extra, &offset_image(&light, 0.5), &[], &[])
+                .unwrap();
+            for stacker in [&mut uncached, &mut cached, &mut restored] {
+                assert!(matches!(
+                    stacker.push_fits(&extra).unwrap(),
+                    FrameDisposition::Accepted(_)
+                ));
+            }
+            assert_eq!(
+                bits(&uncached.snapshot().unwrap().image),
+                bits(&restored.snapshot().unwrap().image)
+            );
+        }
+    }
+
+    #[test]
     fn delta_sigma_rejects_late_outlier_without_moving_mean() {
         let mut accumulator = Accumulator::new(1, false);
         let rejection = RejectionMode::DeltaSigma(DeltaSigmaOptions {
@@ -2406,6 +2652,8 @@ mod tests {
         context::write_legacy_v1(
             &path,
             context::ContextWriteState {
+                reference_is_integrated: stacker.reference_is_integrated,
+                alignment_reference: stacker.alignment_reference.as_ref(),
                 options: &stacker.options,
                 calibration: &stacker.calibration,
                 reference: &stacker.reference,

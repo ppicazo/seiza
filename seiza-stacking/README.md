@@ -22,6 +22,18 @@ The first release supports:
 
 ## Completed-stack rejection
 
+`LiveStacker::with_reference_image` starts an empty stack using a separate
+FITS/XISF image for alignment only. It also takes a channel reference light,
+which it calibrates and registers onto the alignment grid to supply the
+normalization target. Noise weighting uses that light's calibrated noise,
+measured before resampling. The alignment image's brightness and noise never
+set the channel's photometric scale. Push every light explicitly, including
+the channel reference; the external image contributes no observations unless
+also pushed. Online integration, retained-frame replay, and drizzle use its
+pixel grid and output WCS. Prepared channel counts must match.
+Saved contexts retain both references; older readers reject these contexts,
+while ordinary stack contexts retain their existing format.
+
 Live delta-sigma rejection cannot remove trails admitted during its warm-up.
 `LiveStacker::reintegrate` fixes that for a live stack. The stacker keeps a
 ledger of every admitted frame: its source file, the calibration masters that

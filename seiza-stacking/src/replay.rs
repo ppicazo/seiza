@@ -272,11 +272,12 @@ impl Ledger {
 
     /// Restore the weight records a weighted context saved beside the
     /// ledger, checking one record per frame, one value per channel, and
-    /// weight 1 for the reference.
+    /// positive weights (an external reference need not be an admitted frame).
     pub(crate) fn attach_weights(
         &mut self,
         records: Vec<FrameWeightRecord>,
         channels: usize,
+        reference_is_integrated: bool,
     ) -> std::result::Result<(), String> {
         if records.len() != self.frames.len() {
             return Err(format!(
@@ -296,7 +297,9 @@ impl Ledger {
                     .weight
                     .iter()
                     .all(|weight| weight.is_finite() && *weight > 0.0)
-                && (index > 0 || record.weight.iter().all(|weight| *weight == 1.0));
+                && (!reference_is_integrated
+                    || index > 0
+                    || record.weight.iter().all(|weight| *weight == 1.0));
             if !valid {
                 return Err(format!(
                     "context has an invalid weight record for admitted frame {}",
@@ -1514,7 +1517,8 @@ impl LiveStacker {
     /// Call this before pushing frames to a stack that will be reintegrated.
     /// The threads preparing frames write each file while they hold the
     /// registered image, and a frame that is turned away has its file
-    /// deleted. The reference is written now. Frames admitted before the
+    /// deleted. An integrated reference is written now; an external reference
+    /// is never cached as a light. Frames admitted before the
     /// call, such as those of a stack reopened from a saved context, are
     /// prepared from their sources when replayed, as they are without it.
     /// A stack that integrates Bayer photosites keeps each frame's
@@ -1558,6 +1562,10 @@ impl LiveStacker {
         // again. A Bayer-drizzled stack keeps its photosites, so needs the
         // layout it was demosaiced from; without it, the replay prepares the
         // reference again.
+        if !self.reference_is_integrated {
+            self.frame_cache = Some(cache);
+            return Ok(());
+        }
         let reference = &self.ledger.frames[0];
         if self.options.cfa_integration != crate::CfaIntegration::BayerDrizzle {
             cache.get_or_prepare(0, Vec::new(), || {
@@ -2454,7 +2462,7 @@ mod tests {
     }
 
     #[test]
-    fn weight_records_must_cover_every_frame_and_weigh_the_reference_as_one() {
+    fn weight_records_must_cover_every_frame_with_positive_weights() {
         let reference = LinearImage::new(4, 4, 1, vec![1.0; 16]).unwrap();
         let mut ledger = Ledger::new(&reference);
         ledger.admit(
@@ -2465,6 +2473,7 @@ mod tests {
         let valid = vec![record(2.0, 1.0), record(4.0, 0.25)];
         for invalid in [
             vec![record(2.0, 1.0)],
+            vec![record(2.0, -0.5), record(4.0, 0.25)],
             vec![record(2.0, 0.5), record(4.0, 0.25)],
             vec![record(2.0, 1.0), record(4.0, 0.0)],
             vec![record(2.0, 1.0), record(f32::NAN, 0.25)],
@@ -2476,9 +2485,13 @@ mod tests {
                 },
             ],
         ] {
-            assert!(ledger.clone().attach_weights(invalid, 1).is_err());
+            assert!(ledger.clone().attach_weights(invalid, 1, true).is_err());
         }
-        ledger.attach_weights(valid.clone(), 1).unwrap();
+        ledger
+            .clone()
+            .attach_weights(vec![record(2.0, 0.5), record(4.0, 0.25)], 1, false)
+            .unwrap();
+        ledger.attach_weights(valid.clone(), 1, true).unwrap();
         assert_eq!(ledger.weights(), valid);
         // The postcard ledger layout does not carry the records.
         let bytes = postcard::to_stdvec(&ledger).unwrap();
