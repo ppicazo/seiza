@@ -272,7 +272,7 @@ impl Ledger {
 
     /// Restore the weight records a weighted context saved beside the
     /// ledger, checking one record per frame, one value per channel, and
-    /// weight 1 for the reference.
+    /// positive weights (an external reference need not be an admitted frame).
     pub(crate) fn attach_weights(
         &mut self,
         records: Vec<FrameWeightRecord>,
@@ -295,8 +295,7 @@ impl Ledger {
                 && record
                     .weight
                     .iter()
-                    .all(|weight| weight.is_finite() && *weight > 0.0)
-                && (index > 0 || record.weight.iter().all(|weight| *weight == 1.0));
+                    .all(|weight| weight.is_finite() && *weight > 0.0);
             if !valid {
                 return Err(format!(
                     "context has an invalid weight record for admitted frame {}",
@@ -1558,6 +1557,10 @@ impl LiveStacker {
         // again. A Bayer-drizzled stack keeps its photosites, so needs the
         // layout it was demosaiced from; without it, the replay prepares the
         // reference again.
+        if !self.reference_is_integrated {
+            self.frame_cache = Some(cache);
+            return Ok(());
+        }
         let reference = &self.ledger.frames[0];
         if self.options.cfa_integration != crate::CfaIntegration::BayerDrizzle {
             cache.get_or_prepare(0, Vec::new(), || {
@@ -2454,7 +2457,7 @@ mod tests {
     }
 
     #[test]
-    fn weight_records_must_cover_every_frame_and_weigh_the_reference_as_one() {
+    fn weight_records_must_cover_every_frame_with_positive_weights() {
         let reference = LinearImage::new(4, 4, 1, vec![1.0; 16]).unwrap();
         let mut ledger = Ledger::new(&reference);
         ledger.admit(
@@ -2462,10 +2465,10 @@ mod tests {
             RegisteredFrameMapping::identity(&reference),
             record(4.0, 0.5),
         );
-        let valid = vec![record(2.0, 1.0), record(4.0, 0.25)];
+        let valid = vec![record(2.0, 0.5), record(4.0, 0.25)];
         for invalid in [
             vec![record(2.0, 1.0)],
-            vec![record(2.0, 0.5), record(4.0, 0.25)],
+            vec![record(2.0, -0.5), record(4.0, 0.25)],
             vec![record(2.0, 1.0), record(4.0, 0.0)],
             vec![record(2.0, 1.0), record(f32::NAN, 0.25)],
             vec![

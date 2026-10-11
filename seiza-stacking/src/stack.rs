@@ -533,6 +533,13 @@ pub struct LiveStacker {
     /// The Bayer layout the reference was demosaiced from, when this stack
     /// prepared it; a stack reopened from a context does not know it.
     pub(crate) reference_cfa: Option<BayerLayout>,
+    /// Whether the prepared reference is also the first admitted image.
+    pub(crate) reference_is_integrated: bool,
+}
+
+enum ReferenceContribution {
+    Integrated(Option<BayerLayout>),
+    External,
 }
 
 impl LiveStacker {
@@ -562,10 +569,33 @@ impl LiveStacker {
             calibration,
             options,
             FrameInputMode::CalibrateAndPrepare,
-            cfa,
+            ReferenceContribution::Integrated(cfa),
         )?;
         stacker.ledger.set_reference_source(source);
         Ok(stacker)
+    }
+
+    /// Start an empty stack on an external reference's grid. The reference
+    /// supplies registration, normalization, noise weighting, and output headers,
+    /// but contributes no samples. It is demosaiced without applying the light
+    /// frames' calibration masters; supply a calibrated reference when needed.
+    /// All lights, including the reference if desired, must be pushed explicitly.
+    pub fn with_reference_image(
+        reference: FitsFrame,
+        calibration: CalibrationMasters,
+        options: StackOptions,
+    ) -> Result<Self> {
+        let metadata = reference.metadata();
+        let (reference, _) = reference.into_prepared_with_layout(options.demosaic)?;
+        Self::from_prepared(
+            reference.image,
+            reference.headers,
+            metadata,
+            calibration,
+            options,
+            FrameInputMode::CalibrateAndPrepare,
+            ReferenceContribution::External,
+        )
     }
 
     /// Start a stack from an already-prepared linear reference, with no
@@ -580,7 +610,7 @@ impl LiveStacker {
             CalibrationMasters::default(),
             options,
             FrameInputMode::PreparedOnly,
-            None,
+            ReferenceContribution::Integrated(None),
         )
     }
 
@@ -605,7 +635,7 @@ impl LiveStacker {
             CalibrationMasters::default(),
             options,
             FrameInputMode::PreparedOnly,
-            None,
+            ReferenceContribution::Integrated(None),
         )
     }
 
@@ -616,7 +646,7 @@ impl LiveStacker {
         calibration: CalibrationMasters,
         options: StackOptions,
         input_mode: FrameInputMode,
-        reference_cfa: Option<BayerLayout>,
+        contribution: ReferenceContribution,
     ) -> Result<Self> {
         options.validate()?;
         let configuration_fingerprint =
@@ -629,31 +659,43 @@ impl LiveStacker {
         };
         let mut accumulator =
             Accumulator::new(reference.sample_count(), !options.weighting.is_equal());
-        // The reference is the unit of weight: it integrates with weight 1.
-        // Under Bayer drizzle it contributes its own photosites, like every
-        // later frame, while the demosaiced image stays the alignment target.
-        match reference_cfa.filter(|_| options.cfa_integration == CfaIntegration::BayerDrizzle) {
-            Some(layout) => {
-                let photosites = crate::registration::resample_region_photosites(
-                    &reference,
-                    reference.width,
-                    reference.height,
-                    ReferenceRegion {
-                        x: 0,
-                        y: 0,
-                        width: reference.width,
-                        height: reference.height,
-                    },
-                    SimilarityTransform::IDENTITY,
-                    layout,
-                )?;
-                accumulator.integrate(&photosites.data, RejectionMode::None, None);
-            }
-            None => {
-                accumulator.integrate(&reference.data, RejectionMode::None, None);
+        let reference_is_integrated = matches!(contribution, ReferenceContribution::Integrated(_));
+        let reference_cfa = match contribution {
+            ReferenceContribution::Integrated(cfa) => cfa,
+            ReferenceContribution::External => None,
+        };
+        if reference_is_integrated {
+            // The reference is the unit of weight: it integrates with weight 1.
+            // Under Bayer drizzle it contributes its own photosites, like every
+            // later frame, while the demosaiced image stays the alignment target.
+            match reference_cfa.filter(|_| options.cfa_integration == CfaIntegration::BayerDrizzle)
+            {
+                Some(layout) => {
+                    let photosites = crate::registration::resample_region_photosites(
+                        &reference,
+                        reference.width,
+                        reference.height,
+                        ReferenceRegion {
+                            x: 0,
+                            y: 0,
+                            width: reference.width,
+                            height: reference.height,
+                        },
+                        SimilarityTransform::IDENTITY,
+                        layout,
+                    )?;
+                    accumulator.integrate(&photosites.data, RejectionMode::None, None);
+                }
+                None => {
+                    accumulator.integrate(&reference.data, RejectionMode::None, None);
+                }
             }
         }
-        let mut ledger = crate::replay::Ledger::new(&reference);
+        let mut ledger = if reference_is_integrated {
+            crate::replay::Ledger::new(&reference)
+        } else {
+            crate::replay::Ledger::legacy()
+        };
         if !reference_noise.is_empty() {
             ledger.set_reference_weighting(&reference_noise);
         }
@@ -666,7 +708,7 @@ impl LiveStacker {
             reference_noise,
             accumulator,
             reference_headers,
-            accepted_frames: 1,
+            accepted_frames: u32::from(reference_is_integrated),
             rejected_frames: 0,
             input_paths: Vec::new(),
             input_mode,
@@ -674,6 +716,7 @@ impl LiveStacker {
             ledger,
             frame_cache: None,
             reference_cfa,
+            reference_is_integrated,
         })
     }
 
@@ -764,6 +807,7 @@ impl LiveStacker {
                 .unwrap_or_else(crate::replay::Ledger::legacy),
             frame_cache: None,
             reference_cfa: None,
+            reference_is_integrated: false,
         })
     }
 

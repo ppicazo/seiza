@@ -68,6 +68,11 @@ pub(crate) struct StackArgs {
     /// star count over every frame, or the first frame given
     #[arg(long, value_enum, default_value = "auto")]
     reference: ReferenceArg,
+    /// Common FITS or XISF registration/normalization reference for channel
+    /// stacks. Prepared without the lights' calibration masters; contributes
+    /// no pixels unless also listed as a light. Works with --reintegrate
+    #[arg(long, conflicts_with = "reference")]
+    reference_image: Option<PathBuf>,
     /// Linear 32-bit floating-point FITS stack
     #[arg(short, long)]
     output: PathBuf,
@@ -268,6 +273,7 @@ struct StackReport {
     output: FileIdentity,
     preview: Option<String>,
     reference: FileIdentity,
+    reference_integrated_automatically: bool,
     calibration: CalibrationReport,
     configuration: ConfigurationReport,
     frames: Vec<AdmissionRecord>,
@@ -324,6 +330,24 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
         }
     }
     validate_path_roles(path_roles)?;
+    if let Some(reference) = options.reference_image.as_deref() {
+        // Sharing the reference with a light is intentional; outputs and
+        // calibration masters must still be distinct from it.
+        let mut roles = vec![("reference image".into(), reference)];
+        for (role, path) in [
+            ("master bias", options.bias.as_deref()),
+            ("master dark", options.dark.as_deref()),
+            ("master flat", options.flat.as_deref()),
+            ("stack output", Some(options.output.as_path())),
+            ("preview output", options.preview.as_deref()),
+            ("report output", options.report.as_deref()),
+        ] {
+            if let Some(path) = path {
+                roles.push((role.into(), path));
+            }
+        }
+        validate_path_roles(roles)?;
+    }
     if matches!(options.rejection, RejectionArg::DeltaSigma) {
         if !options.sigma_low.is_finite()
             || options.sigma_low <= 0.0
@@ -441,7 +465,7 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
     // normalization, the background every frame is matched to; the first
     // frame of a night is often low in the sky and in twilight.
     let mut ordered = options.images.clone();
-    if matches!(options.reference, ReferenceArg::Auto) {
+    if options.reference_image.is_none() && matches!(options.reference, ReferenceArg::Auto) {
         let (best, scores) = seiza_stacking::choose_reference(&ordered, 8)?;
         let chosen = ordered.remove(best);
         if let Some(score) = &scores[best] {
@@ -456,7 +480,10 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
         ordered.insert(0, chosen);
     }
     let mut images = ordered.iter();
-    let reference_path = images.next().expect("clap requires at least two images");
+    let reference_path = options
+        .reference_image
+        .as_ref()
+        .unwrap_or_else(|| images.next().expect("clap requires at least two images"));
     let reference_identity = report_path
         .as_ref()
         .map(|_| file_identity(reference_path))
@@ -464,7 +491,8 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
     let reference = crate::common::open_frame(reference_path, "reference frame")?;
     // A dark master that never recorded its temperature is used, since
     // nothing says it is wrong, but nothing says it is right either.
-    if dark_records_temperature == Some(false)
+    if options.reference_image.is_none()
+        && dark_records_temperature == Some(false)
         && let Some(temperature) = known_temperature(&reference)
     {
         eprintln!(
@@ -537,13 +565,17 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
         minimum_integrated_fraction: stack_options.acceptance.minimum_integrated_fraction,
     };
 
-    let mut stacker = seiza_stacking::LiveStacker::new(reference, calibration, stack_options)
-        .with_context(|| {
-            format!(
-                "failed to initialize stack from {}",
-                reference_path.display()
-            )
-        })?;
+    let mut stacker = if options.reference_image.is_some() {
+        seiza_stacking::LiveStacker::with_reference_image(reference, calibration, stack_options)
+    } else {
+        seiza_stacking::LiveStacker::new(reference, calibration, stack_options)
+    }
+    .with_context(|| {
+        format!(
+            "failed to initialize stack from {}",
+            reference_path.display()
+        )
+    })?;
     // Each admitted frame's registered image waits here for reintegration:
     // about four bytes per output sample per frame, beside the output rather
     // than in a temporary directory that may live in memory. The live pass
@@ -662,6 +694,10 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
         stop_interrupted();
     }
 
+    if stacker.view().accepted_frames == 0 {
+        anyhow::bail!("no light frames were accepted against the reference image");
+    }
+
     let reference_headers = stacker.reference_headers().to_vec();
     let mut drizzled = None;
     let mut snapshot = if reintegrate {
@@ -769,6 +805,7 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
             output: file_identity(&options.output)?,
             preview: preview_path.map(|path| path.display().to_string()),
             reference: reference_identity.expect("report identity was prepared"),
+            reference_integrated_automatically: options.reference_image.is_none(),
             calibration: calibration_report.expect("report calibration was prepared"),
             configuration: configuration_report,
             frames: admission_records,
