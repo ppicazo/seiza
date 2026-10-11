@@ -5,10 +5,11 @@ use seiza::catalog::{StarCatalog, TileCatalog};
 use seiza::data_paths;
 use seiza::minor_bodies::MinorBodyCatalog;
 use seiza::objects::{ObjectCatalog, ObjectKind, ObjectQuery, ObjectSort, SkyRegion};
-use seiza::raster::{self, PhotoMetadata, ScaleSearch};
+use seiza::raster::{PhotoMetadata, ScaleSearch};
 use seiza::solve::{SolveHint, solve};
 use seiza::star_ids::{StarIdentifierCatalog, StarLookupMatch};
 use seiza::{DetectBackend, DetectConfig, DetectedStar};
+use seiza_image_io::Format as ImageFormat;
 use seiza_satellites::{
     CacheState, CelesTrakSource, ExposureProvenance, ObserverLocation, OrbitalCatalogSource,
     SatelliteCatalog, SatelliteTrack, SingleExposure, TrackOptions, UtcTimestamp,
@@ -36,28 +37,13 @@ mod stack;
 mod stretch_command;
 mod worker;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AstronomyImageFormat {
-    Fits,
-    Xisf,
-}
-
-fn astronomy_image_format(path: &std::path::Path) -> Option<AstronomyImageFormat> {
-    if seiza_xisf::is_xisf_path(path) || seiza_xisf::is_xisf_header_path(path) {
-        return Some(AstronomyImageFormat::Xisf);
-    }
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("fits")
-                || extension.eq_ignore_ascii_case("fit")
-                || extension.eq_ignore_ascii_case("fts")
-        })
-        .then_some(AstronomyImageFormat::Fits)
+/// A FITS or XISF path's format, as the shared image reader names it.
+fn astronomy_image_format(path: &std::path::Path) -> Option<ImageFormat> {
+    ImageFormat::from_path(path).filter(|format| format.is_astronomy())
 }
 
 fn is_fits_path(path: &std::path::Path) -> bool {
-    astronomy_image_format(path) == Some(AstronomyImageFormat::Fits)
+    astronomy_image_format(path) == Some(ImageFormat::Fits)
 }
 
 fn is_astronomy_image_path(path: &std::path::Path) -> bool {
@@ -65,23 +51,21 @@ fn is_astronomy_image_path(path: &std::path::Path) -> bool {
 }
 
 fn open_astronomy_image(path: &std::path::Path) -> Result<seiza_fits::FitsImage> {
-    match astronomy_image_format(path) {
-        Some(AstronomyImageFormat::Fits) => seiza_fits::FitsImage::open(path)
-            .map_err(|error| anyhow::anyhow!("{}: {error}", path.display())),
-        Some(AstronomyImageFormat::Xisf) => {
-            seiza_xisf::open(path).map_err(|error| anyhow::anyhow!("{}: {error}", path.display()))
-        }
-        None => anyhow::bail!("{} is not a FITS or XISF path", path.display()),
-    }
+    anyhow::ensure!(
+        is_astronomy_image_path(path),
+        "{} is not a FITS or XISF path",
+        path.display()
+    );
+    Ok(seiza_image_io::open_astronomy(path)?.0)
 }
 
 fn read_astronomy_headers(
     path: &std::path::Path,
 ) -> Result<Vec<(String, seiza_fits::HeaderValue)>> {
     match astronomy_image_format(path) {
-        Some(AstronomyImageFormat::Fits) => seiza_fits::read_header(path)
+        Some(ImageFormat::Fits) => seiza_fits::read_header(path)
             .map_err(|error| anyhow::anyhow!("{}: {error}", path.display())),
-        Some(AstronomyImageFormat::Xisf) => seiza_xisf::read_header(path)
+        Some(_) => seiza_xisf::read_header(path)
             .map_err(|error| anyhow::anyhow!("{}: {error}", path.display())),
         None => anyhow::bail!("{} is not a FITS or XISF path", path.display()),
     }
@@ -188,9 +172,9 @@ pub(crate) fn load_image(path: &std::path::Path, backend: DetectBackend) -> Resu
             buffer,
         )));
     }
-    raster::open_oriented(path)
-        .map(|image| LoadedImage::Dynamic(image.pixels))
-        .with_context(|| format!("failed to open {}", path.display()))
+    Ok(LoadedImage::Dynamic(
+        seiza_image_io::open_raster(path)?.pixels,
+    ))
 }
 
 /// Auto FITS/XISF begins with its compact MTF/u8 representation, while
@@ -1270,8 +1254,7 @@ fn main() -> Result<()> {
                 "image-info describes JPEG, PNG and TIFF files; {} is FITS or XISF, whose headers carry this instead",
                 image.display()
             );
-            let loaded = raster::open_oriented(&image)
-                .with_context(|| format!("failed to open {}", image.display()))?;
+            let loaded = seiza_image_io::open_raster(&image)?;
             let metadata = PhotoMetadata::read(&image);
             println!(
                 "{}",
@@ -2312,9 +2295,9 @@ fn fits_info(path: &std::path::Path, stretch: Option<&std::path::Path>) -> Resul
         let started = std::time::Instant::now();
         let data = image.stretch_to_u8(&seiza_fits::StretchParams::default());
         let elapsed = started.elapsed();
-        image::GrayImage::from_raw(image.width as u32, image.height as u32, data)
-            .ok_or_else(|| anyhow::anyhow!("dimension mismatch"))?
-            .save(out)?;
+        let preview = image::GrayImage::from_raw(image.width as u32, image.height as u32, data)
+            .ok_or_else(|| anyhow::anyhow!("dimension mismatch"))?;
+        seiza_image_io::save_display(out, &image::DynamicImage::ImageLuma8(preview))?;
         println!(
             "  stretched preview written to {} ({:.0}ms stretch)",
             out.display(),
@@ -2436,9 +2419,7 @@ fn detect(
                 image::Rgb([64, 255, 64]),
             );
         }
-        canvas
-            .save(out)
-            .with_context(|| format!("failed to write {}", out.display()))?;
+        seiza_image_io::save_display(out, &image::DynamicImage::ImageRgb8(canvas))?;
         println!("annotated image written to {}", out.display());
     }
 
@@ -3499,9 +3480,7 @@ fn solve_command(
         for track in &satellite_tracks {
             draw_satellite_track(&mut canvas, track);
         }
-        canvas
-            .save(out)
-            .with_context(|| format!("failed to write {}", out.display()))?;
+        seiza_image_io::save_display(out, &image::DynamicImage::ImageRgb8(canvas))?;
         println!("annotated image written to {}", out.display());
     }
     if let Some(request) = sky_map {
@@ -4147,9 +4126,7 @@ fn solve_blind_command(
     if let Some(path) = options.annotate {
         let mut canvas = display_photo(path, &img)?.into_owned();
         draw_star_overlay(&mut canvas, invocation.stars(), &catalog, wcs, dims);
-        canvas
-            .save(path)
-            .with_context(|| format!("failed to write {}", path.display()))?;
+        seiza_image_io::save_display(path, &image::DynamicImage::ImageRgb8(canvas))?;
         println!("annotated image written to {}", path.display());
     }
     if let Some(request) = options.sky_map {
@@ -4759,10 +4736,7 @@ mod cli_tests {
         assert!(auto_can_retry_f32(fits, &luma, DetectBackend::Auto));
         assert!(!auto_can_retry_f32(fits, &luma, DetectBackend::U8));
         assert!(auto_can_retry_f32(xisf, &luma, DetectBackend::Auto));
-        assert_eq!(
-            astronomy_image_format(xisf),
-            Some(AstronomyImageFormat::Xisf)
-        );
+        assert_eq!(astronomy_image_format(xisf), Some(ImageFormat::Xisf));
         assert!(!is_fits_path(xisf));
     }
 
