@@ -28,6 +28,7 @@ const MAXIMUM_LEDGER_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const IO_BUFFER_VALUES: usize = 16 * 1024;
 
 pub(crate) struct ContextWriteState<'a> {
+    pub alignment_reference: Option<&'a LinearImage>,
     pub reference_is_integrated: bool,
     pub options: &'a StackOptions,
     pub calibration: &'a CalibrationMasters,
@@ -48,6 +49,7 @@ pub(crate) struct ContextWriteState<'a> {
 }
 
 pub(crate) struct RestoredContext {
+    pub alignment_reference: Option<LinearImage>,
     pub reference_is_integrated: bool,
     pub options: StackOptions,
     pub calibration: CalibrationMasters,
@@ -75,6 +77,10 @@ struct ContextMetadata {
     /// contexts rather than incorrectly caching the target as their first light.
     #[serde(default, skip_serializing_if = "is_false")]
     external_reference: bool,
+    /// A separate star-matching target; the main reference contains this
+    /// channel's photometric target on the same grid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    alignment_reference: Option<ImageMetadata>,
     schema_version: u32,
     options: StackOptions,
     calibration: CalibrationMetadata,
@@ -323,6 +329,7 @@ fn write_version(path: &Path, state: ContextWriteState<'_>, format_version: u32)
                     .and_then(|()| encoder.write_all(warps)),
                 None => Ok(()),
             })
+            .and_then(|()| write_optional_image(&mut encoder, state.alignment_reference))
             .map_err(|error| context_write_error(path, error.to_string()))?;
 
         let mut writer = encoder
@@ -455,6 +462,8 @@ pub(crate) fn read(path: &Path) -> Result<RestoredContext> {
         None
     };
 
+    let alignment_reference = read_optional_image(&mut decoder, metadata.alignment_reference)
+        .map_err(|error| context_read_error(path, error))?;
     let mut trailing = [0_u8; 1];
     if decoder
         .read(&mut trailing)
@@ -526,6 +535,7 @@ pub(crate) fn read(path: &Path) -> Result<RestoredContext> {
         .collect();
 
     Ok(RestoredContext {
+        alignment_reference,
         reference_is_integrated: !metadata.external_reference,
         options: metadata.options,
         calibration,
@@ -563,6 +573,7 @@ impl ContextMetadata {
         Ok(Self {
             schema_version,
             external_reference: !state.reference_is_integrated,
+            alignment_reference: state.alignment_reference.map(ImageMetadata::from),
             options: state.options.clone(),
             calibration: CalibrationMetadata::from(state.calibration),
             reference: ImageMetadata::from(state.reference),
@@ -602,6 +613,16 @@ impl ContextMetadata {
             return Err("weighted context options do not select frame weighting".into());
         }
         self.reference.sample_count()?;
+        if let Some(alignment) = self.alignment_reference {
+            alignment.sample_count()?;
+            if !self.external_reference
+                || alignment.width != self.reference.width
+                || alignment.height != self.reference.height
+                || alignment.channels != self.reference.channels
+            {
+                return Err("alignment reference does not match the external output grid".into());
+            }
+        }
         for image in [
             self.calibration.bias,
             self.calibration.dark_signal,

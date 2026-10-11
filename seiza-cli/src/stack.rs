@@ -64,14 +64,15 @@ pub(crate) struct StackArgs {
     /// FITS or XISF light frames, in acquisition order; see --reference
     #[arg(required = true, num_args = 2..)]
     images: Vec<PathBuf>,
-    /// Which frame is the reference: the clearest and sharpest by a quick
-    /// star count over every frame, or the first frame given
+    /// Which light supplies normalization and noise weighting: the clearest
+    /// and sharpest, or the first given. Also sets alignment unless
+    /// --reference-image supplies a common grid
     #[arg(long, value_enum, default_value = "auto")]
     reference: ReferenceArg,
-    /// Common FITS or XISF registration/normalization reference for channel
+    /// Common FITS or XISF alignment reference for channel
     /// stacks. Prepared without the lights' calibration masters; contributes
     /// no pixels unless also listed as a light. Works with --reintegrate
-    #[arg(long, conflicts_with = "reference")]
+    #[arg(long)]
     reference_image: Option<PathBuf>,
     /// Linear 32-bit floating-point FITS stack
     #[arg(short, long)]
@@ -273,6 +274,8 @@ struct StackReport {
     output: FileIdentity,
     preview: Option<String>,
     reference: FileIdentity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    normalization_reference: Option<FileIdentity>,
     reference_integrated_automatically: bool,
     calibration: CalibrationReport,
     configuration: ConfigurationReport,
@@ -461,11 +464,11 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
     };
     stack_options.registration.maximum_drift_fraction = options.max_registration_drift_fraction;
 
-    // The reference fixes the stack's grid and, under local background
-    // normalization, the background every frame is matched to; the first
-    // frame of a night is often low in the sky and in twilight.
+    // Pick this channel's photometric target even when an external image
+    // supplies the alignment grid. The first light of a night can be low
+    // in the sky and in twilight.
     let mut ordered = options.images.clone();
-    if options.reference_image.is_none() && matches!(options.reference, ReferenceArg::Auto) {
+    if matches!(options.reference, ReferenceArg::Auto) {
         let (best, scores) = seiza_stacking::choose_reference(&ordered, 8)?;
         let chosen = ordered.remove(best);
         if let Some(score) = &scores[best] {
@@ -489,15 +492,26 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
         .map(|_| file_identity(reference_path))
         .transpose()?;
     let reference = crate::common::open_frame(reference_path, "reference frame")?;
+    let channel_reference = options
+        .reference_image
+        .as_ref()
+        .map(|_| crate::common::open_frame(&ordered[0], "channel normalization reference"))
+        .transpose()?;
+    let normalization_identity = options
+        .reference_image
+        .as_ref()
+        .and(report_path.as_ref())
+        .map(|_| file_identity(&ordered[0]))
+        .transpose()?;
     // A dark master that never recorded its temperature is used, since
     // nothing says it is wrong, but nothing says it is right either.
-    if options.reference_image.is_none()
-        && dark_records_temperature == Some(false)
-        && let Some(temperature) = known_temperature(&reference)
+    if dark_records_temperature == Some(false)
+        && let Some(temperature) =
+            known_temperature(channel_reference.as_ref().unwrap_or(&reference))
     {
         eprintln!(
             "warning: the master dark records no sensor temperature, so it cannot be checked against the lights ({temperature}C in {})",
-            reference_path.display()
+            ordered[0].display()
         );
     }
     let effective_maximum_drift_pixels = stack_options
@@ -565,8 +579,14 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
         minimum_integrated_fraction: stack_options.acceptance.minimum_integrated_fraction,
     };
 
-    let mut stacker = if options.reference_image.is_some() {
-        seiza_stacking::LiveStacker::with_reference_image(reference, calibration, stack_options)
+    let mut stacker = if let Some(channel_reference) = channel_reference {
+        println!("normalize  {} (channel reference)", ordered[0].display());
+        seiza_stacking::LiveStacker::with_reference_image(
+            reference,
+            channel_reference,
+            calibration,
+            stack_options,
+        )
     } else {
         seiza_stacking::LiveStacker::new(reference, calibration, stack_options)
     }
@@ -805,6 +825,7 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
             output: file_identity(&options.output)?,
             preview: preview_path.map(|path| path.display().to_string()),
             reference: reference_identity.expect("report identity was prepared"),
+            normalization_reference: normalization_identity,
             reference_integrated_automatically: options.reference_image.is_none(),
             calibration: calibration_report.expect("report calibration was prepared"),
             configuration: configuration_report,

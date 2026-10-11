@@ -151,7 +151,15 @@ fn common_reference_aligns_channels_without_contributing_pixels() {
                     let path = directory.path().join(format!("{channel}-{i}.fits"));
                     let pixels = star_field(x, y)
                         .into_iter()
-                        .map(|v| v * gain)
+                        // The second light needs real within-channel gain and
+                        // background correction; disabling normalization fails.
+                        .map(|v| {
+                            if i == 0 {
+                                v * gain
+                            } else {
+                                v * gain * 1.5 + 0.2
+                            }
+                        })
                         .collect::<Vec<_>>();
                     write_f32_image(&path, WIDTH, HEIGHT, F32ImageData::Mono(&pixels), &[])
                         .unwrap();
@@ -168,7 +176,7 @@ fn common_reference_aligns_channels_without_contributing_pixels() {
                 .args(&lights)
                 .arg("--reference-image")
                 .arg(&reference)
-                .args(["--normalization", "none", "--rejection", "none"])
+                .args(["--reference", "first", "--rejection", "none"])
                 .arg("--output")
                 .arg(&output)
                 .arg("--report")
@@ -206,6 +214,18 @@ fn common_reference_aligns_channels_without_contributing_pixels() {
             assert_eq!(report["frames"].as_array().unwrap().len(), 2);
             assert_eq!(report["reference_integrated_automatically"], false);
             assert_eq!(report["reference"]["path"], reference.display().to_string());
+            assert_eq!(
+                report["normalization_reference"]["path"],
+                lights[0].display().to_string()
+            );
+            let frames = report["frames"].as_array().unwrap();
+            assert!((frames[0]["diagnostics"]["weight"][0].as_f64().unwrap() - 1.0).abs() < 0.01);
+            assert!(
+                frames[1]["diagnostics"]["normalization_mean_gain"]
+                    .as_f64()
+                    .unwrap()
+                    < 0.9
+            );
         }
     }
 }
@@ -290,12 +310,12 @@ fn common_reference_is_not_calibrated_with_the_channel_masters() {
         .output()
         .unwrap();
     assert!(!result.status.success());
-    assert!(String::from_utf8_lossy(&result.stderr).contains("no light frames were accepted"));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("temperature light=-10C master=0C"));
     assert!(!output.exists());
 }
 
 #[test]
-fn common_reference_rejects_conflicting_selection_and_output_aliases() {
+fn common_reference_rejects_output_aliases_with_either_channel_selection() {
     let directory = tempfile::tempdir().unwrap();
     let lights = write_lights(directory.path());
     let reference = directory.path().join("reference.fits");
@@ -316,14 +336,7 @@ fn common_reference_rejects_conflicting_selection_and_output_aliases() {
         let result = command.output().unwrap();
         assert!(!result.status.success());
         let stderr = String::from_utf8_lossy(&result.stderr);
-        assert!(
-            stderr.contains(if selection.is_some() {
-                "cannot be used with"
-            } else {
-                "same file"
-            }),
-            "{stderr}"
-        );
+        assert!(stderr.contains("same file"), "{stderr}");
         assert_eq!(std::fs::read(&reference).unwrap(), original);
     }
 }

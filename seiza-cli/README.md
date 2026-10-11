@@ -517,7 +517,7 @@ changed:
 | Option | Default | What it does |
 |---|---|---|
 | `--reference auto\|first` | `auto` | `auto` scores every frame on a half-resolution view (star signal over sky noise, which seeing, trailing, haze and twilight all lower) and, among frames near the best score, takes the flattest sky. `first` keeps the first frame given. |
-| `--reference-image PATH` | none | Use a common FITS/XISF reference for separate channel stacks, including `--reintegrate` and `--drizzle`. Sets the output grid, WCS, normalization target, and noise-weight scale. No reference pixels are integrated unless its path is also listed as a light. Conflicts with explicit `--reference`. |
+| `--reference-image PATH` | none | Use a common FITS/XISF reference for separate channel stacks, including `--reintegrate` and `--drizzle`. Sets only the alignment grid and WCS. `--reference auto\|first` selects a light within this channel for normalization and noise weighting. No external-reference pixels are integrated unless its path is also listed as a light. |
 | `--registration-model similarity\|affine\|quadratic` | `quadratic` | After the similarity match, fit a polynomial to up to 2 000 stars to follow lens distortion. A frame with too few stars keeps its similarity. |
 | `--normalization none\|global\|local\|local-background` | `local-background` | `local-background` keeps one gain per channel, measured from star photometry, and matches each tile's background to the reference's, so frames whose sky gradients differ leave no seams where coverage changes. `local` also fits a gain per tile. |
 | `--local-tile-size` | `256` | Tile size for `local` and `local-background`. |
@@ -604,12 +604,15 @@ seiza stack blue/*.fits --reference-image common.fits --output blue.fits --reint
 The common reference is demosaiced if needed, but the lights' bias, dark, and
 flat are not applied to it; supply a calibrated reference when needed. Its
 prepared channel count must match the lights (mono for separate mono filters,
-RGB for RGB or Bayer lights). Normalization matches the common reference's
-brightness as well as its grid; use `--normalization none` to preserve each
-channel's original intensity scale. Only listed lights count toward the stack.
+RGB for RGB or Bayer lights). Normalization and noise weighting use a
+calibrated light from the current channel, selected by `--reference auto`
+(the default) or `--reference first`. The shared image supplies geometry only,
+so default normalization remains enabled without matching different filters
+to one brightness scale. Only listed lights count toward the stack.
 With this option, the report's `reference_integrated_automatically` is false
 and `frames` contains every listed light, even when the reference is one of
-them. The reference retains its own SHA-256 identity in `reference`.
+them. The alignment image retains its SHA-256 identity in `reference`, and
+`normalization_reference` identifies the selected channel light.
 
 Mono inputs produce a one-plane linear FITS stack. Three-plane FITS/XISF inputs
 remain RGB, while raw one-shot-color frames with `BAYERPAT` are calibrated in
