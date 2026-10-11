@@ -807,7 +807,7 @@ impl LiveStacker {
                 .unwrap_or_else(crate::replay::Ledger::legacy),
             frame_cache: None,
             reference_cfa: None,
-            reference_is_integrated: false,
+            reference_is_integrated: restored.reference_is_integrated,
         })
     }
 
@@ -828,6 +828,7 @@ impl LiveStacker {
         context::write(
             path,
             context::ContextWriteState {
+                reference_is_integrated: self.reference_is_integrated,
                 options: &self.options,
                 calibration: &self.calibration,
                 reference: &self.reference,
@@ -888,8 +889,12 @@ impl LiveStacker {
     pub fn set_calibration(&mut self, calibration: CalibrationMasters) -> Result<()> {
         self.require_fits_input_mode()?;
         calibration.validate_master_set_signatures()?;
-        crate::context::validate_calibration(&self.reference, &calibration)
-            .map_err(Error::Calibration)?;
+        crate::context::validate_calibration(
+            &self.reference,
+            &calibration,
+            self.reference_is_integrated,
+        )
+        .map_err(Error::Calibration)?;
         let configuration_fingerprint =
             stack_configuration_fingerprint(&self.options, &calibration, self.input_mode)?;
         self.calibration = calibration;
@@ -2172,6 +2177,112 @@ mod tests {
     }
 
     #[test]
+    fn external_reference_replays_cached_uncached_and_restored_lights() {
+        let directory = tempfile::tempdir().unwrap();
+        let light = stacking_star_field(160, 128);
+        let mut reference = stacking_star_field(176, 144);
+        for value in &mut reference.data {
+            *value = *value * 2.0 + 500.0;
+        }
+        let reference_path = directory.path().join("reference.fits");
+        crate::write_processed_image_fits_f32(&reference_path, &reference, &[], &[]).unwrap();
+        let paths = (0..3)
+            .map(|index| {
+                let path = directory.path().join(format!("light-{index}.fits"));
+                crate::write_processed_image_fits_f32(
+                    &path,
+                    &offset_image(&light, index as f32),
+                    &[],
+                    &[],
+                )
+                .unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        let bits = |image: &LinearImage| image.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        for normalization in [
+            NormalizationMode::None,
+            NormalizationMode::LocalBackground { tile_size: 32 },
+        ] {
+            let options = StackOptions {
+                normalization,
+                weighting: FrameWeighting::inverse_noise_variance(),
+                ..StackOptions::default()
+            };
+            let make = || {
+                LiveStacker::with_reference_image(
+                    FitsFrame::open(&reference_path).unwrap(),
+                    CalibrationMasters::new(
+                        Some(LinearImage::new(160, 128, 1, vec![0.0; 160 * 128]).unwrap()),
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                    options.clone(),
+                )
+                .unwrap()
+            };
+            let mut uncached = make();
+            let mut cached = make();
+            assert_eq!(cached.view().accepted_frames, 0);
+            assert!(cached.view().coverage.iter().all(|&count| count == 0));
+            cached
+                .retain_frames_for_reintegration(Some(directory.path()))
+                .unwrap();
+            for path in &paths {
+                assert!(matches!(
+                    uncached.push_fits(path).unwrap(),
+                    FrameDisposition::Accepted(_)
+                ));
+                assert!(matches!(
+                    cached.push_fits(path).unwrap(),
+                    FrameDisposition::Accepted(_)
+                ));
+            }
+            assert_eq!(
+                bits(&uncached.snapshot().unwrap().image),
+                bits(&cached.snapshot().unwrap().image)
+            );
+            let context = directory.path().join("external.seiza-stack");
+            cached.save_context(&context).unwrap();
+            let mut restored = LiveStacker::open_context(&context).unwrap();
+            restored
+                .retain_frames_for_reintegration(Some(directory.path()))
+                .unwrap();
+            let batch = crate::BatchStackOptions {
+                scratch_directory: Some(directory.path().to_path_buf()),
+                ..Default::default()
+            };
+            let expected = uncached.reintegrate(&batch, |_, _, _| {}).unwrap().snapshot;
+            assert_eq!(expected.accepted_frames, 3);
+            for stacker in [&cached, &restored] {
+                let actual = stacker.reintegrate(&batch, |_, _, _| {}).unwrap().snapshot;
+                assert_eq!(actual.accepted_frames, 3);
+                assert_eq!(bits(&actual.image), bits(&expected.image));
+                assert_eq!(actual.coverage, expected.coverage);
+            }
+            if matches!(normalization, NormalizationMode::None) {
+                assert!(
+                    (expected.image.data[70 * 176 + 70] - light.data[70 * 160 + 70] - 1.0).abs()
+                        < 0.1
+                );
+            }
+            let (replayed, drizzled) = cached
+                .reintegrate_drizzled(
+                    &batch,
+                    &crate::DrizzleOptions {
+                        scale: 1,
+                        drop_shrink: Some(1.0),
+                    },
+                    |_, _, _| {},
+                )
+                .unwrap();
+            assert_eq!(replayed.snapshot.accepted_frames, 3);
+            assert_eq!((drizzled.image.width, drizzled.image.height), (176, 144));
+        }
+    }
+
+    #[test]
     fn delta_sigma_rejects_late_outlier_without_moving_mean() {
         let mut accumulator = Accumulator::new(1, false);
         let rejection = RejectionMode::DeltaSigma(DeltaSigmaOptions {
@@ -2450,6 +2561,7 @@ mod tests {
         context::write_legacy_v1(
             &path,
             context::ContextWriteState {
+                reference_is_integrated: stacker.reference_is_integrated,
                 options: &stacker.options,
                 calibration: &stacker.calibration,
                 reference: &stacker.reference,

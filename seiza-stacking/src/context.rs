@@ -28,6 +28,7 @@ const MAXIMUM_LEDGER_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const IO_BUFFER_VALUES: usize = 16 * 1024;
 
 pub(crate) struct ContextWriteState<'a> {
+    pub reference_is_integrated: bool,
     pub options: &'a StackOptions,
     pub calibration: &'a CalibrationMasters,
     pub reference: &'a LinearImage,
@@ -47,6 +48,7 @@ pub(crate) struct ContextWriteState<'a> {
 }
 
 pub(crate) struct RestoredContext {
+    pub reference_is_integrated: bool,
     pub options: StackOptions,
     pub calibration: CalibrationMasters,
     pub reference: LinearImage,
@@ -69,6 +71,10 @@ pub(crate) struct RestoredContext {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ContextMetadata {
+    /// Omitted for existing stacks; older readers reject external-reference
+    /// contexts rather than incorrectly caching the target as their first light.
+    #[serde(default, skip_serializing_if = "is_false")]
+    external_reference: bool,
     schema_version: u32,
     options: StackOptions,
     calibration: CalibrationMetadata,
@@ -186,8 +192,12 @@ fn write_version(path: &Path, state: ContextWriteState<'_>, format_version: u32)
         .options
         .validate()
         .map_err(|error| context_write_error(path, error.to_string()))?;
-    validate_calibration(state.reference, state.calibration)
-        .map_err(|message| context_write_error(path, message))?;
+    validate_calibration(
+        state.reference,
+        state.calibration,
+        state.reference_is_integrated,
+    )
+    .map_err(|message| context_write_error(path, message))?;
 
     let mut metadata = ContextMetadata::from_state(&state, format_version)
         .map_err(|message| context_write_error(path, message))?;
@@ -428,7 +438,7 @@ pub(crate) fn read(path: &Path) -> Result<RestoredContext> {
             let records: Vec<FrameWeightRecord> = postcard::from_bytes(&bytes)
                 .map_err(|error| context_read_error(path, error.to_string()))?;
             ledger
-                .attach_weights(records, reference.channels)
+                .attach_weights(records, reference.channels, !metadata.external_reference)
                 .map_err(|message| context_read_error(path, message))?;
         }
         if metadata.frame_warps {
@@ -499,7 +509,7 @@ pub(crate) fn read(path: &Path) -> Result<RestoredContext> {
     calibration
         .validate_master_set_signatures()
         .map_err(|error| context_read_error(path, error.to_string()))?;
-    validate_calibration(&reference, &calibration)
+    validate_calibration(&reference, &calibration, !metadata.external_reference)
         .map_err(|message| context_read_error(path, message))?;
     let reference_headers = metadata
         .reference_headers
@@ -516,6 +526,7 @@ pub(crate) fn read(path: &Path) -> Result<RestoredContext> {
         .collect();
 
     Ok(RestoredContext {
+        reference_is_integrated: !metadata.external_reference,
         options: metadata.options,
         calibration,
         reference,
@@ -551,6 +562,7 @@ impl ContextMetadata {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(Self {
             schema_version,
+            external_reference: !state.reference_is_integrated,
             options: state.options.clone(),
             calibration: CalibrationMetadata::from(state.calibration),
             reference: ImageMetadata::from(state.reference),
@@ -967,6 +979,7 @@ fn validate_weights(
 pub(crate) fn validate_calibration(
     reference: &LinearImage,
     calibration: &CalibrationMasters,
+    require_reference_dimensions: bool,
 ) -> std::result::Result<(), String> {
     let images = [
         ("bias", calibration.bias.as_ref()),
@@ -978,7 +991,9 @@ pub(crate) fn validate_calibration(
         .into_iter()
         .filter_map(|(name, image)| image.map(|image| (name, image)))
     {
-        if image.width != reference.width || image.height != reference.height {
+        if require_reference_dimensions
+            && (image.width != reference.width || image.height != reference.height)
+        {
             return Err(format!(
                 "{name} dimensions do not match the registration reference"
             ));

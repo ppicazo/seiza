@@ -238,6 +238,63 @@ fn common_reference_can_also_be_an_explicit_light_once() {
 }
 
 #[test]
+fn common_reference_is_not_calibrated_with_the_channel_masters() {
+    let directory = tempfile::tempdir().unwrap();
+    let lights = write_lights(directory.path());
+    let reference = directory.path().join("reference.fits");
+    write_f32_image(
+        &reference,
+        WIDTH,
+        HEIGHT,
+        F32ImageData::Mono(&star_field(5, 4)),
+        &sensor_cards(Some(0.0)),
+    )
+    .unwrap();
+    let dark = directory.path().join("dark.fits");
+    write_master_dark(&dark, Some(-10.0));
+    for reintegrate in [false, true] {
+        let output = directory.path().join(format!("stack-{reintegrate}.fits"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_seiza"));
+        command
+            .arg("stack")
+            .args(&lights)
+            .arg("--reference-image")
+            .arg(&reference)
+            .arg("--dark")
+            .arg(&dark)
+            .arg("--output")
+            .arg(&output);
+        if reintegrate {
+            command.arg("--reintegrate");
+        }
+        let result = command.output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(String::from_utf8_lossy(&result.stdout).contains("2 accepted frame(s)"));
+    }
+    // The same incompatible master must still reject the actual lights.
+    write_master_dark(&dark, Some(0.0));
+    let output = directory.path().join("rejected.fits");
+    let result = Command::new(env!("CARGO_BIN_EXE_seiza"))
+        .arg("stack")
+        .args(&lights)
+        .arg("--reference-image")
+        .arg(&reference)
+        .arg("--dark")
+        .arg(&dark)
+        .arg("--output")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("no light frames were accepted"));
+    assert!(!output.exists());
+}
+
+#[test]
 fn common_reference_rejects_conflicting_selection_and_output_aliases() {
     let directory = tempfile::tempdir().unwrap();
     let lights = write_lights(directory.path());

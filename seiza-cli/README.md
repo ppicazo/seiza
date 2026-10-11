@@ -517,6 +517,7 @@ changed:
 | Option | Default | What it does |
 |---|---|---|
 | `--reference auto\|first` | `auto` | `auto` scores every frame on a half-resolution view (star signal over sky noise, which seeing, trailing, haze and twilight all lower) and, among frames near the best score, takes the flattest sky. `first` keeps the first frame given. |
+| `--reference-image PATH` | none | Use a common FITS/XISF reference for separate channel stacks, including `--reintegrate` and `--drizzle`. Sets the output grid, WCS, normalization target, and noise-weight scale. No reference pixels are integrated unless its path is also listed as a light. Conflicts with explicit `--reference`. |
 | `--registration-model similarity\|affine\|quadratic` | `quadratic` | After the similarity match, fit a polynomial to up to 2 000 stars to follow lens distortion. A frame with too few stars keeps its similarity. |
 | `--normalization none\|global\|local\|local-background` | `local-background` | `local-background` keeps one gain per channel, measured from star photometry, and matches each tile's background to the reference's, so frames whose sky gradients differ leave no seams where coverage changes. `local` also fits a gain per tile. |
 | `--local-tile-size` | `256` | Tile size for `local` and `local-background`. |
@@ -586,10 +587,29 @@ excess transform drift, low overlap, or implausible normalization leave the
 existing additive stack unchanged. The optional `--report` JSON records
 SHA-256 identities for every source and calibration master, the complete
 configuration, and the ordered accepted/rejected disposition ledger. The
-reference is always integrated, so it counts toward `accepted_frames` but has
+automatically selected reference is integrated, so it counts toward `accepted_frames` but has
 no entry in the per-frame `frames` ledger; that ledger lists only the frames
 pushed after it, with each one's weight when frames are weighted. FITS and report outputs are
 published atomically after they are complete.
+
+To align separate filter channels to the same image, use the same reference
+for each run:
+
+```sh
+seiza stack red/*.fits --reference-image common.fits --output red.fits
+seiza stack green/*.fits --reference-image common.fits --output green.fits --reintegrate
+seiza stack blue/*.fits --reference-image common.fits --output blue.fits --reintegrate
+```
+
+The common reference is demosaiced if needed, but the lights' bias, dark, and
+flat are not applied to it; supply a calibrated reference when needed. Its
+prepared channel count must match the lights (mono for separate mono filters,
+RGB for RGB or Bayer lights). Normalization matches the common reference's
+brightness as well as its grid; use `--normalization none` to preserve each
+channel's original intensity scale. Only listed lights count toward the stack.
+With this option, the report's `reference_integrated_automatically` is false
+and `frames` contains every listed light, even when the reference is one of
+them. The reference retains its own SHA-256 identity in `reference`.
 
 Mono inputs produce a one-plane linear FITS stack. Three-plane FITS/XISF inputs
 remain RGB, while raw one-shot-color frames with `BAYERPAT` are calibrated in
