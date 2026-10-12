@@ -484,10 +484,16 @@ image belongs to the region and black elsewhere, with grays for a soft edge
 starless image onto a plane at that distance, and what lay behind it is
 filled in from the light around it, so the first frame is still the
 photograph. As the camera moves, a cloud in front of the nebula grows and
-slides past it, and a cloud behind it barely moves. A plane takes only the
-light that stands above what fills in behind it, so a dark cloud, which
-blocks light rather than giving it, gives its plane nothing. Repeat the
-option for more planes; where one lies inside another, the smaller keeps
+slides past it, and a cloud behind it barely moves. Where the region is
+brighter than what fills in behind it, the plane takes the light above
+that; where it is darker, and the plane lies in front of the nebula, a dark
+cloud blocks the light behind, and the plane keeps the share it lets
+through, each colour's. Everything behind the cloud then dims or brightens
+as the cloud slides across it, and a star seen where the cloud is opaque
+flies in front of it. A plane behind the nebula cannot darken it, and
+leaves the darkness where it is. Within a twentieth of the fill either way,
+the light is the background's own. Repeat the option
+for more planes; where one lies inside another, the smaller keeps
 its own light and the larger takes the rest. A star within 2% of a plane's
 distance, inside the plane, joins it, and a label on a plane moves with it.
 A plane fades as the camera flies through it, and where the image's edge
@@ -506,8 +512,24 @@ that lie at least 15% nearer or farther than the nebula. A distance typical
 of an object's kind never counts, and nor does one whose range takes in the
 nebula's own, as it cannot say which lies nearer. Each plane takes the
 object's outermost catalogued outline, or else its ellipse, grown to where
-the image's light levels off. The notes name each plane, its distance and
-how that was found. `--object-distance NAME=PARSECS` gives an object's
+the image's light levels off. It takes the nebula's light alone: darkness
+about it is dust, which stays with its cloud.
+
+A dark nebula is the thickest part of a cloud of dust, so it moves with
+that cloud rather than on its own. The star counts split the dust into
+clouds, faint dust included, each at one distance. A cloud that holds the
+nebula stays with it, its dark nebulae too: the notes say which, and where
+the Gaia stars put that dust. A cloud lying at least 15% in front of the
+nebula moves as one plane, dark and glowing parts together, at the distance
+of its largest dark nebula: measured, borrowed from an object around it, or
+that of the nearest cloud measured. A cloud the catalogue gives no distance
+lies where the Gaia stars seen through its thickest part run short: in front
+of a cloud there are as many stars at each distance as over clear sky, and
+behind it fewer, which is how published distances to dark clouds are
+measured. It needs a few stars in front, and a clear fall behind. A dark
+nebula in clear sky gets a plane of its own. The dust mapped from the star
+counts clears where a dark cloud's plane blocks the light itself. The notes
+name each plane, its distance and how that was found. `--object-distance NAME=PARSECS` gives an object's
 distance in place of the catalogue's, for the nebula's distance and for the
 automatic planes; repeat it for more objects. An automatic tour frames each
 target at its own plane's depth: a nearer plane grows sooner, so the camera
@@ -531,8 +553,9 @@ seiza parallax-video bigq.tif --starless bigq-starless.tif --stars bigq-stars.ti
 ```
 
 `--debug-layers DIR` writes the background, the leftover star light, every
-cut-out star tinted by distance, each depth plane, and the dust (white where
-opaque), for checking a result.
+cut-out star tinted by distance, each depth plane, a dark cloud's dust as
+`plane-N-dust.png`, and the dust (white where opaque), for checking a
+result.
 
 `--overlay` labels the catalogued objects in the field the way Seiza's image
 overlays do, with the same colours, names, outlines and ranking. Each label

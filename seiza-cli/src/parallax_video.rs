@@ -251,7 +251,7 @@ pub(crate) struct ParallaxVideoArgs {
     keep_split: bool,
     /// Write the scene's layers to this directory as PNG files: the
     /// background, the star light no star took, the stars cut out, marked
-    /// by their distance, and each depth plane
+    /// by their distance, and each depth plane, with a dark cloud's dust
     #[arg(long)]
     debug_layers: Option<PathBuf>,
     /// Leave galaxies in the starless image, on the nebula's plane, rather
@@ -299,7 +299,11 @@ pub(crate) struct ParallaxVideoArgs {
     /// their own onto planes: those with a measured distance, or one
     /// borrowed from an object around them, at least 15% nearer or farther
     /// than the nebula, each in its catalogued outline or its ellipse sized
-    /// by the image's light
+    /// by the image's light. A dark nebula moves with the cloud of dust it
+    /// lies in: a cloud that holds the nebula stays with it, and one at
+    /// least 15% in front of it, placed by its dark nebulae's distances or
+    /// where the Gaia stars seen through it run short, moves as one
+    /// plane
     #[arg(long)]
     auto_planes: bool,
     /// A distance for a catalogued object in place of the catalogue's,
@@ -1123,6 +1127,25 @@ fn write_layers(directory: &Path, scene: &Scene) -> Result<()> {
                 .copy_from_slice(&base.pixels[y * base.width..(y + 1) * base.width]);
         }
         save(&format!("plane-{}.png", index + 1), &image)?;
+        // A dark cloud's dust, white where it is opaque, as dust.png.
+        if let Some(transmission) = &plane.transmission {
+            let (width, height) = (scene.width(), scene.height());
+            let opacity = (0..width * height)
+                .map(|index| {
+                    let passed = transmission.at((index % width) as f64, (index / width) as f64);
+                    1.0 - (passed[0] + passed[1] + passed[2]) / 3.0
+                })
+                .collect();
+            let path = directory.join(format!("plane-{}-dust.png", index + 1));
+            seiza_parallax::DustMap {
+                width,
+                height,
+                opacity,
+            }
+            .save(&path)
+            .map_err(anyhow::Error::msg)?;
+            println!("wrote {}", path.display());
+        }
     }
     // The dust at its own cells, white where opaque, as --export-dust-map
     // writes it.

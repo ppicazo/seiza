@@ -2168,7 +2168,10 @@ char *seiza_rc_astro_process_file_json(const char *request_json,
  it in events and the summary), `autoPlanes` (lift the catalogued nebulae
  that lie at least 15% nearer or farther than the nebula, by a measured
  distance or one borrowed from an object around them, onto planes of
- their own), `distanceOverrides` (`[{object, distanceParsecs}]`:
+ their own; a dark nebula moves with the cloud of dust it lies in, which
+ stays with the nebula when it holds it, and moves as one plane when it
+ lies at least 15% in front, placed by its dark nebulae or the Gaia star
+ counts), `distanceOverrides` (`[{object, distanceParsecs}]`:
  distances for catalogued objects, by name, in place of the catalogue's,
  for the nebula's distance and the automatic planes), `start` ("focus",
  "whole"), `dolly`, `truck`, `truckAngleDegrees`,
@@ -2294,9 +2297,13 @@ SeizaParallax *seiza_parallax_reconfigure_json(const SeizaParallax *video,
  What preparing the video found, as JSON: its frame count, frame rate
  and size, the stars found and matched, the nebula's distance with how
  and where (`backgroundFocus`) it was found, galaxies lifted, the depth
- planes lifted (`planes`, `[{name, distanceParsecs, basis, coverage}]`,
- `basis` saying how the distance was found and `coverage` the share of
- the image), the dust
+ planes lifted (`planes`, `[{name, distanceParsecs, basis, coverage,
+ absorbs, object}]`, `basis` saying how the distance was found,
+ `coverage` the share of the image, `absorbs` whether it is a dark cloud
+ that blocks light behind it, and `object` the catalogued object whose
+ distance places it, by name, which `distanceOverrides` moves it by, or
+ null for a given mask or a cloud of dust no catalogued object names),
+ the dust
  (`dustTransmission` `{median, thickest}`, `dustGiven` when a map gave
  it, and `starsInFrontOfDust`, the stars it brought in front), objects
  labelled, the WCS used, and `fit`, how fitting the camera to the
