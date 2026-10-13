@@ -436,7 +436,7 @@ impl<'de> Deserialize<'de> for PolynomialWarp {
 }
 
 impl PolynomialWarp {
-    /// The polynomial order: 1 for affine, 2 for quadratic.
+    /// The polynomial order: 1 for affine, 2 for quadratic, 3 for cubic.
     pub fn order(&self) -> u8 {
         self.order
     }
@@ -511,7 +511,7 @@ impl PolynomialWarp {
     /// Check the order, coefficient counts, and that every value is finite.
     pub fn validate(&self) -> Result<()> {
         let terms = Self::term_count(self.order);
-        if !(1..=2).contains(&self.order)
+        if !(1..=3).contains(&self.order)
             || self.x.len() != terms
             || self.y.len() != terms
             || !(self.scale.is_finite() && self.scale > 0.0)
@@ -520,7 +520,7 @@ impl PolynomialWarp {
             || self.x.iter().chain(&self.y).any(|value| !value.is_finite())
         {
             return Err(Error::Registration(
-                "polynomial warp must be order 1 or 2 with finite coefficients".into(),
+                "polynomial warp must be order 1, 2 or 3 with finite coefficients".into(),
             ));
         }
         if let Some(distortion) = &self.distortion {
@@ -532,15 +532,29 @@ impl PolynomialWarp {
     fn term_count(order: u8) -> usize {
         match order {
             1 => 3,
+            3 => 10,
             _ => 6,
         }
     }
 
-    fn terms(order: u8, u: f64, v: f64) -> [f64; 6] {
+    fn terms(order: u8, u: f64, v: f64) -> [f64; 10] {
         if order == 1 {
-            [1.0, u, v, 0.0, 0.0, 0.0]
+            [1.0, u, v, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        } else if order == 3 {
+            [
+                1.0,
+                u,
+                v,
+                u * u,
+                u * v,
+                v * v,
+                u * u * u,
+                u * u * v,
+                u * v * v,
+                v * v * v,
+            ]
         } else {
-            [1.0, u, v, u * u, u * v, v * v]
+            [1.0, u, v, u * u, u * v, v * v, 0.0, 0.0, 0.0, 0.0]
         }
     }
 
@@ -551,9 +565,9 @@ impl PolynomialWarp {
         let center_y = height as f64 * 0.5;
         let scale = width.max(height) as f64 * 0.5;
         let count = Self::term_count(order);
-        let mut normal = [[0.0_f64; 6]; 6];
-        let mut right_x = [0.0_f64; 6];
-        let mut right_y = [0.0_f64; 6];
+        let mut normal = [[0.0_f64; 10]; 10];
+        let mut right_x = [0.0_f64; 10];
+        let mut right_y = [0.0_f64; 10];
         for &((reference_x, reference_y), (source_x, source_y)) in pairs {
             let terms = Self::terms(
                 order,
@@ -584,7 +598,7 @@ impl PolynomialWarp {
 
 /// Solve the leading `count` x `count` system by Gaussian elimination with
 /// partial pivoting.
-fn solve(mut matrix: [[f64; 6]; 6], mut right: [f64; 6], count: usize) -> Option<Vec<f64>> {
+fn solve(mut matrix: [[f64; 10]; 10], mut right: [f64; 10], count: usize) -> Option<Vec<f64>> {
     for column in 0..count {
         let pivot = (column..count)
             .max_by(|&a, &b| matrix[a][column].abs().total_cmp(&matrix[b][column].abs()))?;
@@ -620,7 +634,7 @@ fn solve(mut matrix: [[f64; 6]; 6], mut right: [f64; 6], count: usize) -> Option
 }
 
 /// A reference position and the source position of the same star.
-type PointPair = ((f64, f64), (f64, f64));
+pub(crate) type PointPair = ((f64, f64), (f64, f64));
 
 /// Stars detected for a polynomial fit, against 200 for matching.
 const DISTORTION_STARS: usize = 2_000;
@@ -963,6 +977,34 @@ impl Registrar {
         )
     }
 
+    /// Match through a geometric prediction instead of a similarity. At
+    /// the edge of a wide tangent plane a similarity can miss stars by
+    /// tens of pixels even when the camera's pose is already known.
+    pub(crate) fn warp_stars_seeded(
+        &self,
+        seed: &PolynomialWarp,
+        source_stars: &[DetectedStar],
+    ) -> Option<(PolynomialWarp, usize, f64)> {
+        let order = self.options.model.polynomial_order()?.max(seed.order());
+        let index = StarSpatialIndex::new(source_stars, DISTORTION_PAIR_PIXELS);
+        let mut seen = std::collections::HashSet::new();
+        let pairs = self
+            .dense_stars
+            .iter()
+            .filter_map(|reference| {
+                let (x, y) = seed.apply(reference.x, reference.y);
+                let (matched, _) =
+                    index.nearest_within(x, y, source_stars, DISTORTION_PAIR_PIXELS)?;
+                if !seen.insert(matched) {
+                    return None;
+                }
+                let source = &source_stars[matched];
+                Some(((reference.x, reference.y), (source.x, source.y)))
+            })
+            .collect();
+        self.fit_warp_pairs(order, pairs)
+    }
+
     /// Pair the dense source stars with the dense reference stars through the
     /// similarity, then fit a polynomial from reference to source with three
     /// rounds of clipping at three times the median residual. Returns the
@@ -974,8 +1016,7 @@ impl Registrar {
         transform: SimilarityTransform,
         source_stars: &[DetectedStar],
     ) -> Option<(PolynomialWarp, usize, f64)> {
-        let minimum = PolynomialWarp::term_count(order) * DISTORTION_PAIRS_PER_TERM;
-        let mut pairs = source_stars
+        let pairs = source_stars
             .iter()
             .filter_map(|star| {
                 let (x, y) = transform.apply(star.x, star.y);
@@ -989,6 +1030,15 @@ impl Registrar {
                 Some(((reference.x, reference.y), (star.x, star.y)))
             })
             .collect::<Vec<_>>();
+        self.fit_warp_pairs(order, pairs)
+    }
+
+    fn fit_warp_pairs(
+        &self,
+        order: u8,
+        mut pairs: Vec<PointPair>,
+    ) -> Option<(PolynomialWarp, usize, f64)> {
+        let minimum = PolynomialWarp::term_count(order) * DISTORTION_PAIRS_PER_TERM;
         if pairs.len() < minimum {
             return None;
         }
@@ -2052,6 +2102,51 @@ mod tests {
             flux: 1.0,
             peak: 1.0,
             area: 3,
+        }
+    }
+
+    #[test]
+    fn geometric_seed_pairs_stars_beyond_the_similarity_search_radius() {
+        let mut state = 721_u64;
+        let mut random = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (state >> 33) as f64 / (1_u64 << 31) as f64
+        };
+        let reference = (0..1200)
+            .map(|_| star(30.0 + 900.0 * random(), 30.0 + 900.0 * random()))
+            .collect::<Vec<_>>();
+        let geometry = |x: f64, y: f64| (x + 0.02 * x + 0.00003 * x * y, y + 0.01 * x);
+        let source = reference
+            .iter()
+            .map(|s| {
+                let (x, y) = geometry(s.x, s.y);
+                star(x + 0.3, y - 0.2)
+            })
+            .collect::<Vec<_>>();
+        let pairs = reference
+            .iter()
+            .map(|s| ((s.x, s.y), geometry(s.x, s.y)))
+            .collect::<Vec<_>>();
+        let seed = PolynomialWarp::fit(2, 1000, 1000, &pairs).unwrap();
+        let registrar = Registrar::from_stars(
+            1000,
+            1000,
+            reference,
+            RegistrationOptions {
+                maximum_stars: 2000,
+                model: RegistrationModel::Quadratic,
+                ..RegistrationOptions::default()
+            },
+        )
+        .unwrap();
+        let old = registrar.warp_stars(SimilarityTransform::IDENTITY, &source);
+        let (warp, count, rms) = registrar.warp_stars_seeded(&seed, &source).unwrap();
+        assert!(count > 1100 && rms < 1e-8, "{count} pairs at {rms}");
+        assert!(old.is_none_or(|(_, n, r)| n < count / 2 || r > 0.25));
+        for (x, y) in [(1.0, 2.0), (992.0, 998.0), (451.2, 179.3)] {
+            let expected = geometry(x, y);
+            let actual = warp.apply(x, y);
+            assert!((actual.0 - expected.0 - 0.3).hypot(actual.1 - expected.1 + 0.2) < 1e-8);
         }
     }
 

@@ -114,11 +114,11 @@ const PIER_FLIP_TOLERANCE_DEGREES: f64 = 20.0;
 /// sixth of them or less.
 const LENS_STARS: usize = 8_000;
 
-/// How far a panel start's quadratic may stray from the camera rotation it
+/// How far a panel start's polynomial may stray from the camera rotation it
 /// stands for, over the frame, before the lens model is abandoned.
 const MAXIMUM_GEOMETRY_ERROR_PIXELS: f64 = 0.02;
 
-/// Columns and rows of the grid of a panel start's pixels its quadratic is
+/// Columns and rows of the grid of a panel start's pixels its polynomial is
 /// fitted through.
 const GEOMETRY_GRID: (usize, usize) = (24, 16);
 
@@ -334,6 +334,22 @@ impl Window {
             registration.matched_stars = pairs;
             registration.rms_error_pixels = rms;
         }
+    }
+
+    fn refine_warp(
+        &self,
+        mut seed: RegistrationResult,
+        stars: &[DetectedStar],
+    ) -> Option<RegistrationResult> {
+        let local = seed
+            .warp
+            .as_ref()?
+            .translated(-(self.region.x as f64), -(self.region.y as f64));
+        let (warp, pairs, rms) = self.registrar.warp_stars_seeded(&local, stars)?;
+        seed.warp = Some(warp.translated(self.region.x as f64, self.region.y as f64));
+        seed.matched_stars = pairs;
+        seed.rms_error_pixels = rms;
+        Some(seed)
     }
 }
 
@@ -1034,7 +1050,7 @@ pub(crate) fn plan(
         pending = deferred;
     }
     let mut summary = None;
-    let (compatible, planning_notes) = optical_compatibility(&plan.record.optics);
+    let (compatible, mut planning_notes) = optical_compatibility(&plan.record.optics);
     // The lens bends neighboring panels' edges opposite ways, which the
     // similarities placing the panels' first frames cannot follow; measured
     // where those frames overlap, it is undone and the canvas planned again.
@@ -1053,7 +1069,9 @@ pub(crate) fn plan(
             }
             // Only a geometric or photometric failure can keep the first
             // plan. Resource, input, and cancellation errors remain fatal.
-            Err(error) if retryable(&error) => {}
+            Err(error) if retryable(&error) => planning_notes.push(format!(
+                "lens-corrected canvas rebuild failed; retaining the original plan: {error}"
+            )),
             Err(error) => return Err(error),
         }
     }
@@ -1690,7 +1708,7 @@ impl Plan {
     /// Within a panel the two frames' distortion all but cancels, so this
     /// lies within a pixel or so, for registration to refine without
     /// searching.
-    fn seed(&self, joined: &Joined, start: usize, fit: &LensFit) -> Option<SimilarityTransform> {
+    fn seed(&self, joined: &Joined, start: usize, fit: &LensFit) -> Option<RegistrationResult> {
         let lens = fit.distortion;
         let pose = fit.poses[start];
         let placed = self.placement(&joined.path)?;
@@ -1698,10 +1716,10 @@ impl Plan {
         let (width, height) = joined.size;
         let mut from = Vec::new();
         let mut to = Vec::new();
-        for row in 0..=4 {
-            for column in 0..=4 {
-                let x = (width - 1) as f64 * column as f64 / 4.0;
-                let y = (height - 1) as f64 * row as f64 / 4.0;
+        for row in 0..=2 * GEOMETRY_GRID.1 {
+            for column in 0..=2 * GEOMETRY_GRID.0 {
+                let x = (width - 1) as f64 * column as f64 / (2 * GEOMETRY_GRID.0) as f64;
+                let y = (height - 1) as f64 * row as f64 / (2 * GEOMETRY_GRID.1) as f64;
                 let (canvas_x, canvas_y) = placed.apply(x, y);
                 let (start_x, start_y) = first.inverse_apply(canvas_x, canvas_y);
                 let (u, v) = lens.undistort(start_x, start_y);
@@ -1709,7 +1727,34 @@ impl Plan {
                 from.push(lens.undistort(x, y));
             }
         }
-        crate::lens::fit_similarity(&from, &to)
+        let transform = crate::lens::fit_similarity(&from, &to)?;
+        let (left, top, right, bottom) = point_bounds(&to);
+        let mut grid = Vec::new();
+        let mut validation = Vec::new();
+        for (index, (&source, &(x, y))) in from.iter().zip(&to).enumerate() {
+            let pair = ((x - left, y - top), source);
+            let row = index / (2 * GEOMETRY_GRID.0 + 1);
+            let col = index % (2 * GEOMETRY_GRID.0 + 1);
+            if row.is_multiple_of(2) && col.is_multiple_of(2) {
+                grid.push(pair);
+            } else {
+                validation.push(pair);
+            }
+        }
+        let warp = fit_panel_geometry(
+            (right - left) as usize,
+            (bottom - top) as usize,
+            &grid,
+            &validation,
+        )
+        .ok()?;
+        Some(RegistrationResult {
+            transform,
+            warp: Some(warp.translated(left, top)),
+            matched_stars: 0,
+            rms_error_pixels: 0.0,
+            drift_pixels: 0.0,
+        })
     }
 
     /// Place a frame that started a panel by its fitted pose: grow the canvas
@@ -1752,32 +1797,26 @@ impl Plan {
         )
         .ok_or_else(|| Error::Registration("panel footprint is empty".into()))?;
         let (region_x, region_y) = (region.x as f64, region.y as f64);
-        // The frame's geometry: a quadratic through a grid of its pixels,
-        // from the canvas to their undistorted positions.
+        // Approximate the exact sky projection on a grid, checking the
+        // interleaved grid independently. Wide mosaics may need a cubic;
+        // the ordinary star-fitted registration model remains unchanged.
         let mut grid = Vec::new();
-        for row in 0..=GEOMETRY_GRID.1 {
-            for column in 0..=GEOMETRY_GRID.0 {
-                let x = (source.width - 1) as f64 * column as f64 / GEOMETRY_GRID.0 as f64;
-                let y = (source.height - 1) as f64 * row as f64 / GEOMETRY_GRID.1 as f64;
+        let mut validation = Vec::new();
+        for row in 0..=2 * GEOMETRY_GRID.1 {
+            for column in 0..=2 * GEOMETRY_GRID.0 {
+                let x = (source.width - 1) as f64 * column as f64 / (2 * GEOMETRY_GRID.0) as f64;
+                let y = (source.height - 1) as f64 * row as f64 / (2 * GEOMETRY_GRID.1) as f64;
                 let (u, v) = lens.undistort(x, y);
                 let (a, b) = pose.apply(fit.projection, u, v).ok_or_else(lost)?;
-                grid.push(((a + origin.0 - region_x, b + origin.1 - region_y), (u, v)));
+                let pair = ((a + origin.0 - region_x, b + origin.1 - region_y), (u, v));
+                if row % 2 == 0 && column % 2 == 0 {
+                    grid.push(pair);
+                } else {
+                    validation.push(pair);
+                }
             }
         }
-        let polynomial = PolynomialWarp::fit(2, region.width, region.height, &grid)
-            .ok_or_else(|| Error::Registration("a panel start's geometry is singular".into()))?;
-        let worst = grid
-            .iter()
-            .map(|&((x, y), (u, v))| {
-                let (a, b) = polynomial.apply(x, y);
-                (a - u).hypot(b - v)
-            })
-            .fold(0.0, f64::max);
-        if worst.is_nan() || worst > MAXIMUM_GEOMETRY_ERROR_PIXELS {
-            return Err(Error::Registration(format!(
-                "a quadratic follows a panel start's rotation only to {worst:.3}px"
-            )));
-        }
+        let polynomial = fit_panel_geometry(region.width, region.height, &grid, &validation)?;
         let warp = polynomial
             .translated(region_x, region_y)
             .with_distortion(lens);
@@ -1859,7 +1898,7 @@ impl Plan {
     fn register_through_lens(
         &mut self,
         joined: &Joined,
-        seed: Option<SimilarityTransform>,
+        seed: Option<RegistrationResult>,
         options: &StackOptions,
         maximum_samples: usize,
     ) -> Result<RegistrationResult> {
@@ -1874,10 +1913,15 @@ impl Plan {
             translation_y: self.origin.1,
             ..SimilarityTransform::IDENTITY
         };
-        let refined = seed.and_then(|seed| {
-            let (result, coverage) = self.windows[window]
-                .refine(seed.then(origin), &stars)
-                .ok()?;
+        let refined = seed.and_then(|mut seed| {
+            seed.transform = seed.transform.then(origin);
+            seed.warp = seed
+                .warp
+                .map(|warp| warp.translated(self.origin.0, self.origin.1));
+            if let Some(result) = self.windows[window].refine_warp(seed.clone(), &stars) {
+                return Some((admissible(result, options).ok()?, window, 1.0));
+            }
+            let (result, coverage) = self.windows[window].refine(seed.transform, &stars).ok()?;
             Some((admissible(result, options).ok()?, window, coverage))
         });
         let (mut registration, window, coverage) = match refined {
@@ -1901,7 +1945,10 @@ impl Plan {
         }
         registration.transform.translation_x += dx as f64;
         registration.transform.translation_y += dy as f64;
-        if coverage >= WARP_COVERAGE {
+        registration.warp = registration
+            .warp
+            .map(|warp| warp.translated(dx as f64, dy as f64));
+        if registration.warp.is_none() && coverage >= WARP_COVERAGE {
             self.windows[window].warp(&mut registration, &stars);
         }
         Ok(through_lens(registration, Some(lens)))
@@ -2009,6 +2056,40 @@ fn point_bounds(points: &[(f64, f64)]) -> (f64, f64, f64, f64) {
         right.ceil() + 1.0,
         bottom.ceil() + 1.0,
     )
+}
+
+/// Keep the simplest approximation meeting the same accuracy bound on both
+/// the fit nodes and independent nodes between them.
+fn fit_panel_geometry(
+    width: usize,
+    height: usize,
+    grid: &[crate::registration::PointPair],
+    validation: &[crate::registration::PointPair],
+) -> Result<PolynomialWarp> {
+    let mut worst = f64::INFINITY;
+    for order in [2, 3] {
+        let Some(warp) = PolynomialWarp::fit(order, width, height, grid) else {
+            continue;
+        };
+        worst = grid
+            .iter()
+            .chain(validation)
+            .fold(0.0_f64, |worst, &((x, y), (u, v))| {
+                let (a, b) = warp.apply(x, y);
+                let error = (a - u).hypot(b - v);
+                if error.is_finite() {
+                    worst.max(error)
+                } else {
+                    f64::INFINITY
+                }
+            });
+        if worst <= MAXIMUM_GEOMETRY_ERROR_PIXELS {
+            return Ok(warp);
+        }
+    }
+    Err(Error::Registration(format!(
+        "a panel start's sky projection cannot be approximated within {MAXIMUM_GEOMETRY_ERROR_PIXELS}px (worst {worst:.3}px)"
+    )))
 }
 
 /// Only matching/admission failures may defer a frame or abandon a lens fit.
@@ -2174,6 +2255,67 @@ fn blank(width: usize, height: usize, channels: usize) -> Result<LinearImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wide_panel_projection_uses_a_validated_cubic() {
+        // ASI2600 / 250 mm geometry, with a panel well away from the
+        // anchor's tangent point. A quadratic exceeds the 0.02 px budget.
+        let (width, height) = (6248, 4176);
+        let focal = 250_000.0 / 3.76;
+        let angle = (15_000.0_f64 / focal).atan();
+        let (s, c) = angle.sin_cos();
+        let projection = crate::lens::Projection {
+            focal,
+            center_x: width as f64 / 2.0,
+            center_y: height as f64 / 2.0,
+        };
+        let pose = crate::lens::Pose::Rotation {
+            rotation: [[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]],
+            focal,
+        };
+        let mut grid = Vec::new();
+        let mut validation = Vec::new();
+        for row in 0..=32 {
+            for col in 0..=48 {
+                let source = (
+                    (width - 1) as f64 * col as f64 / 48.0,
+                    (height - 1) as f64 * row as f64 / 32.0,
+                );
+                let (x, y) = pose.apply(Some(projection), source.0, source.1).unwrap();
+                let pair = ((x - 15_000.0, y), source);
+                if row % 2 == 0 && col % 2 == 0 {
+                    grid.push(pair);
+                } else {
+                    validation.push(pair);
+                }
+            }
+        }
+        let quadratic = PolynomialWarp::fit(2, width, height, &grid).unwrap();
+        assert!(validation.iter().any(|&((x, y), (u, v))| {
+            let (a, b) = quadratic.apply(x, y);
+            (a - u).hypot(b - v) > MAXIMUM_GEOMETRY_ERROR_PIXELS
+        }));
+        let warp = fit_panel_geometry(width, height, &grid, &validation).unwrap();
+        assert_eq!(warp.order(), 3);
+        warp.validate().unwrap();
+        // Saved warps, including the compact context payload, must replay
+        // the same map rather than silently losing the higher-order terms.
+        let json: PolynomialWarp =
+            serde_json::from_str(&serde_json::to_string(&warp).unwrap()).unwrap();
+        let compact: PolynomialWarp =
+            postcard::from_bytes(&postcard::to_stdvec(&warp).unwrap()).unwrap();
+        assert_eq!(json, warp);
+        assert_eq!(compact, warp);
+        let moved = warp.translated(1300.0, 2700.0);
+        for &((x, y), (u, v)) in &validation {
+            let (a, b) = moved.apply(x + 1300.0, y + 2700.0);
+            assert!((a - u).hypot(b - v) < MAXIMUM_GEOMETRY_ERROR_PIXELS);
+        }
+        // Independent checks must also be allowed to veto the fit.
+        let mut inconsistent = validation.clone();
+        inconsistent[0].1.0 += 1.0;
+        assert!(fit_panel_geometry(width, height, &grid, &inconsistent).is_err());
+    }
 
     fn optical_frame(camera: &str, filter: &str, date: &str) -> FitsFrame {
         FitsFrame {

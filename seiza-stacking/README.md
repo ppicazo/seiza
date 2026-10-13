@@ -66,7 +66,13 @@ with each panel's camera rotation onto the anchor's tangent plane when the
 anchor's `FOCALLEN` and `XPIXSZ` give its focal length. When it explains what
 the similarities leave, the canvas is planned again on undistorted grids, and
 every frame's warp leads through the lens onto its own pixels;
-`LiveStacker::expanded_lens` reports what was measured. Before fitting, known
+`LiveStacker::expanded_lens` reports what was measured. Panel starts approximate
+the fitted sky projection with a quadratic, or a cubic when needed, retaining
+a 0.02-pixel error limit checked on both fitting and independent grid points.
+A failed rebuild keeps the original plan and reports its reason in the planning
+notes. Later planned frames match stars through that geometric prediction before
+refining their warp; a similarity alone can miss stars near the edges of a wide
+tangent plane even when its central matches have small residuals. Before fitting, known
 camera, dimension, binning, pixel-size or focal-length conflicts among joined
 frames disable the shared lens fit; pixel size and focal length allow 1% rounding
 tolerance. Missing metadata allows fitting with an unverified-compatibility
