@@ -693,8 +693,9 @@ the stars it claims to overlap, so the hot pixels that uncalibrated lights of
 another target share with the mosaic cannot place them. A frame that cannot join
 the connected mosaic, such as one of another target or cloud, is rejected with
 the reason, and the
-mosaic is built from the rest; expansion fails only when nothing joins the
-anchor, or the canvas would exceed `--max-canvas-megasamples`. One set of
+mosaic is built from the rest; expansion fails when nothing joins the
+anchor, an input changes or cannot be read, or the canvas would exceed
+`--max-canvas-megasamples`. One set of
 calibration masters applies to every frame, so lights whose sessions need
 different flats are better stacked per session first and their stacks
 expanded. The default overlap threshold is 10%; change it with
@@ -716,7 +717,17 @@ and misses its ends: by up to 17 px on that mosaic, so stars there appeared
 twice, or, under live rejection, as rings whose cores the first panel's frames
 had rejected from the second's. So once every frame has joined, one radial
 distortion, two coefficients about an axis that may lie off the sensor's
-center, is fitted where the panels' first frames overlap. Where the anchor's
+center, is fitted where the panels' first frames overlap. This shared lens
+model assumes one optical train and sensor geometry; combining different
+rigs or focal reducers needs separate distortion models. Before fitting, joined
+frames are checked for conflicting camera identity, dimensions, binning, pixel
+size and focal length. Pixel size and focal length allow 1% rounding tolerance.
+A known conflict skips the shared lens fit and keeps the first registration
+plan. Missing metadata allows fitting but reports that optical compatibility
+could not be verified. Filters and dates do not cause conflicts. Notes appear
+on stderr and in `configuration.expansion_planning_notes` in the JSON report.
+Matching metadata is a compatibility check, not proof of identical optics.
+Where the anchor's
 `FOCALLEN` and `XPIXSZ` give the focal length, each panel is placed on the
 anchor's tangent plane by a rotation of the camera rather than a similarity,
 which a wide mosaic's panels, several degrees apart, need. When the lens
@@ -726,7 +737,10 @@ the other frames register by the stars planning kept, and every frame's warp
 leads through the lens onto its own pixels. The JSON report's
 `configuration.expanded_lens` records the measured axis, coefficients, largest
 shift, and the overlaps' residual with and without it; the stack is planned on
-similarities alone when no lens is found, as for a single panel. On the
+similarities alone when no lens is found, as for a single panel. Lens correction
+changes the pixel grid, so the original WCS (including SIP distortion) is
+omitted; plate-solve the output mosaic to obtain valid astrometry. Without a
+lens correction, the anchor WCS is retained with its reference pixel shifted. On the
 Rosette mosaic's 215 S-II lights, the lens moved stars up to 63 px about an axis
 127 px off center, and the panels' first frames met at 0.12 px RMS through it,
 against 11.8 px fitted without it. A night that had sat 2 to 3 px off its
@@ -754,9 +768,9 @@ and expand the flattened panel stacks into the mosaic.
 `--reintegrate` uses the same expanded canvas and recorded transforms.
 Planning reads every frame before the integration pass. Each frame being
 registered and the reintegration scratch, four bytes per sample per frame, both
-span the full canvas. A saved stack context keeps the panels, so frames added
-after reopening it register the same way, through the lens planning
-measured.
+span the full canvas. A saved stack context keeps the panels, with the stars planning
+matched each by (its first frame's), and the lens planning measured, so a
+frame added after reopening registers exactly as it would have before saving.
 
 For S/H/O, run expansion separately for each filter and register the resulting
 three mosaics together afterward. Independent expansion runs may choose different

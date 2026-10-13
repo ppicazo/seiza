@@ -49,7 +49,8 @@ and photometric scale. Every other frame registers against the footprints of
 the panels already placed, not the whole canvas, and a frame that starts a new
 panel is refit against every star it covers. Frames may differ in rotation by
 any amount. A frame that cannot join is rejected with the reason when pushed;
-planning fails only when nothing joins the anchor. The canvas supplies alignment and
+planning fails when nothing joins the anchor, an input changes or cannot be read,
+or the canvas limit is exceeded. The canvas supplies alignment and
 normalization only, so push every light, including the anchor: planned paths
 reuse their planned transforms, and fail if the file has changed since, while
 other frames register through the panels. `maximum_samples` bounds the
@@ -65,9 +66,21 @@ with each panel's camera rotation onto the anchor's tangent plane when the
 anchor's `FOCALLEN` and `XPIXSZ` give its focal length. When it explains what
 the similarities leave, the canvas is planned again on undistorted grids, and
 every frame's warp leads through the lens onto its own pixels;
-`LiveStacker::expanded_lens` reports what was measured. Bayer drizzle and
-drizzled reintegration are refused. Saved contexts keep the panels and the
-lens, and older readers reject them.
+`LiveStacker::expanded_lens` reports what was measured. Before fitting, known
+camera, dimension, binning, pixel-size or focal-length conflicts among joined
+frames disable the shared lens fit; pixel size and focal length allow 1% rounding
+tolerance. Missing metadata allows fitting with an unverified-compatibility
+note. Filter and date changes are ignored. `expansion_planning_notes()` exposes
+these notes for newly planned stacks; reopening a context does not rerun the
+check. A lens-corrected
+canvas drops the original WCS, including SIP: plate-solve its output to obtain
+astrometry for the undistorted grid. Without lens correction, the anchor WCS
+is retained with its reference pixel shifted. Bayer drizzle and
+drizzled reintegration are refused. Saved contexts keep the panels, each
+with the stars planning matched it by, and the lens, so a frame added after
+reopening registers exactly as it would have before saving; older readers
+reject them. A context saved before panels kept their stars still opens,
+and its panels then match the stars of the canvas beneath them.
 
 Live delta-sigma rejection cannot remove trails admitted during its warm-up.
 `LiveStacker::reintegrate` fixes that for a live stack. The stacker keeps a

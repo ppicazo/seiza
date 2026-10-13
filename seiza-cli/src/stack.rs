@@ -226,6 +226,8 @@ struct ConfigurationReport {
     /// panels' overlaps measured one.
     #[serde(skip_serializing_if = "Option::is_none")]
     expanded_lens: Option<seiza_stacking::ExpandedLens>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    expansion_planning_notes: Vec<String>,
     registration_detection_sigma: f32,
     registration_maximum_stars: usize,
     registration_triangle_stars: usize,
@@ -555,6 +557,7 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
         expanded_canvas: expand,
         maximum_canvas_samples: expand.then_some(maximum_samples),
         expanded_lens: None,
+        expansion_planning_notes: Vec::new(),
         registration_detection_sigma: stack_options.registration.detection_sigma,
         registration_maximum_stars: stack_options.registration.maximum_stars,
         registration_triangle_stars: stack_options.registration.triangle_stars,
@@ -697,6 +700,15 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
         // Sessions may differ in rotation; expansion admits any.
         configuration_report.maximum_rotation_degrees = 180.0;
         configuration_report.expanded_lens = stacker.expanded_lens();
+        configuration_report.expansion_planning_notes = stacker.expansion_planning_notes().to_vec();
+        for note in &configuration_report.expansion_planning_notes {
+            eprintln!("note: {note}");
+        }
+        if configuration_report.expanded_lens.is_some() {
+            eprintln!(
+                "note: lens correction changes the pixel grid; original WCS is omitted. Plate-solve the output mosaic for astrometry."
+            );
+        }
     }
     // Each admitted frame's registered image waits here for reintegration:
     // about four bytes per output sample per frame, beside the output rather

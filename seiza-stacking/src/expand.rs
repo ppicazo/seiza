@@ -187,18 +187,35 @@ impl Window {
         region: ReferenceRegion,
         options: &RegistrationOptions,
     ) -> Result<Self> {
+        let options = Self::options(region, options);
+        let stars = crate::registration::detect_stars(pixels, &options, options.dense_star_count());
+        Self::from_stars(region, stars, options)
+    }
+
+    /// The registration options a panel at `region` matches with.
+    fn options(region: ReferenceRegion, options: &RegistrationOptions) -> RegistrationOptions {
         let mut options = options.clone();
         // A frame overlapping this panel anywhere lies within about two of
         // its diagonals of the panel's center.
         options.maximum_drift_pixels = 2.0 * (region.width as f64).hypot(region.height as f64);
         options.maximum_stars *= PLANNING_STARS_FACTOR;
         options.triangle_stars = options.triangle_stars.max(PLANNING_TRIANGLE_STARS);
+        options
+    }
+
+    /// A panel at `region` matching `stars`, on the region's grid, with
+    /// [`Self::options`].
+    fn from_stars(
+        region: ReferenceRegion,
+        stars: Vec<DetectedStar>,
+        options: RegistrationOptions,
+    ) -> Result<Self> {
         let maximum_stars = options.maximum_stars;
         let match_tolerance_pixels = options.match_tolerance_pixels;
         let radius = options.effective_maximum_drift_pixels(region.width, region.height);
         let hypotheses =
             (radius / match_tolerance_pixels).powi(2) + options.maximum_candidates as f64;
-        let registrar = Registrar::new(pixels, options)?;
+        let registrar = Registrar::from_stars(region.width, region.height, stars, options)?;
         Ok(Self {
             region,
             stars: registrar.reference_star_positions(),
@@ -330,32 +347,57 @@ pub(crate) struct CanvasRegistrar {
     /// The lens the canvas is undistorted from, when planning measured one.
     lens: Option<LensDistortion>,
     summary: Option<crate::ExpandedLens>,
+    planning_notes: Vec<String>,
 }
 
 impl CanvasRegistrar {
+    /// Panels at `regions` of `canvas`, matching the stars planning saved
+    /// for them, or, for a context saved before panels kept their stars,
+    /// the stars of the canvas beneath them.
     pub(crate) fn new(
         canvas: &LinearImage,
         regions: &[ReferenceRegion],
+        stars: Option<Vec<Vec<DetectedStar>>>,
         lens: Option<LensDistortion>,
         options: &RegistrationOptions,
     ) -> Result<Self> {
         if regions.is_empty() {
             return Err(Error::Stack("an expanded canvas needs a panel".into()));
         }
+        if stars
+            .as_ref()
+            .is_some_and(|stars| stars.len() != regions.len())
+        {
+            return Err(Error::Stack(
+                "an expanded canvas saves stars for every panel".into(),
+            ));
+        }
+        let mut stars = stars.map(Vec::into_iter);
         let windows = regions
             .iter()
             .map(|region| {
                 if region.width == 0
                     || region.height == 0
-                    || region.x + region.width > canvas.width
-                    || region.y + region.height > canvas.height
+                    || region
+                        .x
+                        .checked_add(region.width)
+                        .is_none_or(|x| x > canvas.width)
+                    || region
+                        .y
+                        .checked_add(region.height)
+                        .is_none_or(|y| y > canvas.height)
                 {
                     return Err(Error::Stack(format!(
                         "panel {region:?} lies outside the {}x{} canvas",
                         canvas.width, canvas.height
                     )));
                 }
-                Window::new(canvas, *region, options)
+                match stars.as_mut().and_then(Iterator::next) {
+                    Some(stars) => {
+                        Window::from_stars(*region, stars, Window::options(*region, options))
+                    }
+                    None => Window::new(canvas, *region, options),
+                }
             })
             .collect::<Result<Vec<_>>>()?;
         if let Some(lens) = &lens {
@@ -363,6 +405,15 @@ impl CanvasRegistrar {
         }
         let summary = lens.map(|lens| crate::ExpandedLens::new(&lens, None));
         Ok(Self::from_windows(canvas.width, canvas.height, windows, lens).with_summary(summary))
+    }
+
+    pub(crate) fn planning_notes(&self) -> &[String] {
+        &self.planning_notes
+    }
+
+    fn with_planning_notes(mut self, notes: Vec<String>) -> Self {
+        self.planning_notes = notes;
+        self
     }
 
     fn with_summary(self, summary: Option<crate::ExpandedLens>) -> Self {
@@ -399,7 +450,16 @@ impl CanvasRegistrar {
             stars,
             lens,
             summary: None,
+            planning_notes: Vec::new(),
         }
+    }
+
+    /// Every panel's stars, on its own grid, as [`Self::new`] takes them.
+    pub(crate) fn panel_stars(&self) -> Vec<Vec<DetectedStar>> {
+        self.windows
+            .iter()
+            .map(|window| window.registrar.detected_stars().to_vec())
+            .collect()
     }
 
     /// The lens the canvas is undistorted from, if any.
@@ -598,6 +658,107 @@ struct Plan {
     record: Record,
 }
 
+/// Only acquisition settings relevant to sharing a lens. Filter, date and
+/// photometric/calibration settings deliberately do not participate.
+struct OpticalMetadata {
+    camera: Option<String>,
+    values: [Option<f64>; 7],
+}
+
+impl OpticalMetadata {
+    fn from_frame(frame: &FitsFrame) -> Self {
+        let signature = frame.metadata().signature;
+        let pixel = |key: &str| {
+            frame
+                .headers
+                .iter()
+                .find(|(k, _)| k == key)
+                .and_then(|(_, value)| value.as_f64())
+        };
+        let positive = |value: Option<f64>| value.filter(|v| v.is_finite() && *v > 0.0);
+        Self {
+            camera: signature
+                .camera
+                .map(|s| {
+                    s.split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .to_ascii_lowercase()
+                })
+                .filter(|s| !s.is_empty()),
+            values: [
+                Some(frame.image.width as f64),
+                Some(frame.image.height as f64),
+                positive(signature.binning_x.map(|v| v as f64)),
+                positive(signature.binning_y.map(|v| v as f64)),
+                positive(pixel("XPIXSZ")),
+                positive(pixel("YPIXSZ")),
+                positive(signature.focal_length_mm),
+            ],
+        }
+    }
+}
+
+/// Compare all known values, even when the anchor omitted a field. Missing
+/// values cannot prove compatibility, but do not veto an empirical fit.
+fn optical_compatibility(frames: &[(PathBuf, OpticalMetadata)]) -> (bool, Vec<String>) {
+    let labels = [
+        "width",
+        "height",
+        "X binning",
+        "Y binning",
+        "X pixel size",
+        "Y pixel size",
+        "focal length",
+    ];
+    let mut missing = Vec::new();
+    let mut notes = Vec::new();
+    let mut camera: Option<(&Path, &str)> = None;
+    for (path, frame) in frames {
+        if let Some(value) = frame.camera.as_deref() {
+            if let Some((first, expected)) = camera {
+                if value != expected {
+                    notes.push(format!("shared lens fit skipped: camera differs between {} ({expected}) and {} ({value})", first.display(), path.display()));
+                    break;
+                }
+            } else {
+                camera = Some((path, value));
+            }
+        } else if !missing.contains(&"camera") {
+            missing.push("camera");
+        }
+    }
+    for (index, label) in labels.iter().enumerate() {
+        let mut known: Option<(&Path, f64)> = None;
+        for (path, frame) in frames {
+            if let Some(value) = frame.values[index] {
+                if let Some((first, expected)) = known {
+                    // Dimensions/binning are exact; physical measurements
+                    // may be rounded differently by acquisition software.
+                    let tolerance = if index >= 4 {
+                        expected.abs().max(value.abs()) * 0.01
+                    } else {
+                        0.0
+                    };
+                    if (value - expected).abs() > tolerance {
+                        notes.push(format!("shared lens fit skipped: {label} differs between {} ({expected}) and {} ({value})", first.display(), path.display()));
+                        break;
+                    }
+                } else {
+                    known = Some((path, value));
+                }
+            } else if !missing.contains(label) {
+                missing.push(label);
+            }
+        }
+    }
+    let compatible = notes.is_empty();
+    if compatible && !missing.is_empty() {
+        notes.push(format!("shared lens optical compatibility could not be verified: missing {} on one or more joined frames; lens fitting remains allowed", missing.join(", ")));
+    }
+    (compatible, notes)
+}
+
 /// What planning learns of each frame, to plan again through a lens.
 #[derive(Default)]
 struct Record {
@@ -605,6 +766,7 @@ struct Record {
     /// pixel.
     anchor_size: (usize, usize),
     anchor_headers: Vec<(String, HeaderValue)>,
+    optics: Vec<(PathBuf, OpticalMetadata)>,
     /// The anchor first, then every frame that started a panel, in order.
     starts: Vec<Start>,
     /// Every frame that joined, in order, the anchor aside.
@@ -641,9 +803,27 @@ pub(crate) fn plan(
     let first = paths
         .first()
         .ok_or_else(|| Error::Stack("expansion needs light frames".into()))?;
+    // Keep the original identity across deferred matches and the lens pass.
+    // A later read must never combine new pixels with cached star detections.
+    let stamps: HashMap<_, _> = paths
+        .iter()
+        .map(|path| (path.clone(), crate::replay::SourceStamp::of(path)))
+        .collect();
+    let check_source = |path: &Path| -> Result<()> {
+        if stamps[path] != crate::replay::SourceStamp::of(path) {
+            return Err(Error::Stack(format!(
+                "{} changed during expansion planning",
+                path.display()
+            )));
+        }
+        Ok(())
+    };
+    check_source(first)?;
     let frame = FitsFrame::open(first)?;
     let metadata = frame.metadata();
+    let anchor_optics = OpticalMetadata::from_frame(&frame);
     let (frame, _) = crate::stack::prepare_reference(frame, calibration, options)?;
+    check_source(first)?;
     if frame.image.sample_count() > maximum_samples {
         return Err(Error::Stack(format!(
             "the anchor frame's {} samples exceed the expanded-canvas limit of {maximum_samples}",
@@ -665,6 +845,7 @@ pub(crate) fn plan(
     let record = Record {
         anchor_size: (frame.image.width, frame.image.height),
         anchor_headers: frame.headers.clone(),
+        optics: vec![(first.clone(), anchor_optics)],
         starts: vec![Start {
             path: first.clone(),
             stars: crate::registration::detect_stars(
@@ -682,7 +863,7 @@ pub(crate) fn plan(
         registrations: HashMap::from([(
             path_identity(first),
             PlannedRegistration {
-                stamp: crate::replay::SourceStamp::of(first),
+                stamp: stamps[first],
                 starts_panel: true,
                 result: Ok(RegistrationResult {
                     transform: SimilarityTransform::IDENTITY,
@@ -702,16 +883,19 @@ pub(crate) fn plan(
         origin: (0.0, 0.0),
         record,
     };
-    let prepare = |path: &Path, channels: usize| -> Result<LinearImage> {
-        let (frame, _) =
-            crate::stack::prepare_reference(FitsFrame::open(path)?, calibration, options)?;
+    let prepare = |path: &Path, channels: usize| -> Result<(LinearImage, OpticalMetadata)> {
+        check_source(path)?;
+        let frame = FitsFrame::open(path)?;
+        let optics = OpticalMetadata::from_frame(&frame);
+        let (frame, _) = crate::stack::prepare_reference(frame, calibration, options)?;
+        check_source(path)?;
         if frame.image.channels != channels {
             return Err(Error::Stack(format!(
                 "{} has a different channel count",
                 path.display()
             )));
         }
-        Ok(frame.image)
+        Ok((frame.image, optics))
     };
     let mut pending = paths[1..]
         .iter()
@@ -719,6 +903,7 @@ pub(crate) fn plan(
             path,
             stars: Vec::new(),
             size: None,
+            optics: None,
             tried: 0,
             error: None,
         })
@@ -742,11 +927,13 @@ pub(crate) fn plan(
             {
                 return Err(Error::Cancelled);
             }
+            check_source(path)?;
             // A frame that matched no panel keeps its stars, and is read
             // again only once a panel added since then matches it.
             let mut image = None;
             if item.size.is_none() {
-                let prepared = prepare(path, plan.image.channels)?;
+                let (prepared, optics) = prepare(path, plan.image.channels)?;
+                item.optics = Some(optics);
                 item.stars = plan.windows[0].registrar.detect_source_stars(&prepared);
                 item.size = Some((prepared.width, prepared.height));
                 image = Some(prepared);
@@ -761,7 +948,7 @@ pub(crate) fn plan(
                 Ok((registration, window, coverage)) => {
                     let image = match image {
                         Some(image) => image,
-                        None => prepare(path, plan.image.channels)?,
+                        None => prepare(path, plan.image.channels)?.0,
                     };
                     let joined = plan
                         .join(
@@ -785,10 +972,14 @@ pub(crate) fn plan(
                         path_identity(path),
                         PlannedRegistration {
                             result: Ok(registration),
-                            stamp: crate::replay::SourceStamp::of(path),
+                            stamp: stamps[path],
                             starts_panel,
                         },
                     );
+                    plan.record.optics.push((
+                        path.clone(),
+                        item.optics.take().expect("the frame was measured"),
+                    ));
                     plan.record.joined.push(Joined {
                         path: path.clone(),
                         stars: std::mem::take(&mut item.stars),
@@ -802,6 +993,9 @@ pub(crate) fn plan(
                     deferred.push(item);
                 }
                 Err(error) => {
+                    if !retryable(&error) {
+                        return Err(error);
+                    }
                     first_error.get_or_insert_with(|| format!("{}: {error}", path.display()));
                     item.error = Some(error.to_string());
                     deferred.push(item);
@@ -829,7 +1023,7 @@ pub(crate) fn plan(
                     path_identity(item.path),
                     PlannedRegistration {
                         result: Err(item.error.unwrap_or_else(|| "no panel matched".into())),
-                        stamp: crate::replay::SourceStamp::of(item.path),
+                        stamp: stamps[item.path],
                         starts_panel: false,
                     },
                 );
@@ -840,14 +1034,15 @@ pub(crate) fn plan(
         pending = deferred;
     }
     let mut summary = None;
+    let (compatible, planning_notes) = optical_compatibility(&plan.record.optics);
     // The lens bends neighboring panels' edges opposite ways, which the
     // similarities placing the panels' first frames cannot follow; measured
     // where those frames overlap, it is undone and the canvas planned again.
-    if let Some(fit) = plan.estimate_lens() {
+    if let Some(fit) = compatible.then(|| plan.estimate_lens()).flatten() {
         match plan.rebuild(
             &fit,
             first,
-            &prepare,
+            &|path, channels| prepare(path, channels).map(|(image, _)| image),
             options,
             maximum_samples,
             &mut progress,
@@ -856,9 +1051,10 @@ pub(crate) fn plan(
                 summary = Some(crate::ExpandedLens::new(&fit.distortion, Some(&fit)));
                 plan = rebuilt;
             }
-            Err(Error::Cancelled) => return Err(Error::Cancelled),
-            // The similarities' plan stands.
-            Err(_) => {}
+            // Only a geometric or photometric failure can keep the first
+            // plan. Resource, input, and cancellation errors remain fatal.
+            Err(error) if retryable(&error) => {}
+            Err(error) => return Err(error),
         }
     }
     reject_residual_outliers(&mut plan.registrations);
@@ -875,9 +1071,13 @@ pub(crate) fn plan(
     if progress(first, plan.registrations.len(), width, height) == Continue::No {
         return Err(Error::Cancelled);
     }
+    for path in paths {
+        check_source(path)?;
+    }
     Ok(Expansion {
         canvas: CanvasRegistrar::from_windows(width, height, plan.windows, plan.lens)
-            .with_summary(summary),
+            .with_summary(summary)
+            .with_planning_notes(planning_notes),
         image: plan.image,
         headers: plan.headers,
         metadata,
@@ -907,6 +1107,7 @@ struct Pending<'a> {
     stars: Vec<DetectedStar>,
     /// Width and height, once read.
     size: Option<(usize, usize)>,
+    optics: Option<OpticalMetadata>,
     /// Panels it has already failed to match.
     tried: usize,
     /// Why it last failed to join.
@@ -970,7 +1171,7 @@ impl Plan {
         let source_area = finite_source * transform.scale.powi(2);
         let overlap = common as f64 / (self.finite as f64).min(source_area).max(1.0);
         if common == 0 || overlap < f64::from(criteria.minimum_overlap_fraction) {
-            return Err(Error::Stack(format!(
+            return Err(Error::Registration(format!(
                 "panel overlap {overlap:.3} is below {}",
                 criteria.minimum_overlap_fraction
             )));
@@ -1098,7 +1299,7 @@ impl Plan {
         )?;
         let (low, high) = normalization.gain_range();
         if low < criteria.minimum_normalization_gain || high > criteria.maximum_normalization_gain {
-            return Err(Error::Stack(
+            return Err(Error::Normalization(
                 "panel normalization gain exceeds admission limits".into(),
             ));
         }
@@ -1204,7 +1405,7 @@ impl Plan {
         transform.translation_x += dx as f64;
         transform.translation_y += dy as f64;
         let region = footprint(source, transform, width, height)
-            .ok_or_else(|| Error::Stack("panel footprint is empty".into()))?;
+            .ok_or_else(|| Error::Registration("panel footprint is empty".into()))?;
         let incoming = crate::resample_region_to_reference_with(
             source,
             width,
@@ -1286,7 +1487,7 @@ impl Plan {
     }
 
     /// Measure the lens where the anchor and the frames that started panels
-    /// overlap. `None` unless every frame came from one sensor and the lens
+    /// overlap. `None` unless every frame has the same dimensions and the lens
     /// explains what their similarities leave.
     fn estimate_lens(&self) -> Option<LensFit> {
         let (width, height) = self.record.anchor_size;
@@ -1350,7 +1551,11 @@ impl Plan {
             .collect::<Vec<_>>();
         let (left, top, right, bottom) = point_bounds(&edge);
         let (width, height) = ((right - left) as usize, (bottom - top) as usize);
-        if width * height * channels > maximum_samples {
+        if width
+            .checked_mul(height)
+            .and_then(|n| n.checked_mul(channels))
+            .is_none_or(|n| n > maximum_samples)
+        {
             return Err(Error::Stack(format!(
                 "expanded canvas {width}x{height} exceeds the limit of {maximum_samples} samples"
             )));
@@ -1378,7 +1583,10 @@ impl Plan {
         drop(source);
         let anchor = Window::new(&image, region, &options.registration)?;
         let mut headers = self.record.anchor_headers.clone();
-        shift_reference_pixel(&mut headers, -left, -top);
+        // These pixels are undistorted. Translating CRPIX cannot compose the
+        // raw frame's WCS (including SIP) with this nonlinear mapping. Leave
+        // astrometry unset until the mosaic is plate-solved on its new grid.
+        headers.retain(|(key, _)| !crate::fits::preserve_wcs_key(key));
         let stamp = |path: &Path| {
             self.registrations
                 .get(&path_identity(path))
@@ -1446,9 +1654,11 @@ impl Plan {
             let seed = creators
                 .get(joined.window)
                 .and_then(|&start| self.seed(joined, start, fit));
-            let result = plan
-                .register_through_lens(joined, seed, options, maximum_samples)
-                .map_err(|error| error.to_string());
+            let result = match plan.register_through_lens(joined, seed, options, maximum_samples) {
+                Ok(result) => Ok(result),
+                Err(error) if retryable(&error) => Err(error.to_string()),
+                Err(error) => return Err(error),
+            };
             plan.registrations.insert(
                 path_identity(&joined.path),
                 PlannedRegistration {
@@ -1518,7 +1728,7 @@ impl Plan {
     ) -> Result<()> {
         let lens = fit.distortion;
         let pose = fit.poses[index];
-        let lost = || Error::Stack("a panel start turns away from the anchor's view".into());
+        let lost = || Error::Registration("a panel start turns away from the anchor's view".into());
         let to_anchor = |x: f64, y: f64| {
             let (u, v) = lens.undistort(x, y);
             pose.apply(fit.projection, u, v).ok_or_else(lost)
@@ -1540,7 +1750,7 @@ impl Plan {
             width,
             height,
         )
-        .ok_or_else(|| Error::Stack("panel footprint is empty".into()))?;
+        .ok_or_else(|| Error::Registration("panel footprint is empty".into()))?;
         let (region_x, region_y) = (region.x as f64, region.y as f64);
         // The frame's geometry: a quadratic through a grid of its pixels,
         // from the canvas to their undistorted positions.
@@ -1555,7 +1765,7 @@ impl Plan {
             }
         }
         let polynomial = PolynomialWarp::fit(2, region.width, region.height, &grid)
-            .ok_or_else(|| Error::Stack("a panel start's geometry is singular".into()))?;
+            .ok_or_else(|| Error::Registration("a panel start's geometry is singular".into()))?;
         let worst = grid
             .iter()
             .map(|&((x, y), (u, v))| {
@@ -1564,7 +1774,7 @@ impl Plan {
             })
             .fold(0.0, f64::max);
         if worst.is_nan() || worst > MAXIMUM_GEOMETRY_ERROR_PIXELS {
-            return Err(Error::Stack(format!(
+            return Err(Error::Registration(format!(
                 "a quadratic follows a panel start's rotation only to {worst:.3}px"
             )));
         }
@@ -1596,7 +1806,7 @@ impl Plan {
             }
         }
         if common == 0 {
-            return Err(Error::Stack(
+            return Err(Error::Registration(
                 "a panel start no longer overlaps the canvas".into(),
             ));
         }
@@ -1801,6 +2011,11 @@ fn point_bounds(points: &[(f64, f64)]) -> (f64, f64, f64, f64) {
     )
 }
 
+/// Only matching/admission failures may defer a frame or abandon a lens fit.
+fn retryable(error: &Error) -> bool {
+    matches!(error, Error::Registration(_) | Error::Normalization(_))
+}
+
 fn admissible(
     registration: RegistrationResult,
     options: &StackOptions,
@@ -1811,7 +2026,7 @@ fn admissible(
         || crate::stack::rotation_deviation_degrees(registration.transform.rotation_radians)
             > criteria.maximum_rotation_degrees
     {
-        return Err(Error::Stack(
+        return Err(Error::Registration(
             "panel transform exceeds registration admission limits".into(),
         ));
     }
@@ -1959,6 +2174,132 @@ fn blank(width: usize, height: usize, channels: usize) -> Result<LinearImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn optical_frame(camera: &str, filter: &str, date: &str) -> FitsFrame {
+        FitsFrame {
+            image: blank(100, 80, 1).unwrap(),
+            headers: vec![
+                ("INSTRUME".into(), HeaderValue::String(camera.into())),
+                ("XBINNING".into(), HeaderValue::Integer(1)),
+                ("YBINNING".into(), HeaderValue::Integer(1)),
+                ("XPIXSZ".into(), HeaderValue::Float(3.76)),
+                ("YPIXSZ".into(), HeaderValue::Float(3.76)),
+                ("FOCALLEN".into(), HeaderValue::Float(528.0)),
+                ("FILTER".into(), HeaderValue::String(filter.into())),
+                ("DATE-OBS".into(), HeaderValue::String(date.into())),
+            ],
+            exposure_seconds: None,
+            bayer: None,
+            source: None,
+            bounds: None,
+        }
+    }
+
+    #[test]
+    fn optical_check_allows_filters_dates_and_rounded_measurements() {
+        let a = optical_frame(" Camera A ", "S", "2025-01-01");
+        let mut b = optical_frame("camera a", "O", "2025-02-01");
+        for (key, value) in &mut b.headers {
+            if key == "FOCALLEN" {
+                *value = HeaderValue::Float(530.0);
+            }
+            if key == "XPIXSZ" {
+                *value = HeaderValue::Float(3.77);
+            }
+        }
+        let result = optical_compatibility(&[
+            ("a".into(), OpticalMetadata::from_frame(&a)),
+            ("b".into(), OpticalMetadata::from_frame(&b)),
+        ]);
+        assert_eq!(result, (true, Vec::new()));
+    }
+
+    #[test]
+    fn optical_check_finds_conflicts_even_with_missing_anchor_metadata() {
+        let a = optical_frame("Camera A", "S", "2025-01-01");
+        let mut missing = a.clone();
+        missing.headers.clear();
+        let allowed =
+            optical_compatibility(&[("missing".into(), OpticalMetadata::from_frame(&missing))]);
+        assert!(allowed.0);
+        assert!(allowed.1[0].contains("could not be verified"));
+        for key in [
+            "INSTRUME", "XBINNING", "YBINNING", "XPIXSZ", "YPIXSZ", "FOCALLEN",
+        ] {
+            let mut b = a.clone();
+            let value = &mut b.headers.iter_mut().find(|(k, _)| k == key).unwrap().1;
+            *value = if key == "INSTRUME" {
+                HeaderValue::String("Camera B".into())
+            } else if key.ends_with("BINNING") {
+                HeaderValue::Integer(2)
+            } else {
+                HeaderValue::Float(10.0)
+            };
+            let (compatible, notes) = optical_compatibility(&[
+                ("missing".into(), OpticalMetadata::from_frame(&missing)),
+                ("a".into(), OpticalMetadata::from_frame(&a)),
+                ("b".into(), OpticalMetadata::from_frame(&b)),
+            ]);
+            assert!(!compatible, "{key}");
+            assert!(notes[0].contains("shared lens fit skipped"));
+            assert!(notes[0].contains("a (") && notes[0].contains("b ("));
+        }
+    }
+
+    #[test]
+    fn restored_panels_reject_invalid_bounds_and_stars() {
+        let canvas = blank(100, 80, 1).unwrap();
+        let region = ReferenceRegion {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 80,
+        };
+        let options = RegistrationOptions {
+            minimum_matches: 3,
+            ..RegistrationOptions::default()
+        };
+        let stars = [(10.0, 12.0), (50.0, 19.0), (65.0, 60.0), (20.0, 55.0)]
+            .into_iter()
+            .map(|(x, y)| DetectedStar {
+                x,
+                y,
+                flux: 1.0,
+                peak: 1.0,
+                area: 1,
+            })
+            .collect::<Vec<_>>();
+        let restore = |region, stars| {
+            CanvasRegistrar::new(&canvas, &[region], Some(vec![stars]), None, &options)
+        };
+        assert!(restore(region, stars.clone()).is_ok());
+        for coordinate in [f64::NAN, f64::INFINITY, -1.0, 100.0] {
+            let mut invalid = stars.clone();
+            invalid[0].x = coordinate;
+            assert!(restore(region, invalid).is_err());
+        }
+        let mut invalid = stars.clone();
+        invalid[0].y = 80.0;
+        assert!(restore(region, invalid).is_err());
+        let mut invalid = stars.clone();
+        invalid[0].flux = f64::NAN;
+        assert!(restore(region, invalid).is_err());
+        let mut invalid = stars.clone();
+        invalid[0].peak = f32::INFINITY;
+        assert!(restore(region, invalid).is_err());
+        for invalid in [
+            ReferenceRegion {
+                x: usize::MAX,
+                ..region
+            },
+            ReferenceRegion {
+                y: usize::MAX,
+                ..region
+            },
+        ] {
+            assert!(restore(invalid, stars.clone()).is_err());
+        }
+    }
 
     #[test]
     fn bounds_include_rotated_corners_and_negative_origins() {

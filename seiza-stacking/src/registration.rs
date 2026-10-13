@@ -313,6 +313,10 @@ impl RegistrationModel {
 /// coordinates, the direction resampling reads. Coordinates are centred on
 /// the reference frame and scaled by half its larger dimension before the
 /// terms are formed, so the coefficients stay well conditioned.
+///
+/// A lens-corrected warp must be serialized with a human-readable format
+/// such as JSON, or through a saved stack context. Standalone compact binary
+/// serialization is refused because its legacy layout cannot hold a lens.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PolynomialWarp {
     order: u8,
@@ -382,6 +386,11 @@ impl Serialize for PolynomialWarp {
             }
             .serialize(serializer)
         } else {
+            if distortion.is_some() {
+                return Err(serde::ser::Error::custom(
+                    "binary warp serialization cannot preserve lens distortion; use JSON or a stack context",
+                ));
+            }
             PolynomialWarpCompact {
                 order,
                 center_x,
@@ -468,6 +477,18 @@ impl PolynomialWarp {
             distortion: Some(distortion),
             ..self
         }
+    }
+
+    /// A context saves this lens separately and attaches it after decoding
+    /// the legacy warp payload. Refuse to discard any other distortion.
+    pub(crate) fn for_context(mut self, lens: Option<crate::lens::LensDistortion>) -> Result<Self> {
+        if self.distortion != lens {
+            return Err(Error::Stack(
+                "frame warp does not share the context's lens".into(),
+            ));
+        }
+        self.distortion = None;
+        Ok(self)
     }
 
     /// The first-order polynomial equal to the inverse of `transform`.
@@ -630,7 +651,7 @@ impl Default for RegistrationOptions {
 
 impl RegistrationOptions {
     /// Stars to detect: the matching set, or more for a polynomial fit.
-    fn dense_star_count(&self) -> usize {
+    pub(crate) fn dense_star_count(&self) -> usize {
         if self.model.is_similarity() {
             self.maximum_stars
         } else {
@@ -714,10 +735,40 @@ impl Registrar {
     /// Detect stars in the reference frame and prepare the matching index.
     pub fn new(reference: &LinearImage, options: RegistrationOptions) -> Result<Self> {
         options.validate()?;
+        let stars = detect(reference, &options, options.dense_star_count());
+        Self::from_stars(reference.width, reference.height, stars, options)
+    }
+
+    /// A registrar for a `width` by `height` reference whose stars were
+    /// detected already, brightest first, as [`Self::detected_stars`] gives
+    /// them back.
+    pub(crate) fn from_stars(
+        width: usize,
+        height: usize,
+        stars: Vec<DetectedStar>,
+        options: RegistrationOptions,
+    ) -> Result<Self> {
+        options.validate()?;
+        // Saved panel detections enter here without passing through the
+        // detector. Reject corrupt coordinates before indexing or fitting.
+        if stars.iter().any(|star| {
+            !star.x.is_finite()
+                || !star.y.is_finite()
+                || star.x < 0.0
+                || star.y < 0.0
+                || star.x >= width as f64
+                || star.y >= height as f64
+                || !star.flux.is_finite()
+                || !star.peak.is_finite()
+        }) {
+            return Err(Error::Registration(
+                "reference stars must be finite and lie within the reference image".into(),
+            ));
+        }
         // The detector sorts by brightness before truncating, so the first
         // `maximum_stars` of a dense detection are exactly the matching set.
-        let dense_count = options.dense_star_count();
-        let mut reference_stars = detect(reference, &options, dense_count);
+        let mut reference_stars = stars;
+        reference_stars.truncate(options.dense_star_count());
         let dense_stars = if options.model.is_similarity() {
             Vec::new()
         } else {
@@ -741,11 +792,10 @@ impl Registrar {
         }
         let reference_index =
             StarSpatialIndex::new(&reference_stars, options.match_tolerance_pixels);
-        let maximum_drift_pixels =
-            options.effective_maximum_drift_pixels(reference.width, reference.height);
+        let maximum_drift_pixels = options.effective_maximum_drift_pixels(width, height);
         Ok(Self {
-            width: reference.width,
-            height: reference.height,
+            width,
+            height,
             reference_stars,
             reference_index,
             reference_triangles,
@@ -754,6 +804,16 @@ impl Registrar {
             maximum_drift_pixels,
             options,
         })
+    }
+
+    /// Every reference star detected, brightest first: what
+    /// [`Self::from_stars`] rebuilds this registrar from.
+    pub(crate) fn detected_stars(&self) -> &[DetectedStar] {
+        if self.dense_stars.is_empty() {
+            &self.reference_stars
+        } else {
+            &self.dense_stars
+        }
     }
 
     /// Positions of the reference frame's brightest stars, on its grid.
@@ -2018,6 +2078,29 @@ mod tests {
             translation_y: dy,
             ..SimilarityTransform::IDENTITY
         }
+    }
+
+    #[test]
+    fn lens_warps_cannot_silently_lose_distortion_in_binary_serialization() {
+        let plain = PolynomialWarp::from_similarity(shift(3.0, 5.0));
+        let bytes = postcard::to_stdvec(&plain).unwrap();
+        assert_eq!(
+            postcard::from_bytes::<PolynomialWarp>(&bytes).unwrap(),
+            plain
+        );
+        let lens = crate::lens::LensDistortion::none(160, 128);
+        let warped = plain.clone().with_distortion(lens);
+        assert!(postcard::to_stdvec(&warped).is_err());
+        assert_eq!(
+            serde_json::from_str::<PolynomialWarp>(&serde_json::to_string(&warped).unwrap())
+                .unwrap(),
+            warped,
+        );
+        assert!(warped.clone().for_context(None).is_err());
+        assert_eq!(
+            postcard::to_stdvec(&warped.for_context(Some(lens)).unwrap()).unwrap(),
+            bytes
+        );
     }
 
     #[test]

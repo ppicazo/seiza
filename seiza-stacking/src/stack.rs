@@ -722,7 +722,8 @@ impl LiveStacker {
     /// photometric scale. Every path must subsequently be pushed explicitly.
     /// Planning places frames by similarity at any rotation. A frame that
     /// cannot join is rejected, with the reason, when pushed; planning fails
-    /// only when nothing joins the first path. `maximum_samples` bounds
+    /// when nothing joins the first path, an input changes or cannot be read,
+    /// or the canvas limit is exceeded. `maximum_samples` bounds
     /// the canvas's pixels times channels; with frames being prepared, a
     /// stack peaks at about 40 bytes per sample. Each frame registers against the panels it overlaps, so a
     /// narrow overlap need not hold the canvas's brightest stars, and a frame
@@ -823,6 +824,14 @@ impl LiveStacker {
         self.canvas_registrar
             .as_ref()
             .and_then(crate::expand::CanvasRegistrar::lens_summary)
+    }
+
+    /// Metadata compatibility notes from expansion planning. Empty for
+    /// ordinary stacks and reopened contexts, which do not rerun planning.
+    pub fn expansion_planning_notes(&self) -> &[String] {
+        self.canvas_registrar
+            .as_ref()
+            .map_or(&[], |canvas| canvas.planning_notes())
     }
 
     /// The largest frame displacement registration accepts, in reference
@@ -1084,7 +1093,14 @@ impl LiveStacker {
     /// registration reference, calibration, online moments, and source ledger.
     pub fn open_context(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let restored = context::read(path)?;
+        let mut restored = context::read(path)?;
+        if restored.expanded_lens.is_some() {
+            // Early lens contexts retained the raw anchor's WCS even though
+            // their pixels were already on the undistorted canvas.
+            restored
+                .reference_headers
+                .retain(|(key, _)| !crate::fits::preserve_wcs_key(key));
+        }
         let read_error = |error: Error| Error::StackContextRead {
             path: path.to_path_buf(),
             message: error.to_string(),
@@ -1094,6 +1110,7 @@ impl LiveStacker {
                 crate::expand::CanvasRegistrar::new(
                     &restored.reference,
                     &restored.expanded_panels,
+                    restored.expanded_panel_stars,
                     restored.expanded_lens,
                     &restored.options.registration,
                 )
@@ -1187,6 +1204,11 @@ impl LiveStacker {
                     .canvas_registrar
                     .as_ref()
                     .map(crate::expand::CanvasRegistrar::regions)
+                    .unwrap_or_default(),
+                expanded_panel_stars: self
+                    .canvas_registrar
+                    .as_ref()
+                    .map(crate::expand::CanvasRegistrar::panel_stars)
                     .unwrap_or_default(),
                 expanded_lens: self
                     .canvas_registrar
@@ -3292,6 +3314,7 @@ mod tests {
                 input_mode: stacker.input_mode,
                 ledger: &stacker.ledger,
                 expanded_panels: &[],
+                expanded_panel_stars: Vec::new(),
                 expanded_lens: None,
             },
         )
@@ -3317,6 +3340,159 @@ mod tests {
             restored.push(frame()).unwrap(),
             FrameDisposition::Accepted(_)
         ));
+    }
+
+    /// Contexts saved before expanded canvases kept their panels' stars
+    /// hold the panels alone; reopened, each panel matches the stars of the
+    /// canvas beneath it, and frames still join.
+    #[test]
+    fn expanded_context_without_panel_stars_still_registers_frames() {
+        let (width, height, step) = (320_usize, 240_usize, 200_usize);
+        let sky_width = width + step;
+        let mut state = 0x5eed_u64;
+        let mut random = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as f64 / (1u64 << 31) as f64
+        };
+        let stars = (0..450)
+            .map(|_| {
+                (
+                    random() * sky_width as f64,
+                    random() * height as f64,
+                    300.0 + 3000.0 * random(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let directory = tempfile::tempdir().unwrap();
+        let panel = |name: &str, offset: f64| {
+            let mut data = vec![100.0_f32; width * height];
+            for &(sx, sy, peak) in &stars {
+                let x = sx - offset;
+                for py in (sy as isize - 4).max(0)..(sy as isize + 5).min(height as isize) {
+                    for px in (x as isize - 4).max(0)..(x as isize + 5).min(width as isize) {
+                        let d2 = (px as f64 - x).powi(2) + (py as f64 - sy).powi(2);
+                        data[py as usize * width + px as usize] +=
+                            (peak * (-d2 / 3.2).exp()) as f32;
+                    }
+                }
+            }
+            let path = directory.path().join(name);
+            seiza_fits::write_f32_image(
+                &path,
+                width,
+                height,
+                seiza_fits::F32ImageData::Mono(&data),
+                &[],
+            )
+            .unwrap();
+            path
+        };
+        let paths = [panel("a.fits", 0.0), panel("b.fits", step as f64)];
+        let mut options = StackOptions {
+            normalization: NormalizationMode::None,
+            ..StackOptions::default()
+        };
+        options.acceptance.minimum_overlap_fraction = 0.1;
+        let mut stacker = LiveStacker::with_expanding_reference(
+            &paths,
+            CalibrationMasters::default(),
+            options,
+            usize::MAX,
+            |_, _, _, _| crate::Continue::Yes,
+        )
+        .unwrap();
+        let placed = paths
+            .iter()
+            .map(|path| match stacker.push_fits(path).unwrap() {
+                FrameDisposition::Accepted(diagnostics) => diagnostics.transform,
+                other => panic!("{other:?}"),
+            })
+            .collect::<Vec<_>>();
+        let canvas = stacker.canvas_registrar.as_ref().unwrap();
+        let path = directory.path().join("before-panel-stars.seiza-stack");
+        context::write(
+            &path,
+            context::ContextWriteState {
+                reference_is_integrated: stacker.reference_is_integrated,
+                alignment_reference: stacker.alignment_reference.as_ref(),
+                reference_image_path: stacker.reference_image_path.as_deref(),
+                options: &stacker.options,
+                calibration: &stacker.calibration,
+                reference: &stacker.reference,
+                reference_headers: &stacker.reference_headers,
+                reference_metadata: &stacker.reference_metadata,
+                mean: &stacker.accumulator.mean,
+                m2: &stacker.accumulator.m2,
+                count: &stacker.accumulator.count,
+                rejected: &stacker.accumulator.rejected,
+                weight_sum: stacker.accumulator.weight_sum.as_deref(),
+                reference_noise: &stacker.reference_noise,
+                accepted_frames: stacker.accepted_frames,
+                rejected_frames: stacker.rejected_frames,
+                input_paths: &stacker.input_paths,
+                input_mode: stacker.input_mode,
+                ledger: &stacker.ledger,
+                expanded_panels: &canvas.regions(),
+                // As written before panels kept their stars.
+                expanded_panel_stars: Vec::new(),
+                expanded_lens: None,
+            },
+        )
+        .unwrap();
+        let mut restored = LiveStacker::open_context(&path).unwrap();
+        assert_eq!(
+            restored.canvas_registrar.as_ref().unwrap().regions(),
+            canvas.regions()
+        );
+        let late = panel("late.fits", step as f64 + 3.4);
+        let FrameDisposition::Accepted(diagnostics) = restored.push_fits(&late).unwrap() else {
+            panic!("a frame joins a context saved without panel stars");
+        };
+        // It lands where the panel it repeats was planned, 3.4px further on.
+        let (x, y) = diagnostics.transform.apply(0.0, 0.0);
+        let (px, py) = placed[1].apply(3.4, 0.0);
+        assert!((x - px).hypot(y - py) < 0.5, "{x},{y} against {px},{py}");
+        assert!(diagnostics.registration_rms_pixels < 0.5, "{diagnostics:?}");
+    }
+
+    #[test]
+    fn older_lens_context_drops_raw_anchor_wcs_on_reopening() {
+        let reference = stacking_star_field(160, 128);
+        let mut stacker = LiveStacker::from_linear(reference, StackOptions::default()).unwrap();
+        stacker.reference_is_integrated = false;
+        stacker.canvas_registrar = Some(
+            crate::expand::CanvasRegistrar::new(
+                &stacker.reference,
+                &[ReferenceRegion {
+                    x: 0,
+                    y: 0,
+                    width: 160,
+                    height: 128,
+                }],
+                None,
+                Some(crate::lens::LensDistortion::none(160, 128)),
+                &stacker.options.registration,
+            )
+            .unwrap(),
+        );
+        // Simulate a context written before raw WCS was invalidated.
+        stacker.reference_headers = vec![
+            ("CRPIX1".into(), HeaderValue::Float(80.5)),
+            ("CTYPE1".into(), HeaderValue::String("RA---TAN-SIP".into())),
+            ("A_2_0".into(), HeaderValue::Float(1.0e-5)),
+            ("EXPTIME".into(), HeaderValue::Float(60.0)),
+        ];
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("old-lens.context");
+        stacker.save_context(&path).unwrap();
+        let restored = LiveStacker::open_context(&path).unwrap();
+        assert!(restored.expanded_lens().is_some());
+        assert_eq!(
+            restored.reference_headers(),
+            &[("EXPTIME".into(), HeaderValue::Float(60.0))]
+        );
     }
 
     #[test]

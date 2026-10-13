@@ -403,6 +403,13 @@ fn cli_expand_preserves_all_panels_online_and_reintegrated() {
             assert_eq!(report["accepted_frames"], 3);
             assert_eq!(report["reference_integrated"], false);
             assert_eq!(report["configuration"]["expanded_canvas"], true);
+            assert!(
+                report["configuration"]["expansion_planning_notes"][0]
+                    .as_str()
+                    .unwrap()
+                    .contains("could not be verified")
+            );
+            assert!(String::from_utf8_lossy(&result.stderr).contains("could not be verified"));
             assert_eq!(
                 report["configuration"]["maximum_canvas_samples"],
                 256_000_000
@@ -465,6 +472,94 @@ fn expansion_refuses_disconnected_panels_and_canvas_overflow() {
             .to_string()
             .contains("exceeds the limit")
     );
+}
+
+#[test]
+fn expansion_refuses_canvas_overflow_after_a_panel_has_joined() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = panels(directory.path());
+    let mut options = StackOptions {
+        normalization: NormalizationMode::None,
+        ..StackOptions::default()
+    };
+    options.acceptance.minimum_overlap_fraction = 0.1;
+    // Two panels fit, but adding the third must fail the whole plan.
+    let limit = (WIDTH + STEP + 8) * (HEIGHT + 8);
+    assert!(
+        LiveStacker::with_expanding_reference(
+            &paths[..2],
+            CalibrationMasters::default(),
+            options.clone(),
+            limit,
+            |_, _, _, _| Continue::Yes,
+        )
+        .is_ok()
+    );
+    let result = LiveStacker::with_expanding_reference(
+        &paths,
+        CalibrationMasters::default(),
+        options,
+        limit,
+        |_, _, _, _| Continue::Yes,
+    );
+    assert!(
+        result
+            .err()
+            .expect("canvas overflow must not reject just one frame")
+            .to_string()
+            .contains("exceeds the limit")
+    );
+}
+
+#[test]
+fn expansion_rejects_sources_changed_during_planning() {
+    use std::io::Write;
+    // Exercise cached detections on retry and an already accepted anchor
+    // changed by the final progress callback.
+    for change_on_retry in [true, false] {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = panels(directory.path());
+        let order = [paths[0].clone(), paths[2].clone(), paths[1].clone()];
+        let mut options = StackOptions {
+            normalization: NormalizationMode::None,
+            ..StackOptions::default()
+        };
+        options.acceptance.minimum_overlap_fraction = 0.1;
+        let mut visits = 0;
+        let mut changed = false;
+        let result = LiveStacker::with_expanding_reference(
+            &order,
+            CalibrationMasters::default(),
+            options,
+            1_000_000,
+            |path, _, _, _| {
+                if path == paths[2] {
+                    visits += 1;
+                }
+                if !changed
+                    && ((change_on_retry && path == paths[2] && visits == 2)
+                        || (!change_on_retry && path == paths[0]))
+                {
+                    std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(path)
+                        .unwrap()
+                        .write_all(&[0; 2880])
+                        .unwrap();
+                    changed = true;
+                }
+                Continue::Yes
+            },
+        );
+        assert!(changed);
+        assert!(
+            result
+                .err()
+                .expect("changed pixels must not reuse a cached plan")
+                .to_string()
+                .contains("changed during expansion planning")
+        );
+    }
 }
 
 #[test]
@@ -921,13 +1016,249 @@ fn lens_mosaic(directory: &Path) -> (Vec<(PathBuf, Box<dyn Fn((f64, f64)) -> (f6
             PANEL_WIDTH,
             PANEL_HEIGHT,
             F32ImageData::Mono(&data),
-            &[],
+            &[
+                WriteHeaderCard::new("CRPIX1", HeaderValue::Float(360.5)),
+                WriteHeaderCard::new("CRPIX2", HeaderValue::Float(240.5)),
+                WriteHeaderCard::new("CRVAL1", HeaderValue::Float(120.0)),
+                WriteHeaderCard::new("CRVAL2", HeaderValue::Float(30.0)),
+                WriteHeaderCard::new("CTYPE1", HeaderValue::String("RA---TAN-SIP".into())),
+                WriteHeaderCard::new("CTYPE2", HeaderValue::String("DEC--TAN-SIP".into())),
+                WriteHeaderCard::new("CD1_1", HeaderValue::Float(-0.001)),
+                WriteHeaderCard::new("CD2_2", HeaderValue::Float(0.001)),
+                WriteHeaderCard::new("A_ORDER", HeaderValue::Integer(2)),
+                WriteHeaderCard::new("B_ORDER", HeaderValue::Integer(2)),
+                WriteHeaderCard::new("A_2_0", HeaderValue::Float(1.0e-5)),
+                WriteHeaderCard::new("EXPTIME", HeaderValue::Float(60.0)),
+            ],
         )
         .unwrap();
         let undistort = Lens { ..lens };
         frames.push((path, Box::new(move |raw| to_sky(undistort.undistort(raw)))));
     }
     (frames, lens)
+}
+
+/// Plan and stack every frame of `paths` but `late`, save the context, then
+/// register a copy of `late` on the live stack and another on the stack
+/// reopened from the context. Returns both registrations and whether
+/// planning measured a lens.
+fn register_late_frame_after_reopening(
+    directory: &Path,
+    paths: &[PathBuf],
+    late: usize,
+) -> (
+    seiza_stacking::FrameDiagnostics,
+    seiza_stacking::FrameDiagnostics,
+    bool,
+) {
+    let planned = paths
+        .iter()
+        .enumerate()
+        .filter(|&(index, _)| index != late)
+        .map(|(_, path)| path.clone())
+        .collect::<Vec<_>>();
+    let mut options = StackOptions {
+        normalization: NormalizationMode::LocalBackground { tile_size: 128 },
+        ..StackOptions::default()
+    };
+    options.registration.model = seiza_stacking::RegistrationModel::Quadratic;
+    options.acceptance.minimum_overlap_fraction = 0.1;
+    let mut stacker = LiveStacker::with_expanding_reference(
+        &planned,
+        CalibrationMasters::default(),
+        options,
+        10_000_000,
+        |_, _, _, _| Continue::Yes,
+    )
+    .unwrap();
+    for path in &planned {
+        assert!(matches!(
+            stacker.push_fits(path).unwrap(),
+            FrameDisposition::Accepted(_)
+        ));
+    }
+    let context = directory.join("late.context");
+    stacker.save_context(&context).unwrap();
+    let mut reopened = LiveStacker::open_context(&context).unwrap();
+    assert_eq!(
+        reopened.expanded_lens().is_some(),
+        stacker.expanded_lens().is_some()
+    );
+    let push = |stacker: &mut LiveStacker, name: &str| {
+        // Copies, since a stack refuses a file it has already integrated.
+        let copy = directory.join(name);
+        std::fs::copy(&paths[late], &copy).unwrap();
+        match stacker.push_fits(&copy).unwrap() {
+            FrameDisposition::Accepted(diagnostics) => diagnostics,
+            other => panic!("{}: {other:?}", copy.display()),
+        }
+    };
+    let live = push(&mut stacker, "late-live.fits");
+    let restored = push(&mut reopened, "late-reopened.fits");
+    (live, restored, stacker.expanded_lens().is_some())
+}
+
+/// Where a registration reads a canvas pixel from its source.
+fn source_of(diagnostics: &seiza_stacking::FrameDiagnostics, x: f64, y: f64) -> (f64, f64) {
+    match diagnostics.mapping.warp() {
+        Some(warp) => warp.apply(x, y),
+        None => diagnostics.transform.inverse_apply(x, y),
+    }
+}
+
+/// The largest distance between where two registrations of one frame read
+/// the canvas pixels the frame covers.
+fn disagreement(
+    a: &seiza_stacking::FrameDiagnostics,
+    b: &seiza_stacking::FrameDiagnostics,
+    width: f64,
+    height: f64,
+) -> f64 {
+    let mut worst: f64 = 0.0;
+    for row in 0..=8 {
+        for column in 0..=8 {
+            let (x, y) = a
+                .transform
+                .apply(width * column as f64 / 8.0, height * row as f64 / 8.0);
+            let (p, q) = (source_of(a, x, y), source_of(b, x, y));
+            worst = worst.max((p.0 - q.0).hypot(p.1 - q.1));
+        }
+    }
+    worst
+}
+
+#[test]
+fn a_frame_added_after_reopening_registers_as_before_without_a_lens() {
+    let directory = tempfile::tempdir().unwrap();
+    // Panel B's flipped frame is left out of planning and added late, to
+    // the panel its unflipped frame started, whose footprint on the canvas
+    // also holds panel A's edge.
+    let frames = flipped_panels(directory.path());
+    let paths = frames
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    assert!(frames[1].1, "the late frame is flipped");
+    let (live, reopened, lens) = register_late_frame_after_reopening(directory.path(), &paths, 1);
+    assert!(!lens, "this mosaic's distortion is not radial");
+    assert!(live.mapping.warp().is_some(), "the flipped frame is warped");
+    assert!(live.registration_rms_pixels < 0.3, "{live:?}");
+    let worst = disagreement(&live, &reopened, 511.0, 383.0);
+    assert!(worst < 1.0e-6, "reopened stack reads it {worst:.4}px away");
+}
+
+#[test]
+fn a_frame_added_after_reopening_registers_as_before_through_the_lens() {
+    let directory = tempfile::tempdir().unwrap();
+    let (frames, _) = lens_mosaic(directory.path());
+    let paths = frames
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    // The middle panel was shot from the other side of the pier; its second
+    // frame comes late.
+    let (live, reopened, lens) = register_late_frame_after_reopening(directory.path(), &paths, 3);
+    assert!(lens);
+    assert!(
+        live.transform.rotation_radians.cos() < 0.0,
+        "the frame is flipped"
+    );
+    assert!(live.registration_rms_pixels < 0.15, "{live:?}");
+    let worst = disagreement(&live, &reopened, 719.0, 479.0);
+    assert!(worst < 1.0e-6, "reopened stack reads it {worst:.4}px away");
+}
+
+#[test]
+fn expansion_does_not_hide_a_source_change_in_the_lens_pass() {
+    use std::io::Write;
+    let directory = tempfile::tempdir().unwrap();
+    let (frames, _) = lens_mosaic(directory.path());
+    let paths = frames
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    let mut options = StackOptions {
+        normalization: NormalizationMode::LocalBackground { tile_size: 128 },
+        ..StackOptions::default()
+    };
+    options.registration.model = seiza_stacking::RegistrationModel::Quadratic;
+    options.acceptance.minimum_overlap_fraction = 0.1;
+    let mut changed = false;
+    let result = LiveStacker::with_expanding_reference(
+        &paths,
+        CalibrationMasters::default(),
+        options,
+        10_000_000,
+        |path, planned, _, _| {
+            if path == paths[0] && planned == 0 {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(path)
+                    .unwrap()
+                    .write_all(&[0; 2880])
+                    .unwrap();
+                changed = true;
+            }
+            Continue::Yes
+        },
+    );
+    assert!(changed, "the fixture must reach the lens rebuild");
+    assert!(
+        result
+            .err()
+            .expect("a changed source must not fall back to the first plan")
+            .to_string()
+            .contains("changed during expansion planning")
+    );
+}
+
+#[test]
+fn a_conflicting_joined_frames_camera_disables_the_shared_lens() {
+    let directory = tempfile::tempdir().unwrap();
+    let (frames, _) = lens_mosaic(directory.path());
+    let paths = frames
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    for (index, path) in paths.iter().enumerate() {
+        let frame = FitsFrame::open(path).unwrap();
+        // This is a dithered sibling, not a panel start. Every joined frame
+        // must participate in the compatibility check.
+        let camera = if index == 1 { "Camera B" } else { "Camera A" };
+        write_f32_image(
+            path,
+            frame.image.width,
+            frame.image.height,
+            F32ImageData::Mono(&frame.image.data),
+            &[WriteHeaderCard::new(
+                "INSTRUME",
+                HeaderValue::String(camera.into()),
+            )],
+        )
+        .unwrap();
+    }
+    let mut options = StackOptions {
+        normalization: NormalizationMode::LocalBackground { tile_size: 128 },
+        ..StackOptions::default()
+    };
+    options.registration.model = seiza_stacking::RegistrationModel::Quadratic;
+    options.acceptance.minimum_overlap_fraction = 0.1;
+    let stacker = LiveStacker::with_expanding_reference(
+        &paths,
+        CalibrationMasters::default(),
+        options,
+        10_000_000,
+        |_, _, _, _| Continue::Yes,
+    )
+    .unwrap();
+    assert!(stacker.expanded_lens().is_none());
+    assert!(
+        stacker
+            .expansion_planning_notes()
+            .iter()
+            .any(|note| note.contains("shared lens fit skipped: camera")
+                && note.contains("lens-0-3.3.fits"))
+    );
 }
 
 #[test]
@@ -955,6 +1286,13 @@ fn expansion_measures_one_lens_across_its_panels() {
     let measured = stacker
         .expanded_lens()
         .expect("the panels' overlaps measure the lens");
+    assert!(
+        stacker
+            .expansion_planning_notes()
+            .iter()
+            .any(|note| note.contains("could not be verified")
+                && note.contains("lens fitting remains allowed"))
+    );
     let decenter = (lens.axis.0 - measured.center_x).hypot(lens.axis.1 - measured.center_y);
     assert!(decenter < 8.0, "{measured:?}");
     assert!(
@@ -1017,6 +1355,21 @@ fn expansion_measures_one_lens_across_its_panels() {
     let replayed = restored
         .reintegrate(&seiza_stacking::BatchStackOptions::default(), |_, _, _| {})
         .unwrap();
+    // Raw TAN-SIP headers do not describe the undistorted canvas. Neither
+    // online nor reopened/reintegrated output may publish that stale WCS.
+    for (name, snapshot, headers) in [
+        ("online", &snapshot, stacker.reference_headers()),
+        ("replayed", &replayed.snapshot, restored.reference_headers()),
+    ] {
+        for key in ["CRPIX1", "CTYPE1", "CD1_1", "A_ORDER", "A_2_0"] {
+            assert!(!headers.iter().any(|(k, _)| k == key), "{name}: {key}");
+        }
+        assert!(headers.iter().any(|(k, _)| k == "EXPTIME"));
+        let output = directory.path().join(format!("{name}.fits"));
+        seiza_stacking::write_fits_f32(&output, snapshot, headers).unwrap();
+        let output = FitsFrame::open(output).unwrap();
+        assert!(!output.headers.iter().any(|(k, _)| k == "CRPIX1"));
+    }
     let (mut compared, mut differing) = (0, 0);
     for (online, replay) in snapshot
         .image
@@ -1213,6 +1566,25 @@ fn expansion_joins_sessions_at_any_rotation_and_rejects_a_stray_frame() {
     // The anchor's panel at 0 and 37 degrees, its neighbour at 10.8 and 95.
     let sessions = [(0, 0.0), (1, 10.8), (0, 37.0), (1, 95.0)];
     let paths = rotated_sessions(directory.path(), &sessions);
+    for (index, path) in paths.iter().enumerate() {
+        let frame = FitsFrame::open(path).unwrap();
+        let camera = if index == sessions.len() {
+            "Unrelated rig"
+        } else {
+            "Mosaic rig"
+        };
+        write_f32_image(
+            path,
+            frame.image.width,
+            frame.image.height,
+            F32ImageData::Mono(&frame.image.data),
+            &[WriteHeaderCard::new(
+                "INSTRUME",
+                HeaderValue::String(camera.into()),
+            )],
+        )
+        .unwrap();
+    }
     let mut options = StackOptions {
         normalization: NormalizationMode::LocalBackground { tile_size: 128 },
         ..StackOptions::default()
@@ -1245,6 +1617,12 @@ fn expansion_joins_sessions_at_any_rotation_and_rejects_a_stray_frame() {
         other => panic!("stray frame: {other:?}"),
     }
     assert_eq!(stacker.snapshot().unwrap().accepted_frames, 4);
+    assert!(
+        !stacker
+            .expansion_planning_notes()
+            .iter()
+            .any(|note| note.contains("shared lens fit skipped"))
+    );
 }
 
 #[test]
