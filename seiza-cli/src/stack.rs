@@ -222,6 +222,10 @@ struct ConfigurationReport {
     expanded_canvas: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     maximum_canvas_samples: Option<usize>,
+    /// The lens distortion the expanded canvas was planned through, when its
+    /// panels' overlaps measured one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expanded_lens: Option<seiza_stacking::ExpandedLens>,
     registration_detection_sigma: f32,
     registration_maximum_stars: usize,
     registration_triangle_stars: usize,
@@ -550,6 +554,7 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
     let mut configuration_report = ConfigurationReport {
         expanded_canvas: expand,
         maximum_canvas_samples: expand.then_some(maximum_samples),
+        expanded_lens: None,
         registration_detection_sigma: stack_options.registration.detection_sigma,
         registration_maximum_stars: stack_options.registration.maximum_stars,
         registration_triangle_stars: stack_options.registration.triangle_stars,
@@ -691,6 +696,7 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
         configuration_report.registration_effective_maximum_drift_pixels = drift;
         // Sessions may differ in rotation; expansion admits any.
         configuration_report.maximum_rotation_degrees = 180.0;
+        configuration_report.expanded_lens = stacker.expanded_lens();
     }
     // Each admitted frame's registered image waits here for reintegration:
     // about four bytes per output sample per frame, beside the output rather

@@ -334,7 +334,11 @@ stacker.finish("mosaic.fits")
 ```
 
 `max_canvas_megasamples` (256 by default) bounds the canvas's pixels times
-channels; a run peaks at about 40 bytes per sample. `cancel`, a callable, is
+channels; a run peaks at about 40 bytes per sample. When the panels' overlaps
+show one lens distortion bending them all, planning undoes it and
+`stacker.expanded_lens` describes it as a dict (its axis, coefficients,
+largest shift in pixels, and the overlaps' residual with and without it);
+otherwise it is `None`. `cancel`, a callable, is
 asked before each light is planned, and Ctrl-C also stops planning. Drizzle is
 not supported on an expanded canvas. See the CLI documentation for how panels
 are matched and what the result looks like on real data.

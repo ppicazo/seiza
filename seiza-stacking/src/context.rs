@@ -49,6 +49,7 @@ pub(crate) struct ContextWriteState<'a> {
     pub input_mode: FrameInputMode,
     pub ledger: &'a Ledger,
     pub expanded_panels: &'a [ReferenceRegion],
+    pub expanded_lens: Option<crate::lens::LensDistortion>,
 }
 
 pub(crate) struct RestoredContext {
@@ -73,6 +74,7 @@ pub(crate) struct RestoredContext {
     /// `None` for a context saved before ledgers existed.
     pub ledger: Option<Ledger>,
     pub expanded_panels: Vec<ReferenceRegion>,
+    pub expanded_lens: Option<crate::lens::LensDistortion>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -115,6 +117,11 @@ struct ContextMetadata {
     /// Panel footprints an expanded canvas registers frames through.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     expanded_panels: Vec<ReferenceRegion>,
+    /// The lens distortion an expanded canvas is undistorted from. Readers
+    /// that predate it refuse the field rather than register new frames
+    /// onto the canvas with distorted stars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expanded_lens: Option<crate::lens::LensDistortion>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -468,8 +475,15 @@ pub(crate) fn read(path: &Path) -> Result<RestoredContext> {
         if metadata.frame_warps {
             let bytes = read_section(&mut decoder, "frame warps")
                 .map_err(|message| context_read_error(path, message))?;
-            let warps: Vec<Option<crate::PolynomialWarp>> = postcard::from_bytes(&bytes)
+            let mut warps: Vec<Option<crate::PolynomialWarp>> = postcard::from_bytes(&bytes)
                 .map_err(|error| context_read_error(path, error.to_string()))?;
+            // Every frame of a canvas planned through a lens was registered
+            // on undistorted stars, and its warp leads through that lens.
+            if let Some(lens) = metadata.expanded_lens {
+                for warp in warps.iter_mut() {
+                    *warp = warp.take().map(|warp| warp.with_distortion(lens));
+                }
+            }
             ledger
                 .attach_warps(warps)
                 .map_err(|message| context_read_error(path, message))?;
@@ -577,6 +591,7 @@ pub(crate) fn read(path: &Path) -> Result<RestoredContext> {
         input_mode: metadata.input_mode,
         ledger,
         expanded_panels: metadata.expanded_panels,
+        expanded_lens: metadata.expanded_lens,
     })
 }
 
@@ -629,6 +644,7 @@ impl ContextMetadata {
                 None
             },
             expanded_panels: state.expanded_panels.to_vec(),
+            expanded_lens: state.expanded_lens,
         })
     }
 
@@ -676,6 +692,12 @@ impl ContextMetadata {
             && (!self.external_reference || self.alignment_reference.is_some())
         {
             return Err("expanded-canvas context has an integrated or separate reference".into());
+        }
+        if let Some(lens) = &self.expanded_lens {
+            if self.expanded_panels.is_empty() {
+                return Err("context holds a lens distortion but no expanded canvas".into());
+            }
+            lens.validate().map_err(|error| error.to_string())?;
         }
         if self.reference_image_path.is_some() && self.alignment_reference.is_none() {
             return Err("context names a reference image but holds no alignment reference".into());

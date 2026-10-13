@@ -812,6 +812,237 @@ fn expansion_warps_frames_from_the_other_side_of_the_pier_onto_their_panel() {
     }
 }
 
+/// A radial lens about an axis off the sensor's center: a star an ideal lens
+/// images at `ideal` lands at `axis + (ideal - axis) (1 + k1 q + k2 q²)`, `q`
+/// being its squared distance from the axis over the half diagonal squared.
+struct Lens {
+    axis: (f64, f64),
+    radius: f64,
+    k1: f64,
+    k2: f64,
+}
+
+impl Lens {
+    fn distort(&self, (x, y): (f64, f64)) -> (f64, f64) {
+        let (u, v) = (x - self.axis.0, y - self.axis.1);
+        let q = (u * u + v * v) / (self.radius * self.radius);
+        let factor = 1.0 + self.k1 * q + self.k2 * q * q;
+        (self.axis.0 + u * factor, self.axis.1 + v * factor)
+    }
+
+    fn undistort(&self, (x, y): (f64, f64)) -> (f64, f64) {
+        let mut ideal = (x, y);
+        for _ in 0..50 {
+            let (dx, dy) = self.distort(ideal);
+            ideal = (ideal.0 + x - dx, ideal.1 + y - dy);
+        }
+        ideal
+    }
+}
+
+/// Three panels stacked down the sky, a quarter of each overlapping the
+/// next, the middle one shot from the other side of the pier, two dithered
+/// frames apiece, all through one decentred lens that moves stars up to ten
+/// pixels. Returns each frame's path and the map from its sensor to the sky.
+#[allow(clippy::type_complexity)]
+fn lens_mosaic(directory: &Path) -> (Vec<(PathBuf, Box<dyn Fn((f64, f64)) -> (f64, f64)>)>, Lens) {
+    const PANEL_WIDTH: usize = 720;
+    const PANEL_HEIGHT: usize = 480;
+    const STEP_Y: f64 = 360.0;
+    let lens = Lens {
+        axis: (359.5 + 25.0, 239.5 - 18.0),
+        radius: 0.5 * (PANEL_WIDTH as f64).hypot(PANEL_HEIGHT as f64),
+        k1: 0.02,
+        k2: 0.004,
+    };
+    let mut seed = 0x1e45_u64;
+    let mut random = || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (seed >> 33) as f64 / (1u64 << 31) as f64
+    };
+    let (sky_width, sky_height) = (
+        PANEL_WIDTH as f64 + 40.0,
+        2.0 * STEP_Y + PANEL_HEIGHT as f64 + 40.0,
+    );
+    let stars = (0..(sky_width * sky_height / 120.0) as usize)
+        .map(|_| {
+            (
+                random() * sky_width - 20.0,
+                random() * sky_height - 20.0,
+                (0.02 + 0.0005 / (0.01 + random()).powf(1.5)) as f32,
+            )
+        })
+        .collect::<Vec<_>>();
+    let (right, bottom) = ((PANEL_WIDTH - 1) as f64, (PANEL_HEIGHT - 1) as f64);
+    let mut frames: Vec<(PathBuf, Box<dyn Fn((f64, f64)) -> (f64, f64)>)> = Vec::new();
+    for (panel, dither) in [(0, 0.0), (0, 3.3), (1, 0.0), (1, -2.7), (2, 0.0), (2, 4.1)] {
+        let flipped = panel == 1;
+        let (ox, oy) = (dither, panel as f64 * STEP_Y + dither * 0.6);
+        // Sky to the frame's ideal grid, and back.
+        let to_frame = move |(x, y): (f64, f64)| {
+            let (x, y) = (x - ox, y - oy);
+            if flipped {
+                (right - x, bottom - y)
+            } else {
+                (x, y)
+            }
+        };
+        let to_sky = move |(x, y): (f64, f64)| {
+            let (x, y) = if flipped {
+                (right - x, bottom - y)
+            } else {
+                (x, y)
+            };
+            (x + ox, y + oy)
+        };
+        let mut data = vec![0.01_f32; PANEL_WIDTH * PANEL_HEIGHT];
+        for &(sx, sy, peak) in &stars {
+            let (x, y) = lens.distort(to_frame((sx, sy)));
+            for py in (y.floor() as isize - 4)..=(y.floor() as isize + 4) {
+                for px in (x.floor() as isize - 4)..=(x.floor() as isize + 4) {
+                    if px < 0 || py < 0 || px >= PANEL_WIDTH as isize || py >= PANEL_HEIGHT as isize
+                    {
+                        continue;
+                    }
+                    let d2 = (px as f64 - x).powi(2) + (py as f64 - y).powi(2);
+                    data[py as usize * PANEL_WIDTH + px as usize] +=
+                        peak * (-d2 / 2.9).exp() as f32;
+                }
+            }
+        }
+        for value in &mut data {
+            *value += (((0..4).map(|_| random()).sum::<f64>() - 2.0) * 0.0005) as f32;
+        }
+        let path = directory.join(format!("lens-{panel}-{dither}.fits"));
+        write_f32_image(
+            &path,
+            PANEL_WIDTH,
+            PANEL_HEIGHT,
+            F32ImageData::Mono(&data),
+            &[],
+        )
+        .unwrap();
+        let undistort = Lens { ..lens };
+        frames.push((path, Box::new(move |raw| to_sky(undistort.undistort(raw)))));
+    }
+    (frames, lens)
+}
+
+#[test]
+fn expansion_measures_one_lens_across_its_panels() {
+    let directory = tempfile::tempdir().unwrap();
+    let (frames, lens) = lens_mosaic(directory.path());
+    let paths = frames
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    let mut options = StackOptions {
+        normalization: NormalizationMode::LocalBackground { tile_size: 128 },
+        ..StackOptions::default()
+    };
+    options.registration.model = seiza_stacking::RegistrationModel::Quadratic;
+    options.acceptance.minimum_overlap_fraction = 0.1;
+    let mut stacker = LiveStacker::with_expanding_reference(
+        &paths,
+        CalibrationMasters::default(),
+        options,
+        10_000_000,
+        |_, _, _, _| Continue::Yes,
+    )
+    .unwrap();
+    let measured = stacker
+        .expanded_lens()
+        .expect("the panels' overlaps measure the lens");
+    let decenter = (lens.axis.0 - measured.center_x).hypot(lens.axis.1 - measured.center_y);
+    assert!(decenter < 8.0, "{measured:?}");
+    assert!(
+        measured.overlap_rms_pixels.unwrap() < 0.2
+            && measured.undistorted_overlap_rms_pixels.unwrap() > 0.5,
+        "{measured:?}"
+    );
+    let warps = paths
+        .iter()
+        .map(|path| match stacker.push_fits(path).unwrap() {
+            FrameDisposition::Accepted(diagnostics) => diagnostics.mapping.warp().cloned().unwrap(),
+            other => panic!("{}: {other:?}", path.display()),
+        })
+        .collect::<Vec<_>>();
+    // Every frame covering a canvas pixel must read it from the same point
+    // of the sky, seams included.
+    let snapshot = stacker.snapshot().unwrap();
+    let mut worst: f64 = 0.0;
+    let mut shared = 0;
+    for y in (0..snapshot.image.height).step_by(9) {
+        for x in (0..snapshot.image.width).step_by(9) {
+            let skies = warps
+                .iter()
+                .zip(&frames)
+                .filter_map(|(warp, (_, to_sky))| {
+                    let (u, v) = warp.apply(x as f64, y as f64);
+                    (u >= 4.0 && v >= 4.0 && u <= 715.0 && v <= 475.0).then(|| to_sky((u, v)))
+                })
+                .collect::<Vec<_>>();
+            if skies.len() > 2 {
+                shared += 1;
+            }
+            for a in &skies {
+                for b in &skies {
+                    worst = worst.max((a.0 - b.0).hypot(a.1 - b.1));
+                }
+            }
+        }
+    }
+    assert!(shared > 500, "{shared}");
+    assert!(worst < 0.25, "frames disagree by {worst:.3}px");
+
+    // A saved context keeps the lens: reintegration reads every frame back
+    // through it, and a frame pushed after reopening registers through it.
+    let context = directory.path().join("lens.context");
+    stacker.save_context(&context).unwrap();
+    let mut restored = LiveStacker::open_context(&context).unwrap();
+    let kept = restored
+        .expanded_lens()
+        .expect("the context keeps the lens");
+    assert_eq!(
+        (kept.center_x, kept.center_y, kept.k1, kept.k2),
+        (
+            measured.center_x,
+            measured.center_y,
+            measured.k1,
+            measured.k2
+        )
+    );
+    let replayed = restored
+        .reintegrate(&seiza_stacking::BatchStackOptions::default(), |_, _, _| {})
+        .unwrap();
+    let (mut compared, mut differing) = (0, 0);
+    for (online, replay) in snapshot
+        .image
+        .data
+        .iter()
+        .zip(&replayed.snapshot.image.data)
+    {
+        if online.is_finite() && replay.is_finite() {
+            compared += 1;
+            differing += usize::from((online - replay).abs() > 0.01);
+        }
+    }
+    assert!(differing * 1000 < compared, "{differing} of {compared}");
+    // A copy, since the stack refuses a file it has already integrated.
+    let again = directory.path().join("again.fits");
+    std::fs::copy(&paths[3], &again).unwrap();
+    let FrameDisposition::Accepted(diagnostics) = restored.push_fits(&again).unwrap() else {
+        panic!("a frame pushed after reopening joins the canvas");
+    };
+    let warp = diagnostics.mapping.warp().unwrap();
+    for (x, y) in [(200.0, 500.0), (600.0, 700.0), (360.0, 900.0)] {
+        let (a, b) = (warp.apply(x, y), warps[3].apply(x, y));
+        assert!((a.0 - b.0).hypot(a.1 - b.1) < 0.1, "{a:?} vs {b:?}");
+    }
+}
+
 #[test]
 fn expansion_from_paths_keeps_masters_for_reintegration_after_reopening() {
     let directory = tempfile::tempdir().unwrap();

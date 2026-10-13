@@ -57,9 +57,17 @@ canvas's pixels times channels. A similarity places every frame; a frame
 lying mostly within one panel also gets the registration model's warp
 against it, which follows lens distortion across a meridian flip, while a
 panel's first frame keeps its similarity and comes from the anchor's side of
-the pier where one connects. Bayer drizzle and drizzled reintegration are
-refused. Saved contexts keep the
-panels, and older readers reject them.
+the pier where one connects. The lens bends neighboring panels' shared edges
+opposite ways, which those similarities cannot follow, so once every frame
+has joined, one radial distortion (two coefficients about an axis that may lie
+off the sensor's center) is fitted where the panels' first frames overlap,
+with each panel's camera rotation onto the anchor's tangent plane when the
+anchor's `FOCALLEN` and `XPIXSZ` give its focal length. When it explains what
+the similarities leave, the canvas is planned again on undistorted grids, and
+every frame's warp leads through the lens onto its own pixels;
+`LiveStacker::expanded_lens` reports what was measured. Bayer drizzle and
+drizzled reintegration are refused. Saved contexts keep the panels and the
+lens, and older readers reject them.
 
 Live delta-sigma rejection cannot remove trails admitted during its warm-up.
 `LiveStacker::reintegrate` fixes that for a live stack. The stacker keeps a

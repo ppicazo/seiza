@@ -677,6 +677,62 @@ def test_expanding_stack_holds_every_panel(tmp_path):
     assert 416 <= snapshot.width <= 420
     assert 160 <= snapshot.height <= 164
     assert np.isfinite(snapshot.image).mean() > 0.95
+    # Undistorted panels leave the lens nothing to explain.
+    assert stacker.expanded_lens is None
+
+
+def lens_panels(tmp_path, width=600, height=400, step=300):
+    """Three panels stacked down one star field, a quarter of each
+    overlapping the next, through a radial lens about an axis 30 pixels off
+    the sensor's centre. Returns the paths and the axis."""
+    rng = np.random.default_rng(7)
+    axis = ((width - 1) / 2 + 24.0, (height - 1) / 2 - 18.0)
+    radius = 0.5 * np.hypot(width, height)
+    sky_height = 2 * step + height
+    stars = np.column_stack(
+        [
+            rng.uniform(-10, width + 10, 4000),
+            rng.uniform(-10, sky_height + 10, 4000),
+            0.02 + 0.0005 / (0.01 + rng.uniform(size=4000)) ** 1.5,
+        ]
+    )
+    yy, xx = np.mgrid[:height, :width]
+    paths = []
+    for panel in range(3):
+        u, v = stars[:, 0] - axis[0], stars[:, 1] - panel * step - axis[1]
+        q = (u * u + v * v) / radius**2
+        factor = 1.0 + 0.02 * q + 0.004 * q * q
+        x, y = axis[0] + u * factor, axis[1] + v * factor
+        image = np.full((height, width), 0.01, np.float32)
+        for sx, sy, peak in zip(x, y, stars[:, 2]):
+            if -5 < sx < width + 5 and -5 < sy < height + 5:
+                x0, y0 = int(sx) - 4, int(sy) - 4
+                patch = (
+                    slice(max(y0, 0), max(y0 + 9, 0)),
+                    slice(max(x0, 0), max(x0 + 9, 0)),
+                )
+                d2 = (xx[patch] - sx) ** 2 + (yy[patch] - sy) ** 2
+                image[patch] += (peak * np.exp(-d2 / 2.9)).astype(np.float32)
+        image += rng.normal(0.0, 0.0005, image.shape).astype(np.float32)
+        path = tmp_path / f"lens-{panel}.fits"
+        fits.writeto(path, image)
+        paths.append(path)
+    return paths, axis
+
+
+def test_expanding_stack_measures_the_lens_across_panels(tmp_path):
+    paths, axis = lens_panels(tmp_path)
+    options = seiza.StackOptions(
+        normalization="none", minimum_overlap=0.1, registration_model="quadratic"
+    )
+    stacker = seiza.LiveStacker.open_fits_expanding(paths, options=options)
+    lens = stacker.expanded_lens
+    assert lens is not None
+    assert np.hypot(lens["center_x"] - axis[0], lens["center_y"] - axis[1]) < 8.0
+    assert lens["overlap_rms_pixels"] < 0.2 < lens["undistorted_overlap_rms_pixels"]
+    assert lens["focal_length_pixels"] is None
+    for path in paths:
+        assert stacker.push_fits(path).accepted
 
 
 def test_expanding_stack_refuses_bad_inputs_and_honours_cancel(tmp_path):

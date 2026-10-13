@@ -53,6 +53,8 @@ mod expand;
 mod external;
 mod fits;
 mod image;
+mod lens;
+pub use lens::ExpandedLens;
 mod mapping;
 mod master;
 mod normalization;

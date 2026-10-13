@@ -817,6 +817,14 @@ impl LiveStacker {
         Ok(stacker)
     }
 
+    /// The lens distortion an expanded canvas was planned through, when
+    /// planning found the panels' overlaps bent by one.
+    pub fn expanded_lens(&self) -> Option<crate::ExpandedLens> {
+        self.canvas_registrar
+            .as_ref()
+            .and_then(crate::expand::CanvasRegistrar::lens_summary)
+    }
+
     /// The largest frame displacement registration accepts, in reference
     /// pixels: on an expanded canvas, its diagonal.
     pub fn effective_maximum_drift_pixels(&self) -> f64 {
@@ -1086,6 +1094,7 @@ impl LiveStacker {
                 crate::expand::CanvasRegistrar::new(
                     &restored.reference,
                     &restored.expanded_panels,
+                    restored.expanded_lens,
                     &restored.options.registration,
                 )
             })
@@ -1179,6 +1188,10 @@ impl LiveStacker {
                     .as_ref()
                     .map(crate::expand::CanvasRegistrar::regions)
                     .unwrap_or_default(),
+                expanded_lens: self
+                    .canvas_registrar
+                    .as_ref()
+                    .and_then(crate::expand::CanvasRegistrar::lens),
             },
         )
     }
@@ -3279,6 +3292,7 @@ mod tests {
                 input_mode: stacker.input_mode,
                 ledger: &stacker.ledger,
                 expanded_panels: &[],
+                expanded_lens: None,
             },
         )
         .unwrap();

@@ -7,11 +7,19 @@
 //! of them to match. A similarity places every frame; a frame lying mostly
 //! within one panel also gets the polynomial warp the registration model asks
 //! for, fitted against that panel.
+//!
+//! The similarities placing each panel's first frame leave the lens's
+//! distortion in the seams between panels. Once every frame has joined, one
+//! radial distortion is fitted where those first frames overlap (see
+//! [`crate::lens`]); when it explains what the similarities leave, the canvas
+//! is planned again on undistorted grids, and every frame's warp leads
+//! through the lens onto its own pixels.
 
+use crate::lens::{LensDistortion, LensFit, LensFrame};
 use crate::{
     CalibrationMasters, Continue, Error, FitsFrame, FrameMetadata, LinearImage, NormalizationMap,
-    NormalizationMode, ReferenceRegion, Registrar, RegistrationOptions, RegistrationResult, Result,
-    SimilarityTransform, StackOptions, path_identity,
+    NormalizationMode, PolynomialWarp, ReferenceRegion, Registrar, RegistrationOptions,
+    RegistrationResult, Result, SimilarityTransform, StackOptions, path_identity,
 };
 use seiza::DetectedStar;
 use seiza_fits::HeaderValue;
@@ -77,7 +85,8 @@ const PLANNING_TRIANGLE_STARS: usize = 40;
 /// panels overlap: on a real mosaic a similarity left 1.16px RMS between the
 /// two sides of the pier, and a quadratic 0.06px. Fitted through a narrow
 /// overlap, though, a quadratic would extrapolate across the rest of the
-/// frame, so a frame starting a panel keeps its similarity.
+/// frame, so a frame starting a panel keeps its similarity, until a lens
+/// measured across all the panels places it.
 const WARP_COVERAGE: f64 = 0.5;
 
 /// How close a frame's own star must land to a panel star for photometry to
@@ -100,12 +109,25 @@ const PANEL_PHOTOMETRY_STARS: usize = 5;
 /// from it.
 const PIER_FLIP_TOLERANCE_DEGREES: f64 = 20.0;
 
+/// Stars detected in the anchor and in each frame starting a panel to measure
+/// the lens by, against the 2000 a frame registers with: an overlap holds a
+/// sixth of them or less.
+const LENS_STARS: usize = 8_000;
+
+/// How far a panel start's quadratic may stray from the camera rotation it
+/// stands for, over the frame, before the lens model is abandoned.
+const MAXIMUM_GEOMETRY_ERROR_PIXELS: f64 = 0.02;
+
+/// Columns and rows of the grid of a panel start's pixels its quadratic is
+/// fitted through.
+const GEOMETRY_GRID: (usize, usize) = (24, 16);
+
 /// Where planning put a frame, or why it could not.
 pub(crate) struct PlannedRegistration {
     pub result: std::result::Result<RegistrationResult, String>,
     stamp: Option<crate::replay::SourceStamp>,
-    /// Whether the frame anchored or started a panel, and so keeps a
-    /// similarity by design.
+    /// Whether the frame anchored or started a panel, and so was placed
+    /// without being warped onto one.
     starts_panel: bool,
 }
 
@@ -255,6 +277,33 @@ impl Window {
         ))
     }
 
+    /// Refine a canvas similarity found elsewhere against this panel,
+    /// returning it with the fraction of the source's stars within the panel.
+    fn refine(
+        &self,
+        seed: SimilarityTransform,
+        stars: &[DetectedStar],
+    ) -> Result<(RegistrationResult, f64)> {
+        let mut local = seed;
+        local.translation_x -= self.region.x as f64;
+        local.translation_y -= self.region.y as f64;
+        let mut result = self.registrar.refine_similarity_stars(local, stars)?;
+        let source_stars = &stars[..stars.len().min(self.maximum_stars)];
+        let inside = source_stars
+            .iter()
+            .filter(|star| {
+                let (x, y) = result.transform.apply(star.x, star.y);
+                x >= 0.0
+                    && y >= 0.0
+                    && x < self.region.width as f64
+                    && y < self.region.height as f64
+            })
+            .count();
+        result.transform.translation_x += self.region.x as f64;
+        result.transform.translation_y += self.region.y as f64;
+        Ok((result, inside as f64 / source_stars.len().max(1) as f64))
+    }
+
     /// Fit the registration model's polynomial warp against this panel around
     /// a canvas `registration` of the source whose `stars` these are. Leaves
     /// a similarity model's registration, or one too few stars support,
@@ -278,12 +327,16 @@ pub(crate) struct CanvasRegistrar {
     height: usize,
     windows: Vec<Window>,
     stars: Vec<(f64, f64)>,
+    /// The lens the canvas is undistorted from, when planning measured one.
+    lens: Option<LensDistortion>,
+    summary: Option<crate::ExpandedLens>,
 }
 
 impl CanvasRegistrar {
     pub(crate) fn new(
         canvas: &LinearImage,
         regions: &[ReferenceRegion],
+        lens: Option<LensDistortion>,
         options: &RegistrationOptions,
     ) -> Result<Self> {
         if regions.is_empty() {
@@ -305,10 +358,28 @@ impl CanvasRegistrar {
                 Window::new(canvas, *region, options)
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(Self::from_windows(canvas.width, canvas.height, windows))
+        if let Some(lens) = &lens {
+            lens.validate()?;
+        }
+        let summary = lens.map(|lens| crate::ExpandedLens::new(&lens, None));
+        Ok(Self::from_windows(canvas.width, canvas.height, windows, lens).with_summary(summary))
     }
 
-    fn from_windows(width: usize, height: usize, windows: Vec<Window>) -> Self {
+    fn with_summary(self, summary: Option<crate::ExpandedLens>) -> Self {
+        Self { summary, ..self }
+    }
+
+    /// What planning measured of the lens the canvas is undistorted from.
+    pub(crate) fn lens_summary(&self) -> Option<crate::ExpandedLens> {
+        self.summary
+    }
+
+    fn from_windows(
+        width: usize,
+        height: usize,
+        windows: Vec<Window>,
+        lens: Option<LensDistortion>,
+    ) -> Self {
         // Overlapping panels share stars; photometry should count each once.
         let mut seen = HashSet::new();
         let stars = windows
@@ -326,7 +397,14 @@ impl CanvasRegistrar {
             height,
             windows,
             stars,
+            lens,
+            summary: None,
         }
+    }
+
+    /// The lens the canvas is undistorted from, if any.
+    pub(crate) fn lens(&self) -> Option<LensDistortion> {
+        self.lens
     }
 
     /// The anchor panel's registrar, on the anchor's own grid. An expanded
@@ -348,7 +426,10 @@ impl CanvasRegistrar {
     /// The best-matched registration among the panels, warped against that
     /// panel when the frame lies mostly within it.
     pub(crate) fn register(&self, source: &LinearImage) -> Result<RegistrationResult> {
-        let stars = self.windows[0].registrar.detect_source_stars(source);
+        let mut stars = self.windows[0].registrar.detect_source_stars(source);
+        if let Some(lens) = &self.lens {
+            stars = lens.undistort_stars(&stars);
+        }
         let mut best: Option<(RegistrationResult, f64, &Window)> = None;
         let mut last_error = None;
         for window in &self.windows {
@@ -370,6 +451,7 @@ impl CanvasRegistrar {
         if coverage >= WARP_COVERAGE {
             window.warp(&mut best, &stars);
         }
+        let mut best = through_lens(best, self.lens);
         best.drift_pixels = best
             .transform
             .displacement_at(self.width as f64 * 0.5, self.height as f64 * 0.5);
@@ -467,6 +549,22 @@ fn chance_ceiling(chance: f64, hypotheses: f64) -> usize {
     ceiling
 }
 
+/// A registration found on undistorted stars, given the warp that carries
+/// it through `lens` onto the source's pixels.
+fn through_lens(
+    mut registration: RegistrationResult,
+    lens: Option<LensDistortion>,
+) -> RegistrationResult {
+    if let Some(lens) = lens {
+        let warp = registration
+            .warp
+            .take()
+            .unwrap_or_else(|| PolynomialWarp::from_similarity(registration.transform));
+        registration.warp = Some(warp.with_distortion(lens));
+    }
+    registration
+}
+
 fn better(candidate: &RegistrationResult, incumbent: &RegistrationResult) -> bool {
     candidate.matched_stars > incumbent.matched_stars
         || (candidate.matched_stars == incumbent.matched_stars
@@ -493,6 +591,41 @@ struct Plan {
     /// most likely overlap too.
     last_window: usize,
     registrations: HashMap<PathBuf, PlannedRegistration>,
+    /// The lens every frame's stars are undistorted by, once measured.
+    lens: Option<LensDistortion>,
+    /// Where the anchor's undistorted grid has its origin on the canvas.
+    origin: (f64, f64),
+    record: Record,
+}
+
+/// What planning learns of each frame, to plan again through a lens.
+#[derive(Default)]
+struct Record {
+    /// The anchor's size and headers, before the canvas moved its reference
+    /// pixel.
+    anchor_size: (usize, usize),
+    anchor_headers: Vec<(String, HeaderValue)>,
+    /// The anchor first, then every frame that started a panel, in order.
+    starts: Vec<Start>,
+    /// Every frame that joined, in order, the anchor aside.
+    joined: Vec<Joined>,
+}
+
+struct Start {
+    path: PathBuf,
+    /// Up to [`LENS_STARS`] of its brightest stars, on its own sensor.
+    stars: Vec<DetectedStar>,
+    /// The panel it registered to, and whether it started one of its own.
+    window: usize,
+    creates_window: bool,
+}
+
+struct Joined {
+    path: PathBuf,
+    stars: Vec<DetectedStar>,
+    size: (usize, usize),
+    window: usize,
+    starts_panel: bool,
 }
 
 /// Each frame joins the growing canvas through actual common stars and pixels.
@@ -529,6 +662,21 @@ pub(crate) fn plan(
         height: frame.image.height,
     };
     let anchor = Window::new(&frame.image, anchor, &options.registration)?;
+    let record = Record {
+        anchor_size: (frame.image.width, frame.image.height),
+        anchor_headers: frame.headers.clone(),
+        starts: vec![Start {
+            path: first.clone(),
+            stars: crate::registration::detect_stars(
+                &frame.image,
+                &options.registration,
+                LENS_STARS,
+            ),
+            window: 0,
+            creates_window: true,
+        }],
+        joined: Vec::new(),
+    };
     let mut plan = Plan {
         finite: frame.image.data.iter().filter(|v| v.is_finite()).count(),
         registrations: HashMap::from([(
@@ -550,6 +698,9 @@ pub(crate) fn plan(
         headers: frame.headers,
         windows: vec![anchor],
         last_window: 0,
+        lens: None,
+        origin: (0.0, 0.0),
+        record,
     };
     let prepare = |path: &Path, channels: usize| -> Result<LinearImage> {
         let (frame, _) =
@@ -612,21 +763,24 @@ pub(crate) fn plan(
                         Some(image) => image,
                         None => prepare(path, plan.image.channels)?,
                     };
-                    let joined = plan.join(
-                        &image,
-                        &item.stars,
-                        (registration, window, coverage),
-                        flipped_start,
-                        options,
-                        maximum_samples,
-                    );
+                    let joined = plan
+                        .join(
+                            path,
+                            &image,
+                            &item.stars,
+                            (registration, window, coverage),
+                            flipped_start,
+                            options,
+                            maximum_samples,
+                        )
+                        .map(|joined| joined.map(|(result, starts)| (result, starts, window)));
                     // The canvas may yet grow enough for any panel to admit it.
                     item.tried = 0;
                     joined
                 }
             };
             match joined {
-                Ok(Some((registration, starts_panel))) => {
+                Ok(Some((registration, starts_panel, window))) => {
                     plan.registrations.insert(
                         path_identity(path),
                         PlannedRegistration {
@@ -635,6 +789,13 @@ pub(crate) fn plan(
                             starts_panel,
                         },
                     );
+                    plan.record.joined.push(Joined {
+                        path: path.clone(),
+                        stars: std::mem::take(&mut item.stars),
+                        size: (width, height),
+                        window,
+                        starts_panel,
+                    });
                 }
                 Ok(None) => {
                     waiting_for_pier_side = true;
@@ -678,6 +839,28 @@ pub(crate) fn plan(
         flipped_start = false;
         pending = deferred;
     }
+    let mut summary = None;
+    // The lens bends neighboring panels' edges opposite ways, which the
+    // similarities placing the panels' first frames cannot follow; measured
+    // where those frames overlap, it is undone and the canvas planned again.
+    if let Some(fit) = plan.estimate_lens() {
+        match plan.rebuild(
+            &fit,
+            first,
+            &prepare,
+            options,
+            maximum_samples,
+            &mut progress,
+        ) {
+            Ok(rebuilt) => {
+                summary = Some(crate::ExpandedLens::new(&fit.distortion, Some(&fit)));
+                plan = rebuilt;
+            }
+            Err(Error::Cancelled) => return Err(Error::Cancelled),
+            // The similarities' plan stands.
+            Err(_) => {}
+        }
+    }
     reject_residual_outliers(&mut plan.registrations);
     let (width, height) = (plan.image.width, plan.image.height);
     for planned in plan
@@ -693,7 +876,8 @@ pub(crate) fn plan(
         return Err(Error::Cancelled);
     }
     Ok(Expansion {
-        canvas: CanvasRegistrar::from_windows(width, height, plan.windows),
+        canvas: CanvasRegistrar::from_windows(width, height, plan.windows, plan.lens)
+            .with_summary(summary),
         image: plan.image,
         headers: plan.headers,
         metadata,
@@ -735,8 +919,10 @@ impl Plan {
     /// covers. Leaves the plan untouched on failure, and returns `None`
     /// without joining a frame that would start a panel from the other side
     /// of the pier than the anchor, unless `flipped_start` allows it.
+    #[allow(clippy::too_many_arguments)]
     fn join(
         &mut self,
+        path: &Path,
         source: &LinearImage,
         stars: &[DetectedStar],
         (registration, window, coverage): (RegistrationResult, usize, f64),
@@ -796,9 +982,6 @@ impl Plan {
         // integration normalizes every frame on its own.
         let starts_panel = refined;
         if starts_panel && uncovered > 0 {
-            // Match the new sky to the canvas through the overlap. The canvas
-            // is a registration and photometric template, not an integrated
-            // observation, so covered pixels keep their first value.
             let landed = stars
                 .iter()
                 .map(|star| {
@@ -806,80 +989,19 @@ impl Plan {
                     (x - region.x as f64, y - region.y as f64)
                 })
                 .collect::<Vec<_>>();
-            let panel_stars = self.windows[window]
-                .stars
-                .iter()
-                .map(|&(x, y)| {
-                    (
-                        x + (self.windows[window].region.x + dx) as f64 - region.x as f64,
-                        y + (self.windows[window].region.y + dy) as f64 - region.y as f64,
-                    )
-                })
-                .filter(|&(x, y)| {
-                    x >= 0.0 && y >= 0.0 && x < region.width as f64 && y < region.height as f64
-                })
-                .collect::<Vec<_>>();
-            // Panels are shot on different nights, under different skies, so
-            // their noise says nothing of their transparency: a gain comes
-            // from stars or not at all, leaving only the background matched.
-            let gains = matches!(
-                options.normalization,
-                NormalizationMode::LocalBackground { .. }
-            )
-            .then(|| {
-                [
-                    PHOTOMETRY_PAIRING_PIXELS,
-                    options.registration.match_tolerance_pixels,
-                ]
-                .into_iter()
-                .find_map(|tolerance| {
-                    crate::normalization::photometric_gains_from(
-                        &existing,
-                        &incoming,
-                        &paired_stars(&panel_stars, &landed, tolerance),
-                        PANEL_PHOTOMETRY_STARS,
-                    )
-                })
-                .unwrap_or_else(|| vec![1.0; incoming.channels])
-            });
-            let normalization = NormalizationMap::estimate_with_gains(
+            self.match_panel(
+                &mut incoming,
                 &existing,
-                &incoming,
-                options.normalization,
-                gains.as_deref(),
+                region,
+                (dx, dy),
+                &landed,
+                window,
+                options,
             )?;
-            let (low, high) = normalization.gain_range();
-            if low < criteria.minimum_normalization_gain
-                || high > criteria.maximum_normalization_gain
-            {
-                return Err(Error::Stack(
-                    "panel normalization gain exceeds admission limits".into(),
-                ));
-            }
-            normalization.apply(&mut incoming)?;
         }
 
         // Every check has passed: commit.
-        if (width, height, dx, dy) != (self.image.width, self.image.height, 0, 0) {
-            self.grow(width, height, dx, dy)?;
-        }
-        let channels = self.image.channels;
-        let mut filled = 0;
-        for row in (0..region.height).filter(|_| starts_panel) {
-            let start = ((region.y + row) * width + region.x) * channels;
-            let target = &mut self.image.data[start..start + region.width * channels];
-            let from = row * region.width * channels;
-            for (target, value) in target
-                .iter_mut()
-                .zip(&incoming.data[from..from + region.width * channels])
-            {
-                if !target.is_finite() && value.is_finite() {
-                    *target = *value;
-                    filled += 1;
-                }
-            }
-        }
-        self.finite += filled;
+        let filled = self.commit((width, height, dx, dy), region, &incoming, starts_panel)?;
         let mut joined = RegistrationResult {
             transform,
             ..registration
@@ -894,13 +1016,126 @@ impl Plan {
         // warped onto a panel built from the canvas fitted at 0.48 to 0.72px
         // RMS and left copies of each star; built from its first frame, the
         // same frames fit at 0.05px.
+        let mut creates_window = false;
         if filled as f64 >= NEW_PANEL_FRACTION * source_area
             && let Ok(panel) = Window::from_pixels(&incoming, region, &options.registration)
         {
             self.windows.push(panel);
             self.last_window = self.windows.len() - 1;
+            creates_window = true;
+        }
+        if starts_panel {
+            self.record.starts.push(Start {
+                path: path.to_path_buf(),
+                stars: crate::registration::detect_stars(source, &options.registration, LENS_STARS),
+                window,
+                creates_window,
+            });
         }
         Ok(Some((joined, starts_panel)))
+    }
+
+    /// Match a panel-starting frame's pixels, resampled onto `region` of the
+    /// canvas about to move `dx`, `dy` from its origin, to the canvas through
+    /// their overlap, by the stars `landed` on `region`'s grid that pair with
+    /// `window`'s.
+    #[allow(clippy::too_many_arguments)]
+    fn match_panel(
+        &self,
+        incoming: &mut LinearImage,
+        existing: &LinearImage,
+        region: ReferenceRegion,
+        (dx, dy): (usize, usize),
+        landed: &[(f64, f64)],
+        window: usize,
+        options: &StackOptions,
+    ) -> Result<()> {
+        let criteria = options.acceptance;
+        // Match the new sky to the canvas through the overlap. The canvas
+        // is a registration and photometric template, not an integrated
+        // observation, so covered pixels keep their first value.
+        let panel_stars = self.windows[window]
+            .stars
+            .iter()
+            .map(|&(x, y)| {
+                (
+                    x + (self.windows[window].region.x + dx) as f64 - region.x as f64,
+                    y + (self.windows[window].region.y + dy) as f64 - region.y as f64,
+                )
+            })
+            .filter(|&(x, y)| {
+                x >= 0.0 && y >= 0.0 && x < region.width as f64 && y < region.height as f64
+            })
+            .collect::<Vec<_>>();
+        // Panels are shot on different nights, under different skies, so
+        // their noise says nothing of their transparency: a gain comes
+        // from stars or not at all, leaving only the background matched.
+        let gains = matches!(
+            options.normalization,
+            NormalizationMode::LocalBackground { .. }
+        )
+        .then(|| {
+            [
+                PHOTOMETRY_PAIRING_PIXELS,
+                options.registration.match_tolerance_pixels,
+            ]
+            .into_iter()
+            .find_map(|tolerance| {
+                crate::normalization::photometric_gains_from(
+                    existing,
+                    incoming,
+                    &paired_stars(&panel_stars, landed, tolerance),
+                    PANEL_PHOTOMETRY_STARS,
+                )
+            })
+            .unwrap_or_else(|| vec![1.0; incoming.channels])
+        });
+        let normalization = NormalizationMap::estimate_with_gains(
+            existing,
+            incoming,
+            options.normalization,
+            gains.as_deref(),
+        )?;
+        let (low, high) = normalization.gain_range();
+        if low < criteria.minimum_normalization_gain || high > criteria.maximum_normalization_gain {
+            return Err(Error::Stack(
+                "panel normalization gain exceeds admission limits".into(),
+            ));
+        }
+        normalization.apply(incoming)
+    }
+
+    /// Grow the canvas to `width` by `height`, the present one `dx`, `dy`
+    /// from its origin, and when `fill`, fill the samples of `region` only
+    /// `incoming` defines. Returns the samples filled.
+    fn commit(
+        &mut self,
+        (width, height, dx, dy): (usize, usize, usize, usize),
+        region: ReferenceRegion,
+        incoming: &LinearImage,
+        fill: bool,
+    ) -> Result<usize> {
+        if (width, height, dx, dy) != (self.image.width, self.image.height, 0, 0) {
+            self.grow(width, height, dx, dy)?;
+        }
+        let channels = self.image.channels;
+        let mut filled = 0;
+        for row in (0..region.height).filter(|_| fill) {
+            let start = ((region.y + row) * width + region.x) * channels;
+            let target = &mut self.image.data[start..start + region.width * channels];
+            let from = row * region.width * channels;
+            for (target, value) in target
+                .iter_mut()
+                .zip(&incoming.data[from..from + region.width * channels])
+            {
+                if !target.is_finite() && value.is_finite() {
+                    *target = *value;
+                    filled += 1;
+                }
+            }
+        }
+        self.finite += filled;
+        Ok(filled)
     }
 
     /// Register a `width` by `height` frame's stars to the panel the previous
@@ -1039,6 +1274,429 @@ impl Plan {
         Some(refined)
     }
 
+    fn placement(&self, path: &Path) -> Option<SimilarityTransform> {
+        Some(
+            self.registrations
+                .get(&path_identity(path))?
+                .result
+                .as_ref()
+                .ok()?
+                .transform,
+        )
+    }
+
+    /// Measure the lens where the anchor and the frames that started panels
+    /// overlap. `None` unless every frame came from one sensor and the lens
+    /// explains what their similarities leave.
+    fn estimate_lens(&self) -> Option<LensFit> {
+        let (width, height) = self.record.anchor_size;
+        if self.record.starts.len() < 2
+            || self
+                .record
+                .joined
+                .iter()
+                .any(|joined| joined.size != (width, height))
+        {
+            return None;
+        }
+        let anchor = self.placement(&self.record.starts[0].path)?;
+        let to_anchor = SimilarityTransform {
+            translation_x: -anchor.translation_x,
+            translation_y: -anchor.translation_y,
+            ..SimilarityTransform::IDENTITY
+        };
+        let frames = self
+            .record
+            .starts
+            .iter()
+            .map(|start| {
+                Some(LensFrame {
+                    stars: &start.stars,
+                    placement: self.placement(&start.path)?.then(to_anchor),
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        crate::lens::estimate(
+            &frames,
+            width,
+            height,
+            focal_length_pixels(&self.record.anchor_headers),
+        )
+    }
+
+    /// Plan the canvas again on the undistorted grids `fit` measured: the
+    /// anchor and each panel's first frame placed by their fitted poses, and
+    /// every other frame registered again by its undistorted stars. Only the
+    /// anchor and the panel starts are read again.
+    fn rebuild(
+        &self,
+        fit: &LensFit,
+        first: &Path,
+        prepare: &dyn Fn(&Path, usize) -> Result<LinearImage>,
+        options: &StackOptions,
+        maximum_samples: usize,
+        progress: &mut dyn FnMut(&Path, usize, usize, usize) -> Continue,
+    ) -> Result<Plan> {
+        let lens = fit.distortion;
+        let channels = self.image.channels;
+        if progress(first, 0, self.image.width, self.image.height) == Continue::No {
+            return Err(Error::Cancelled);
+        }
+        let source = prepare(first, channels)?;
+        // The anchor's undistorted footprint sets the canvas's first bounds.
+        let edge = boundary(source.width, source.height)
+            .into_iter()
+            .map(|(x, y)| lens.undistort(x, y))
+            .collect::<Vec<_>>();
+        let (left, top, right, bottom) = point_bounds(&edge);
+        let (width, height) = ((right - left) as usize, (bottom - top) as usize);
+        if width * height * channels > maximum_samples {
+            return Err(Error::Stack(format!(
+                "expanded canvas {width}x{height} exceeds the limit of {maximum_samples} samples"
+            )));
+        }
+        let transform = SimilarityTransform {
+            translation_x: -left,
+            translation_y: -top,
+            ..SimilarityTransform::IDENTITY
+        };
+        let warp = PolynomialWarp::from_similarity(transform).with_distortion(lens);
+        let region = ReferenceRegion {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        let image = crate::registration::resample_region_warped(
+            &source,
+            width,
+            height,
+            region,
+            &warp,
+            options.interpolation,
+        )?;
+        drop(source);
+        let anchor = Window::new(&image, region, &options.registration)?;
+        let mut headers = self.record.anchor_headers.clone();
+        shift_reference_pixel(&mut headers, -left, -top);
+        let stamp = |path: &Path| {
+            self.registrations
+                .get(&path_identity(path))
+                .and_then(|planned| planned.stamp)
+        };
+        let mut plan = Plan {
+            finite: image.data.iter().filter(|v| v.is_finite()).count(),
+            registrations: HashMap::from([(
+                path_identity(first),
+                PlannedRegistration {
+                    stamp: stamp(first),
+                    starts_panel: true,
+                    result: Ok(RegistrationResult {
+                        transform,
+                        matched_stars: anchor.stars.len(),
+                        rms_error_pixels: 0.0,
+                        drift_pixels: 0.0,
+                        warp: Some(warp),
+                    }),
+                },
+            )]),
+            image,
+            headers,
+            windows: vec![anchor],
+            last_window: 0,
+            lens: Some(lens),
+            origin: (-left, -top),
+            record: Record::default(),
+        };
+        for (index, start) in self.record.starts.iter().enumerate().skip(1) {
+            let (width, height) = (plan.image.width, plan.image.height);
+            if progress(&start.path, plan.registrations.len(), width, height) == Continue::No {
+                return Err(Error::Cancelled);
+            }
+            let source = prepare(&start.path, channels)?;
+            plan.place_start(
+                &source,
+                start,
+                stamp(&start.path),
+                fit,
+                index,
+                options,
+                maximum_samples,
+            )?;
+        }
+        // Each panel the starts created, by the start that created it.
+        let creators = self
+            .record
+            .starts
+            .iter()
+            .enumerate()
+            .filter(|(_, start)| start.creates_window)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        for joined in self
+            .record
+            .joined
+            .iter()
+            .filter(|joined| !joined.starts_panel)
+        {
+            let (width, height) = (plan.image.width, plan.image.height);
+            if progress(&joined.path, plan.registrations.len(), width, height) == Continue::No {
+                return Err(Error::Cancelled);
+            }
+            let seed = creators
+                .get(joined.window)
+                .and_then(|&start| self.seed(joined, start, fit));
+            let result = plan
+                .register_through_lens(joined, seed, options, maximum_samples)
+                .map_err(|error| error.to_string());
+            plan.registrations.insert(
+                path_identity(&joined.path),
+                PlannedRegistration {
+                    result,
+                    stamp: stamp(&joined.path),
+                    starts_panel: false,
+                },
+            );
+        }
+        // Frames that joined nothing keep their reasons.
+        for (path, planned) in &self.registrations {
+            if planned.result.is_err() && !plan.registrations.contains_key(path) {
+                plan.registrations.insert(
+                    path.clone(),
+                    PlannedRegistration {
+                        result: planned.result.clone(),
+                        stamp: planned.stamp,
+                        starts_panel: false,
+                    },
+                );
+            }
+        }
+        Ok(plan)
+    }
+
+    /// Where a frame that joined the panel `start` began lands on the
+    /// anchor's undistorted grid: through the similarities planning placed
+    /// it and that panel's first frame by, onto that frame's fitted pose.
+    /// Within a panel the two frames' distortion all but cancels, so this
+    /// lies within a pixel or so, for registration to refine without
+    /// searching.
+    fn seed(&self, joined: &Joined, start: usize, fit: &LensFit) -> Option<SimilarityTransform> {
+        let lens = fit.distortion;
+        let pose = fit.poses[start];
+        let placed = self.placement(&joined.path)?;
+        let first = self.placement(&self.record.starts[start].path)?;
+        let (width, height) = joined.size;
+        let mut from = Vec::new();
+        let mut to = Vec::new();
+        for row in 0..=4 {
+            for column in 0..=4 {
+                let x = (width - 1) as f64 * column as f64 / 4.0;
+                let y = (height - 1) as f64 * row as f64 / 4.0;
+                let (canvas_x, canvas_y) = placed.apply(x, y);
+                let (start_x, start_y) = first.inverse_apply(canvas_x, canvas_y);
+                let (u, v) = lens.undistort(start_x, start_y);
+                to.push(pose.apply(fit.projection, u, v)?);
+                from.push(lens.undistort(x, y));
+            }
+        }
+        crate::lens::fit_similarity(&from, &to)
+    }
+
+    /// Place a frame that started a panel by its fitted pose: grow the canvas
+    /// to its undistorted footprint, match and fill the sky it newly covers,
+    /// and start its panel where it started one before.
+    #[allow(clippy::too_many_arguments)]
+    fn place_start(
+        &mut self,
+        source: &LinearImage,
+        start: &Start,
+        stamp: Option<crate::replay::SourceStamp>,
+        fit: &LensFit,
+        index: usize,
+        options: &StackOptions,
+        maximum_samples: usize,
+    ) -> Result<()> {
+        let lens = fit.distortion;
+        let pose = fit.poses[index];
+        let lost = || Error::Stack("a panel start turns away from the anchor's view".into());
+        let to_anchor = |x: f64, y: f64| {
+            let (u, v) = lens.undistort(x, y);
+            pose.apply(fit.projection, u, v).ok_or_else(lost)
+        };
+        let edge = boundary(source.width, source.height)
+            .into_iter()
+            .map(|(x, y)| {
+                let (a, b) = to_anchor(x, y)?;
+                Ok((a + self.origin.0, b + self.origin.1))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let (left, top, right, bottom) = point_bounds(&edge);
+        let (width, height, dx, dy) =
+            grown_bounds(&self.image, (left, top, right, bottom), maximum_samples)?;
+        let (dx_f, dy_f) = (dx as f64, dy as f64);
+        let origin = (self.origin.0 + dx_f, self.origin.1 + dy_f);
+        let region = region_within(
+            (left + dx_f, top + dy_f, right + dx_f, bottom + dy_f),
+            width,
+            height,
+        )
+        .ok_or_else(|| Error::Stack("panel footprint is empty".into()))?;
+        let (region_x, region_y) = (region.x as f64, region.y as f64);
+        // The frame's geometry: a quadratic through a grid of its pixels,
+        // from the canvas to their undistorted positions.
+        let mut grid = Vec::new();
+        for row in 0..=GEOMETRY_GRID.1 {
+            for column in 0..=GEOMETRY_GRID.0 {
+                let x = (source.width - 1) as f64 * column as f64 / GEOMETRY_GRID.0 as f64;
+                let y = (source.height - 1) as f64 * row as f64 / GEOMETRY_GRID.1 as f64;
+                let (u, v) = lens.undistort(x, y);
+                let (a, b) = pose.apply(fit.projection, u, v).ok_or_else(lost)?;
+                grid.push(((a + origin.0 - region_x, b + origin.1 - region_y), (u, v)));
+            }
+        }
+        let polynomial = PolynomialWarp::fit(2, region.width, region.height, &grid)
+            .ok_or_else(|| Error::Stack("a panel start's geometry is singular".into()))?;
+        let worst = grid
+            .iter()
+            .map(|&((x, y), (u, v))| {
+                let (a, b) = polynomial.apply(x, y);
+                (a - u).hypot(b - v)
+            })
+            .fold(0.0, f64::max);
+        if worst.is_nan() || worst > MAXIMUM_GEOMETRY_ERROR_PIXELS {
+            return Err(Error::Stack(format!(
+                "a quadratic follows a panel start's rotation only to {worst:.3}px"
+            )));
+        }
+        let warp = polynomial
+            .translated(region_x, region_y)
+            .with_distortion(lens);
+        let (ideal, placed): (Vec<_>, Vec<_>) = grid
+            .iter()
+            .map(|&((x, y), ideal)| (ideal, (x + region_x, y + region_y)))
+            .unzip();
+        let transform = crate::lens::fit_similarity(&ideal, &placed).ok_or_else(lost)?;
+        let mut incoming = crate::registration::resample_region_warped(
+            source,
+            width,
+            height,
+            region,
+            &warp,
+            options.interpolation,
+        )?;
+        let existing = crop(&self.image, region, dx, dy)?;
+        let (mut common, mut uncovered) = (0, 0);
+        for (a, b) in existing.data.iter().zip(&incoming.data) {
+            if b.is_finite() {
+                if a.is_finite() {
+                    common += 1;
+                } else {
+                    uncovered += 1;
+                }
+            }
+        }
+        if common == 0 {
+            return Err(Error::Stack(
+                "a panel start no longer overlaps the canvas".into(),
+            ));
+        }
+        if uncovered > 0 {
+            let landed = lens
+                .undistort_stars(&start.stars)
+                .iter()
+                .filter_map(|star| pose.apply(fit.projection, star.x, star.y))
+                .map(|(a, b)| (a + origin.0 - region_x, b + origin.1 - region_y))
+                .collect::<Vec<_>>();
+            self.match_panel(
+                &mut incoming,
+                &existing,
+                region,
+                (dx, dy),
+                &landed,
+                start.window,
+                options,
+            )?;
+        }
+        self.commit((width, height, dx, dy), region, &incoming, true)?;
+        if start.creates_window {
+            self.windows.push(Window::from_pixels(
+                &incoming,
+                region,
+                &options.registration,
+            )?);
+        }
+        self.registrations.insert(
+            path_identity(&start.path),
+            PlannedRegistration {
+                stamp,
+                starts_panel: true,
+                result: Ok(RegistrationResult {
+                    transform,
+                    matched_stars: fit.pairs[index],
+                    rms_error_pixels: fit.rms[index],
+                    drift_pixels: 0.0,
+                    warp: Some(warp),
+                }),
+            },
+        );
+        Ok(())
+    }
+
+    /// Register a frame that joined a panel before by its undistorted stars,
+    /// refining `seed`, its expected place on the anchor's undistorted grid,
+    /// against that panel, or else searching every panel; then grow the
+    /// canvas to it.
+    fn register_through_lens(
+        &mut self,
+        joined: &Joined,
+        seed: Option<SimilarityTransform>,
+        options: &StackOptions,
+        maximum_samples: usize,
+    ) -> Result<RegistrationResult> {
+        let lens = self
+            .lens
+            .ok_or_else(|| Error::Stack("no lens was measured".into()))?;
+        let stars = lens.undistort_stars(&joined.stars);
+        let (width, height) = joined.size;
+        let window = joined.window.min(self.windows.len() - 1);
+        let origin = SimilarityTransform {
+            translation_x: self.origin.0,
+            translation_y: self.origin.1,
+            ..SimilarityTransform::IDENTITY
+        };
+        let refined = seed.and_then(|seed| {
+            let (result, coverage) = self.windows[window]
+                .refine(seed.then(origin), &stars)
+                .ok()?;
+            Some((admissible(result, options).ok()?, window, coverage))
+        });
+        let (mut registration, window, coverage) = match refined {
+            Some(refined) => refined,
+            None => {
+                self.last_window = window;
+                self.register(&stars, width, height, 0, options)?
+            }
+        };
+        let edge = boundary(width, height)
+            .into_iter()
+            .map(|(x, y)| {
+                let (u, v) = lens.undistort(x, y);
+                registration.transform.apply(u, v)
+            })
+            .collect::<Vec<_>>();
+        let (canvas_width, canvas_height, dx, dy) =
+            grown_bounds(&self.image, point_bounds(&edge), maximum_samples)?;
+        if (canvas_width, canvas_height, dx, dy) != (self.image.width, self.image.height, 0, 0) {
+            self.grow(canvas_width, canvas_height, dx, dy)?;
+        }
+        registration.transform.translation_x += dx as f64;
+        registration.transform.translation_y += dy as f64;
+        if coverage >= WARP_COVERAGE {
+            self.windows[window].warp(&mut registration, &stars);
+        }
+        Ok(through_lens(registration, Some(lens)))
+    }
+
     /// Move the canvas into a larger one, `dx` and `dy` from its origin.
     fn grow(&mut self, width: usize, height: usize, dx: usize, dy: usize) -> Result<()> {
         let channels = self.image.channels;
@@ -1053,6 +1711,7 @@ impl Plan {
             window.region.x += dx;
             window.region.y += dy;
         }
+        self.origin = (self.origin.0 + dx as f64, self.origin.1 + dy as f64);
         for registered in self
             .registrations
             .values_mut()
@@ -1064,18 +1723,82 @@ impl Plan {
                 *warp = warp.translated(dx as f64, dy as f64);
             }
         }
-        for (key, value) in &mut self.headers {
-            let delta = match key.as_str() {
-                "CRPIX1" => dx,
-                "CRPIX2" => dy,
-                _ => continue,
-            };
-            if let Some(pixel) = value.as_f64().filter(|v| v.is_finite()) {
-                *value = HeaderValue::Float(pixel + delta as f64);
-            }
-        }
+        shift_reference_pixel(&mut self.headers, dx as f64, dy as f64);
         Ok(())
     }
+}
+
+/// Move a WCS reference pixel by `dx`, `dy`, as the canvas moves under it.
+fn shift_reference_pixel(headers: &mut [(String, HeaderValue)], dx: f64, dy: f64) {
+    for (key, value) in headers {
+        let delta = match key.as_str() {
+            "CRPIX1" => dx,
+            "CRPIX2" => dy,
+            _ => continue,
+        };
+        if let Some(pixel) = value.as_f64().filter(|v| v.is_finite()) {
+            *value = HeaderValue::Float(pixel + delta);
+        }
+    }
+}
+
+/// The focal length in pixels a frame's headers give: FOCALLEN in
+/// millimetres over XPIXSZ in micrometres, which capture programs record
+/// with any binning applied.
+fn focal_length_pixels(headers: &[(String, HeaderValue)]) -> Option<f64> {
+    let value = |name: &str| {
+        headers
+            .iter()
+            .find(|(key, _)| key == name)
+            .and_then(|(_, value)| value.as_f64())
+            .filter(|value| value.is_finite() && *value > 0.0)
+    };
+    Some(value("FOCALLEN")? * 1000.0 / value("XPIXSZ")?)
+}
+
+/// Points around the edge of a `width` by `height` frame, at most 64
+/// pixels apart, corners included.
+fn boundary(width: usize, height: usize) -> Vec<(f64, f64)> {
+    let (right, bottom) = (
+        width.saturating_sub(1) as f64,
+        height.saturating_sub(1) as f64,
+    );
+    let steps = |length: f64| ((length / 64.0).ceil() as usize).max(1);
+    let mut points = Vec::new();
+    let across = steps(right);
+    for step in 0..=across {
+        let x = right * step as f64 / across as f64;
+        points.extend([(x, 0.0), (x, bottom)]);
+    }
+    let down = steps(bottom);
+    for step in 1..down {
+        let y = bottom * step as f64 / down as f64;
+        points.extend([(0.0, y), (right, y)]);
+    }
+    points
+}
+
+/// The pixel bounds (left, top, right, bottom) `points` touch, as
+/// [`corner_bounds`] gives a frame's.
+fn point_bounds(points: &[(f64, f64)]) -> (f64, f64, f64, f64) {
+    let (mut left, mut top, mut right, mut bottom) = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for &(x, y) in points {
+        left = left.min(x);
+        top = top.min(y);
+        right = right.max(x);
+        bottom = bottom.max(y);
+    }
+    (
+        left.floor(),
+        top.floor(),
+        right.ceil() + 1.0,
+        bottom.ceil() + 1.0,
+    )
 }
 
 fn admissible(
@@ -1134,7 +1857,16 @@ fn union_bounds(
     transform: SimilarityTransform,
     maximum_samples: usize,
 ) -> Result<(usize, usize, usize, usize)> {
-    let (left, top, right, bottom) = corner_bounds(source, transform);
+    grown_bounds(reference, corner_bounds(source, transform), maximum_samples)
+}
+
+/// The canvas size holding both `reference` and pixel `bounds`, and where
+/// the reference's origin lands on it.
+fn grown_bounds(
+    reference: &LinearImage,
+    (left, top, right, bottom): (f64, f64, f64, f64),
+    maximum_samples: usize,
+) -> Result<(usize, usize, usize, usize)> {
     let (left, top) = (left.min(0.0), top.min(0.0));
     let (right, bottom) = (
         right.max(reference.width as f64),
@@ -1161,7 +1893,15 @@ fn footprint(
     width: usize,
     height: usize,
 ) -> Option<ReferenceRegion> {
-    let (left, top, right, bottom) = corner_bounds(source, transform);
+    region_within(corner_bounds(source, transform), width, height)
+}
+
+/// The part of a `width` by `height` canvas within pixel `bounds`.
+fn region_within(
+    (left, top, right, bottom): (f64, f64, f64, f64),
+    width: usize,
+    height: usize,
+) -> Option<ReferenceRegion> {
     let x = left.max(0.0) as usize;
     let y = top.max(0.0) as usize;
     let right = (right.max(0.0) as usize).min(width);

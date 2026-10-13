@@ -1321,6 +1321,32 @@ impl PyLiveStacker {
             .map(|sample| PySnrSample { inner: sample }))
     }
 
+    /// The lens distortion an expanded canvas was planned through, as a
+    /// dict, or ``None`` when planning measured none.
+    #[getter]
+    fn expanded_lens<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Option<Bound<'py, pyo3::types::PyDict>>> {
+        let Some(lens) = self.active()?.expanded_lens() else {
+            return Ok(None);
+        };
+        let dict = pyo3::types::PyDict::new(py);
+        dict.set_item("center_x", lens.center_x)?;
+        dict.set_item("center_y", lens.center_y)?;
+        dict.set_item("decenter_pixels", lens.decenter_pixels)?;
+        dict.set_item("k1", lens.k1)?;
+        dict.set_item("k2", lens.k2)?;
+        dict.set_item("largest_shift_pixels", lens.largest_shift_pixels)?;
+        dict.set_item("overlap_rms_pixels", lens.overlap_rms_pixels)?;
+        dict.set_item(
+            "undistorted_overlap_rms_pixels",
+            lens.undistorted_overlap_rms_pixels,
+        )?;
+        dict.set_item("focal_length_pixels", lens.focal_length_pixels)?;
+        Ok(Some(dict))
+    }
+
     fn snapshot(&self, py: Python<'_>) -> PyResult<PyStackSnapshot> {
         let stacker = self.active()?;
         let snapshot = py.detach(|| stacker.snapshot()).map_err(stack_error)?;
