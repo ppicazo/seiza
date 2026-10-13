@@ -628,3 +628,77 @@ def test_retained_frames_reintegrate_identically(tmp_path):
     np.testing.assert_array_equal(retained_drizzle.weight, fresh_drizzle.weight)
     retained.finish()
     assert list(scratch.iterdir()) == []
+
+
+def overlapping_panels(tmp_path, width=192, height=160, step=112):
+    """Three panels across one star field, each overlapping the next by
+    80 pixels; the first and third share no sky."""
+    rng = np.random.default_rng(41)
+    sky_width = width + 2 * step
+    sky = rng.normal(100.0, 1.5, size=(height, sky_width)).astype(np.float32)
+    yy, xx = np.mgrid[:height, :sky_width]
+    for _ in range(140):
+        x, y = rng.uniform(8, sky_width - 8), rng.uniform(8, height - 8)
+        sky += rng.uniform(400.0, 4000.0) * np.exp(
+            -((xx - x) ** 2 + (yy - y) ** 2) / 3.2
+        ).astype(np.float32)
+    paths = []
+    for panel in range(3):
+        path = tmp_path / f"panel-{panel}.fits"
+        fits.writeto(path, sky[:, panel * step : panel * step + width])
+        paths.append(path)
+    return paths
+
+
+def test_stack_options_choose_a_registration_model():
+    assert seiza.StackOptions().registration_model == "similarity"
+    options = seiza.StackOptions(registration_model="quadratic")
+    assert options.registration_model == "quadratic"
+    with pytest.raises(ValueError, match="registration_model"):
+        seiza.StackOptions(registration_model="thin-plate")
+
+
+def test_expanding_stack_holds_every_panel(tmp_path):
+    paths = overlapping_panels(tmp_path)
+    options = seiza.StackOptions(
+        normalization="none",
+        rejection="none",
+        minimum_overlap=0.1,
+        registration_model="quadratic",
+    )
+    # Anchored on the last panel, the first joins only through the middle.
+    order = [paths[2], paths[0], paths[1]]
+    stacker = seiza.LiveStacker.open_fits_expanding(order, options=options)
+    assert not stacker.reference_integrated
+    for path in order:
+        assert stacker.push_fits(path).accepted
+    snapshot = stacker.snapshot()
+    assert snapshot.accepted_frames == 3
+    assert 416 <= snapshot.width <= 420
+    assert 160 <= snapshot.height <= 164
+    assert np.isfinite(snapshot.image).mean() > 0.95
+
+
+def test_expanding_stack_refuses_bad_inputs_and_honours_cancel(tmp_path):
+    paths = overlapping_panels(tmp_path)
+    options = seiza.StackOptions(minimum_overlap=0.1)
+    with pytest.raises(ValueError, match="at least one light"):
+        seiza.LiveStacker.open_fits_expanding([], options=options)
+    with pytest.raises(ValueError, match="max_canvas_megasamples"):
+        seiza.LiveStacker.open_fits_expanding(
+            paths, options=options, max_canvas_megasamples=0
+        )
+    with pytest.raises(ValueError, match="duplicate"):
+        seiza.LiveStacker.open_fits_expanding(paths, options=options, flat=paths[1])
+    with pytest.raises(seiza.StackError, match="could not join"):
+        seiza.LiveStacker.open_fits_expanding([paths[0], paths[2]], options=options)
+    with pytest.raises(seiza.StackError, match="cancel"):
+        seiza.LiveStacker.open_fits_expanding(
+            paths, options=options, cancel=lambda: True
+        )
+
+    def interrupt():
+        raise KeyError("stop planning")
+
+    with pytest.raises(KeyError, match="stop planning"):
+        seiza.LiveStacker.open_fits_expanding(paths, options=options, cancel=interrupt)

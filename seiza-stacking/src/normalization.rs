@@ -1103,6 +1103,16 @@ pub(crate) fn photometric_gains(
     source: &LinearImage,
     stars: &[(f64, f64)],
 ) -> Option<Vec<f32>> {
+    photometric_gains_from(reference, source, stars, PHOTOMETRY_MINIMUM_STARS)
+}
+
+/// [`photometric_gains`] from at least `minimum` cleanly measured stars.
+pub(crate) fn photometric_gains_from(
+    reference: &LinearImage,
+    source: &LinearImage,
+    stars: &[(f64, f64)],
+    minimum: usize,
+) -> Option<Vec<f32>> {
     if !reference.dimensions_match(source) {
         return None;
     }
@@ -1170,7 +1180,7 @@ pub(crate) fn photometric_gains(
                         .then(|| (reference_flux / source_flux) as f32)
                 })
                 .collect::<Vec<_>>();
-            if ratios.len() < PHOTOMETRY_MINIMUM_STARS {
+            if ratios.len() < minimum {
                 return None;
             }
             median_in_place(&mut ratios).filter(|gain| gain.is_finite() && *gain > 0.0)

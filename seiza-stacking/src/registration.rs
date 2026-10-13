@@ -330,6 +330,16 @@ impl PolynomialWarp {
         self.order
     }
 
+    /// The same map on a reference grid whose origin lies `dx`, `dy` before
+    /// this one's, as when the reference is a region of a larger image.
+    pub(crate) fn translated(&self, dx: f64, dy: f64) -> Self {
+        Self {
+            center_x: self.center_x + dx,
+            center_y: self.center_y + dy,
+            ..self.clone()
+        }
+    }
+
     /// The source position of a reference pixel.
     pub fn apply(&self, x: f64, y: f64) -> (f64, f64) {
         let terms = Self::terms(
@@ -621,7 +631,34 @@ impl Registrar {
 
     /// Find the best transform aligning `source` to the reference frame.
     pub fn register(&self, source: &LinearImage) -> Result<RegistrationResult> {
-        let dense_source = detect(source, &self.options, self.options.dense_star_count());
+        self.register_stars(&self.detect_source_stars(source))
+    }
+
+    /// Detect a source frame's stars once, to register it against several
+    /// references with [`Self::register_stars`].
+    pub(crate) fn detect_source_stars(&self, source: &LinearImage) -> Vec<DetectedStar> {
+        detect(source, &self.options, self.options.dense_star_count())
+    }
+
+    /// [`Self::register`] with the source's stars already detected.
+    pub(crate) fn register_stars(
+        &self,
+        dense_source: &[DetectedStar],
+    ) -> Result<RegistrationResult> {
+        let mut result = self.register_similarity_stars(dense_source)?;
+        if let Some((warp, pairs, rms)) = self.warp_stars(result.transform, dense_source) {
+            result.warp = Some(warp);
+            result.matched_stars = pairs;
+            result.rms_error_pixels = rms;
+        }
+        Ok(result)
+    }
+
+    /// The similarity [`Self::register_stars`] finds, before any warp.
+    pub(crate) fn register_similarity_stars(
+        &self,
+        dense_source: &[DetectedStar],
+    ) -> Result<RegistrationResult> {
         let source_stars = &dense_source[..dense_source.len().min(self.options.maximum_stars)];
         if source_stars.len() < self.options.minimum_matches.max(3) {
             return Err(Error::Registration(format!(
@@ -688,15 +725,22 @@ impl Registrar {
                 self.maximum_drift_pixels
             ))
         })?;
-        let mut result = self.refine_registration(best, source_stars)?;
-        if let Some(order) = self.options.model.polynomial_order()
-            && let Some((warp, pairs, rms)) = self.fit_warp(order, result.transform, &dense_source)
-        {
-            result.warp = Some(warp);
-            result.matched_stars = pairs;
-            result.rms_error_pixels = rms;
-        }
-        Ok(result)
+        self.refine_registration(best, source_stars)
+    }
+
+    /// The polynomial warp [`Self::register_stars`] fits around `transform`,
+    /// with the pairs it kept and their RMS residual; `None` for a similarity
+    /// model or when too few stars pair up.
+    pub(crate) fn warp_stars(
+        &self,
+        transform: SimilarityTransform,
+        dense_source: &[DetectedStar],
+    ) -> Option<(PolynomialWarp, usize, f64)> {
+        self.fit_warp(
+            self.options.model.polynomial_order()?,
+            transform,
+            dense_source,
+        )
     }
 
     /// Pair the dense source stars with the dense reference stars through the
@@ -796,6 +840,73 @@ impl Registrar {
             warp: None,
         })
     }
+}
+
+/// Refit a similarity found elsewhere against the stars of `reference`,
+/// pairing each source star within the match tolerance of where `initial`
+/// carries it. A star cut by the edge of either image has a biased centroid,
+/// and a narrow overlap holds many, so stars within a few pixels of an edge
+/// or of an undefined reference sample are left out. `None` when fewer than
+/// the minimum matches pair up. Up to `stars` of the brightest on each side
+/// take part.
+pub(crate) fn refine_similarity(
+    reference: &LinearImage,
+    source: &LinearImage,
+    source_stars: &[DetectedStar],
+    initial: SimilarityTransform,
+    options: &RegistrationOptions,
+    stars: usize,
+) -> Option<RegistrationResult> {
+    const MARGIN: isize = 6;
+    let defined = |image: &LinearImage, star: &DetectedStar| {
+        let (cx, cy) = (star.x.round() as isize, star.y.round() as isize);
+        (cy - MARGIN..=cy + MARGIN).all(|y| {
+            (cx - MARGIN..=cx + MARGIN).all(|x| {
+                x >= 0
+                    && y >= 0
+                    && (x as usize) < image.width
+                    && (y as usize) < image.height
+                    && image.data[(y as usize * image.width + x as usize) * image.channels]
+                        .is_finite()
+            })
+        })
+    };
+    let reference_stars = detect(reference, options, stars)
+        .into_iter()
+        .filter(|star| defined(reference, star))
+        .collect::<Vec<_>>();
+    let source_stars = source_stars[..source_stars.len().min(stars)]
+        .iter()
+        .filter(|star| defined(source, star))
+        .cloned()
+        .collect::<Vec<_>>();
+    let source_stars = &source_stars[..];
+    let index = StarSpatialIndex::new(&reference_stars, options.match_tolerance_pixels);
+    let mut transform = initial;
+    let mut pairs = Vec::new();
+    for _ in 0..3 {
+        pairs = matched_pairs(
+            transform,
+            source_stars,
+            &reference_stars,
+            &index,
+            options.match_tolerance_pixels,
+        );
+        if pairs.len() < options.minimum_matches {
+            return None;
+        }
+        transform = fit_similarity(&pairs, source_stars, &reference_stars).ok()?;
+    }
+    let rms = (pair_squared_error(transform, &pairs, source_stars, &reference_stars)
+        / pairs.len() as f64)
+        .sqrt();
+    Some(RegistrationResult {
+        transform,
+        matched_stars: pairs.len(),
+        rms_error_pixels: rms,
+        drift_pixels: 0.0,
+        warp: None,
+    })
 }
 
 /// Resample a source image through a fitted source-to-reference transform.

@@ -49,6 +49,7 @@ mod context;
 mod cosmetic;
 mod crop;
 mod drizzle;
+mod expand;
 mod external;
 mod fits;
 mod image;

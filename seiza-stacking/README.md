@@ -42,6 +42,25 @@ that aligns to it; a channel count that differs from the alignment image's
 ends the search at once. `LiveStacker::open_fits_with_reference_image_candidates`
 does the same from paths.
 
+`LiveStacker::with_expanding_reference` plans a canvas for a connected set of
+overlapping lights, such as mosaic panels or a dithered stack whose edges
+should be kept, and starts an empty stack on it. The first path anchors the WCS
+and photometric scale. Every other frame registers against the footprints of
+the panels already placed, not the whole canvas, and a frame that starts a new
+panel is refit against every star it covers. Frames may differ in rotation by
+any amount. A frame that cannot join is rejected with the reason when pushed;
+planning fails only when nothing joins the anchor. The canvas supplies alignment and
+normalization only, so push every light, including the anchor: planned paths
+reuse their planned transforms, and fail if the file has changed since, while
+other frames register through the panels. `maximum_samples` bounds the
+canvas's pixels times channels. A similarity places every frame; a frame
+lying mostly within one panel also gets the registration model's warp
+against it, which follows lens distortion across a meridian flip, while a
+panel's first frame keeps its similarity and comes from the anchor's side of
+the pier where one connects. Bayer drizzle and drizzled reintegration are
+refused. Saved contexts keep the
+panels, and older readers reject them.
+
 Live delta-sigma rejection cannot remove trails admitted during its warm-up.
 `LiveStacker::reintegrate` fixes that for a live stack. The stacker keeps a
 ledger of every admitted frame: its source file, the calibration masters that

@@ -218,6 +218,13 @@ fn common_reference_aligns_channels_without_contributing_pixels() {
             assert_eq!(report["accepted_frames"], 2);
             assert_eq!(report["frames"].as_array().unwrap().len(), 2);
             assert_eq!(report["reference_integrated"], false);
+            // Only expanded stacks report a canvas.
+            assert!(report["configuration"].get("expanded_canvas").is_none());
+            assert!(
+                report["configuration"]
+                    .get("maximum_canvas_samples")
+                    .is_none()
+            );
             assert_eq!(report["reference"]["path"], reference.display().to_string());
             assert_eq!(
                 report["normalization_reference"]["path"],

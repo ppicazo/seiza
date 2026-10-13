@@ -1,5 +1,6 @@
 use crate::{
-    BayerLayout, CalibrationMasters, Error, FrameMetadata, LinearImage, Result, StackOptions,
+    BayerLayout, CalibrationMasters, Error, FrameMetadata, LinearImage, ReferenceRegion, Result,
+    StackOptions,
     replay::{FrameTolerances, FrameWeightRecord, Ledger},
     stack::FrameInputMode,
 };
@@ -47,6 +48,7 @@ pub(crate) struct ContextWriteState<'a> {
     pub input_paths: &'a [PathBuf],
     pub input_mode: FrameInputMode,
     pub ledger: &'a Ledger,
+    pub expanded_panels: &'a [ReferenceRegion],
 }
 
 pub(crate) struct RestoredContext {
@@ -70,6 +72,7 @@ pub(crate) struct RestoredContext {
     pub input_mode: FrameInputMode,
     /// `None` for a context saved before ledgers existed.
     pub ledger: Option<Ledger>,
+    pub expanded_panels: Vec<ReferenceRegion>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -109,6 +112,9 @@ struct ContextMetadata {
     /// refuse the field rather than replay frames under the wrong gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     frame_tolerances: Option<FrameTolerances>,
+    /// Panel footprints an expanded canvas registers frames through.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    expanded_panels: Vec<ReferenceRegion>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -570,6 +576,7 @@ pub(crate) fn read(path: &Path) -> Result<RestoredContext> {
         input_paths,
         input_mode: metadata.input_mode,
         ledger,
+        expanded_panels: metadata.expanded_panels,
     })
 }
 
@@ -621,6 +628,7 @@ impl ContextMetadata {
             } else {
                 None
             },
+            expanded_panels: state.expanded_panels.to_vec(),
         })
     }
 
@@ -656,8 +664,18 @@ impl ContextMetadata {
                 return Err("alignment reference does not match the external output grid".into());
             }
         }
-        if self.external_reference && self.alignment_reference.is_none() {
+        // Expanded stacks use one synthetic template for both geometry and
+        // photometry. It is not integrated, but needs no second image payload.
+        if self.external_reference
+            && self.alignment_reference.is_none()
+            && self.expanded_panels.is_empty()
+        {
             return Err("external-reference context holds no alignment reference".into());
+        }
+        if !self.expanded_panels.is_empty()
+            && (!self.external_reference || self.alignment_reference.is_some())
+        {
+            return Err("expanded-canvas context has an integrated or separate reference".into());
         }
         if self.reference_image_path.is_some() && self.alignment_reference.is_none() {
             return Err("context names a reference image but holds no alignment reference".into());

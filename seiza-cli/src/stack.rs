@@ -38,6 +38,8 @@ enum RegistrationModelArg {
 enum ReferenceArg {
     Auto,
     First,
+    /// Auto-select an anchor and expand to include all connected panels
+    Expand,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -66,7 +68,9 @@ pub(crate) struct StackArgs {
     images: Vec<PathBuf>,
     /// Which light supplies normalization and noise weighting: the clearest
     /// and sharpest, or the first given. Also sets alignment unless
-    /// --reference-image supplies a common grid
+    /// --reference-image supplies a common grid. Expand anchors on the
+    /// clearest light and grows the canvas to hold every connected,
+    /// overlapping frame, as for a mosaic
     #[arg(long, value_enum, default_value = "auto")]
     reference: ReferenceArg,
     /// Common FITS or XISF alignment reference for channel
@@ -74,6 +78,11 @@ pub(crate) struct StackArgs {
     /// no pixels unless also listed as a light. Works with --reintegrate
     #[arg(long)]
     reference_image: Option<PathBuf>,
+    /// Largest canvas --reference expand may grow, in millions of samples:
+    /// pixels times color channels. A run peaks at about 40 bytes per sample
+    /// [default: 256]
+    #[arg(long)]
+    max_canvas_megasamples: Option<usize>,
     /// Linear 32-bit floating-point FITS stack
     #[arg(short, long)]
     output: PathBuf,
@@ -162,7 +171,8 @@ pub(crate) struct StackArgs {
     /// Geometry fitted to each frame after the similarity match: similarity
     /// (shift, rotation, scale), affine, or quadratic, which follows lens
     /// distortion, for example after a meridian flip turns it against the
-    /// sky. A frame with too few stars for its model keeps the similarity
+    /// sky. A frame with too few stars for its model keeps the similarity, as
+    /// does the first frame of each panel under --reference expand
     #[arg(long, value_enum, default_value = "quadratic")]
     registration_model: RegistrationModelArg,
     /// Maximum registration residual for additive admission
@@ -180,9 +190,12 @@ pub(crate) struct StackArgs {
         default_value_t = RegistrationOptions::DEFAULT_MAXIMUM_DRIFT_FRACTION
     )]
     max_registration_drift_fraction: f64,
-    /// Minimum fraction of samples overlapping the reference
-    #[arg(long, default_value_t = 0.60)]
-    min_overlap: f32,
+    /// Minimum fraction of samples overlapping the reference. With
+    /// --reference expand, the fraction of the smaller footprint a frame must
+    /// share with the canvas to join it [default: 0.60, or 0.10 with
+    /// --reference expand]
+    #[arg(long)]
+    min_overlap: Option<f32>,
     /// Frames read and prepared at once. By default this follows
     /// --pipeline-memory-mib and the threads RAYON_NUM_THREADS allows, or
     /// the machine's cores
@@ -204,6 +217,11 @@ struct CalibrationReport {
 
 #[derive(Serialize)]
 struct ConfigurationReport {
+    /// Present only for --reference expand, so other reports are unchanged.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    expanded_canvas: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    maximum_canvas_samples: Option<usize>,
     registration_detection_sigma: f32,
     registration_maximum_stars: usize,
     registration_triangle_stars: usize,
@@ -303,6 +321,27 @@ fn known_temperature(metadata: &seiza_stacking::FrameMetadata) -> Option<f64> {
 }
 
 pub(crate) fn run(options: StackArgs) -> Result<()> {
+    let expand = matches!(options.reference, ReferenceArg::Expand);
+    let registration_model = options.registration_model;
+    let min_overlap = options
+        .min_overlap
+        .unwrap_or(if expand { 0.10 } else { 0.60 });
+    if expand && options.reference_image.is_some() {
+        anyhow::bail!("--reference expand cannot be combined with --reference-image");
+    }
+    if expand && (options.drizzle.is_some() || options.bayer_drizzle) {
+        anyhow::bail!("--reference expand cannot be combined with --drizzle or --bayer-drizzle");
+    }
+    if !expand && options.max_canvas_megasamples.is_some() {
+        anyhow::bail!("--max-canvas-megasamples applies only to --reference expand");
+    }
+    let maximum_samples = options
+        .max_canvas_megasamples
+        .unwrap_or(256)
+        .checked_mul(1_000_000)
+        .filter(|n| *n > 0)
+        .context("--max-canvas-megasamples must be positive and fit in memory addressing")?;
+
     let drizzle = options
         .drizzle
         .map(|scale| {
@@ -377,7 +416,7 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
         options.max_registration_drift,
         options.max_registration_drift_fraction,
     )?;
-    if !options.min_overlap.is_finite() || !(0.0..=1.0).contains(&options.min_overlap) {
+    if !min_overlap.is_finite() || !(0.0..=1.0).contains(&min_overlap) {
         anyhow::bail!("--min-overlap must be between zero and one");
     }
     if matches!(
@@ -460,9 +499,9 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
         ..StackOptions::default()
     };
     stack_options.acceptance.maximum_registration_rms_pixels = options.max_registration_rms;
-    stack_options.acceptance.minimum_overlap_fraction = options.min_overlap;
+    stack_options.acceptance.minimum_overlap_fraction = min_overlap;
     stack_options.registration.maximum_drift_pixels = options.max_registration_drift;
-    stack_options.registration.model = match options.registration_model {
+    stack_options.registration.model = match registration_model {
         RegistrationModelArg::Similarity => seiza_stacking::RegistrationModel::Similarity,
         RegistrationModelArg::Affine => seiza_stacking::RegistrationModel::Affine,
         RegistrationModelArg::Quadratic => seiza_stacking::RegistrationModel::Quadratic,
@@ -476,7 +515,7 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
     // The lights to try in turn as the channel reference of a stack on
     // `--reference-image`, best first.
     let mut channel_candidates = vec![ordered[0].clone()];
-    if matches!(options.reference, ReferenceArg::Auto) {
+    if matches!(options.reference, ReferenceArg::Auto | ReferenceArg::Expand) {
         let (best, scores) = seiza_stacking::choose_reference(&ordered, 8)?;
         channel_candidates = seiza_stacking::rank_references(&scores)
             .into_iter()
@@ -508,7 +547,9 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
         .registration
         .effective_maximum_drift_pixels(reference.image.width, reference.image.height);
 
-    let configuration_report = ConfigurationReport {
+    let mut configuration_report = ConfigurationReport {
+        expanded_canvas: expand,
+        maximum_canvas_samples: expand.then_some(maximum_samples),
         registration_detection_sigma: stack_options.registration.detection_sigma,
         registration_maximum_stars: stack_options.registration.maximum_stars,
         registration_triangle_stars: stack_options.registration.triangle_stars,
@@ -538,7 +579,7 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
         drizzle_scale: options.drizzle,
         drizzle_drop_shrink: options.drizzle.and(options.drizzle_drop_shrink),
         bayer_drizzle: options.bayer_drizzle,
-        registration_model: match options.registration_model {
+        registration_model: match registration_model {
             RegistrationModelArg::Similarity => "similarity",
             RegistrationModelArg::Affine => "affine",
             RegistrationModelArg::Quadratic => "quadratic",
@@ -563,7 +604,7 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
         maximum_registration_rms_pixels: options.max_registration_rms,
         maximum_scale_deviation: stack_options.acceptance.maximum_scale_deviation,
         maximum_rotation_degrees: stack_options.acceptance.maximum_rotation_degrees,
-        minimum_overlap_fraction: options.min_overlap,
+        minimum_overlap_fraction: min_overlap,
         minimum_normalization_gain: stack_options.acceptance.minimum_normalization_gain,
         maximum_normalization_gain: stack_options.acceptance.maximum_normalization_gain,
         minimum_integrated_fraction: stack_options.acceptance.minimum_integrated_fraction,
@@ -575,7 +616,28 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
             reference_path.display()
         )
     };
-    let mut stacker = if options.reference_image.is_some() {
+    let mut stacker = if expand {
+        crate::interrupt::install();
+        seiza_stacking::LiveStacker::with_expanding_reference(
+            &ordered,
+            calibration,
+            stack_options,
+            maximum_samples,
+            |path, count, width, height| {
+                println!(
+                    "plan       {count}/{} connected, {width}x{height}: {}",
+                    ordered.len(),
+                    path.display()
+                );
+                if crate::interrupt::interrupted() {
+                    Continue::No
+                } else {
+                    Continue::Yes
+                }
+            },
+        )
+        .with_context(initialize)?
+    } else if options.reference_image.is_some() {
         let (stacker, used) = seiza_stacking::LiveStacker::with_reference_image_candidates(
             reference,
             channel_candidates
@@ -621,6 +683,15 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
             ordered[0].display()
         );
     }
+    if expand {
+        // Frames register through the panels they overlap; the canvas
+        // diagonal bounds how far any of them lies from its center.
+        let drift = stacker.effective_maximum_drift_pixels();
+        configuration_report.registration_maximum_drift_floor_pixels = drift;
+        configuration_report.registration_effective_maximum_drift_pixels = drift;
+        // Sessions may differ in rotation; expansion admits any.
+        configuration_report.maximum_rotation_degrees = 180.0;
+    }
     // Each admitted frame's registered image waits here for reintegration:
     // about four bytes per output sample per frame, beside the output rather
     // than in a temporary directory that may live in memory. The live pass
@@ -646,13 +717,13 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
     println!(
         "reference  {} ({:.1}px registration drift limit)",
         reference_path.display(),
-        effective_maximum_drift_pixels,
+        configuration_report.registration_effective_maximum_drift_pixels,
     );
 
     // Fingerprint every frame up front, on all cores, so the report costs the
     // stacking loop nothing.
     // An integrated reference is already in the stack.
-    let paths = ordered[usize::from(options.reference_image.is_none())..].to_vec();
+    let paths = ordered[usize::from(options.reference_image.is_none() && !expand)..].to_vec();
     let mut source_identities = match &report_path {
         Some(_) => paths
             .par_iter()
@@ -852,7 +923,7 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
             preview: preview_path.map(|path| path.display().to_string()),
             reference: reference_identity.expect("report identity was prepared"),
             normalization_reference: normalization_identity,
-            reference_integrated: options.reference_image.is_none(),
+            reference_integrated: options.reference_image.is_none() && !expand,
             calibration: calibration_report.expect("report calibration was prepared"),
             configuration: configuration_report,
             frames: admission_records,
