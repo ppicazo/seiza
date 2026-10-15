@@ -1054,7 +1054,7 @@ fn has_output_wcs(cards: &[WriteHeaderCard]) -> bool {
 /// Whether a reference card belongs to its WCS. WCS keywords are standard
 /// eight-column ones, so a longer `HIERARCH` keyword that shares a prefix
 /// such as `A_` is not one.
-fn preserve_wcs_key(key: &str) -> bool {
+pub(crate) fn preserve_wcs_key(key: &str) -> bool {
     key.len() <= 8 && is_wcs_keyword(key)
 }
 

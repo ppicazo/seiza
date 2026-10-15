@@ -6,8 +6,8 @@ use seiza_stacking::{
     BatchStackOptions, CalibrationMasters, CancelSignal, DeltaSigmaOptions, Demosaic,
     DrizzleOptions, DrizzleResult, FitsFrame, FrameDisposition, LinearImage, LiveStacker,
     MasterBuildOptions, MasterDark, MasterFrameKind, MasterRejectionOptions, NormalizationMode,
-    PipelineOptions, PipelineReport, RejectionMode, SnrSample, StackOptions, StackSnapshot,
-    build_master_from_fits, checkpoint_depths, measure_depth, path_identity,
+    PipelineOptions, PipelineReport, RegistrationModel, RejectionMode, SnrSample, StackOptions,
+    StackSnapshot, build_master_from_fits, checkpoint_depths, measure_depth, path_identity,
     paths_refer_to_same_file, write_drizzle_fits_f32, write_fits_f32, write_master_fits_f32,
 };
 use std::path::{Path, PathBuf};
@@ -95,7 +95,8 @@ impl PyStackOptions {
         maximum_normalization_gain=4.0,
         minimum_integrated_fraction=0.50,
         demosaic="vng",
-        match_tolerances=None
+        match_tolerances=None,
+        registration_model="similarity"
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -125,7 +126,19 @@ impl PyStackOptions {
         minimum_integrated_fraction: f32,
         demosaic: &str,
         match_tolerances: Option<crate::calibration::PyMatchTolerances>,
+        registration_model: &str,
     ) -> PyResult<Self> {
+        let registration_model = match registration_model {
+            "similarity" => RegistrationModel::Similarity,
+            "affine" => RegistrationModel::Affine,
+            "quadratic" => RegistrationModel::Quadratic,
+            value => {
+                return Err(PyValueError::new_err(format!(
+                    "registration_model must be 'similarity', 'affine', or 'quadratic', \
+                     not {value:?}"
+                )));
+            }
+        };
         let demosaic = match demosaic {
             "vng" => Demosaic::Vng,
             "mhc" => Demosaic::Mhc,
@@ -181,6 +194,7 @@ impl PyStackOptions {
         inner.registration.maximum_drift_fraction = maximum_drift_fraction;
         inner.registration.minimum_matches = minimum_matches;
         inner.registration.maximum_candidates = maximum_candidates;
+        inner.registration.model = registration_model;
         inner.acceptance.maximum_registration_rms_pixels = maximum_registration_rms;
         inner.acceptance.maximum_scale_deviation = maximum_scale_deviation;
         inner.acceptance.maximum_rotation_degrees = maximum_rotation_degrees;
@@ -213,6 +227,17 @@ impl PyStackOptions {
             Demosaic::Vng => "vng",
             Demosaic::Mhc => "mhc",
             Demosaic::Bilinear => "bilinear",
+        }
+    }
+
+    /// Geometry fitted after the similarity match: "similarity", "affine",
+    /// or "quadratic", which follows lens distortion.
+    #[getter]
+    fn registration_model(&self) -> &'static str {
+        match self.inner.registration.model {
+            RegistrationModel::Similarity => "similarity",
+            RegistrationModel::Affine => "affine",
+            RegistrationModel::Quadratic => "quadratic",
         }
     }
 
@@ -952,6 +977,113 @@ impl PyLiveStacker {
         Ok((Self { inner: Some(inner) }, selection))
     }
 
+    /// Plan a canvas that holds a connected set of overlapping lights, such
+    /// as mosaic panels or a dithered stack whose edges should be kept, and
+    /// start an empty stack on it. The first path anchors the WCS and
+    /// photometric scale; put :func:`choose_reference`'s choice first to
+    /// anchor on the clearest light. Panels may connect through other
+    /// panels, and frames may differ in rotation by any amount. A frame that
+    /// cannot join is rejected, with the reason, when pushed; this raises only
+    /// when nothing joins the anchor, or the canvas would exceed
+    /// ``max_canvas_megasamples`` million samples (pixels times channels; a
+    /// run peaks at about 40 bytes per sample).
+    ///
+    /// With ``registration_model="quadratic"`` in ``options``, a frame lying
+    /// mostly within one panel is warped onto it, which follows lens
+    /// distortion across a meridian flip; each panel's first frame keeps
+    /// its similarity. Use a ``minimum_overlap`` near 0.1 for panels.
+    ///
+    /// ``cancel``, a callable, is asked before each frame is read; Ctrl-C
+    /// also stops planning. The stack starts empty: push every light, the
+    /// anchor included.
+    #[staticmethod]
+    #[pyo3(signature = (
+        paths,
+        *,
+        options=None,
+        bias=None,
+        dark=None,
+        flat=None,
+        dark_exposure_seconds=None,
+        max_canvas_megasamples=256,
+        cancel=None
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn open_fits_expanding(
+        py: Python<'_>,
+        paths: Vec<PathBuf>,
+        options: Option<PyRef<'_, PyStackOptions>>,
+        bias: Option<PathBuf>,
+        dark: Option<PathBuf>,
+        flat: Option<PathBuf>,
+        dark_exposure_seconds: Option<f64>,
+        max_canvas_megasamples: usize,
+        cancel: Option<Py<PyAny>>,
+    ) -> PyResult<Self> {
+        if paths.is_empty() {
+            return Err(PyValueError::new_err("at least one light is required"));
+        }
+        validate_exposure_override(dark.as_ref(), dark_exposure_seconds, "dark")?;
+        for light in &paths {
+            let inputs = std::iter::once(light.clone())
+                .chain(
+                    [bias.clone(), dark.clone(), flat.clone()]
+                        .into_iter()
+                        .flatten(),
+                )
+                .collect::<Vec<_>>();
+            validate_distinct_paths(&inputs)?;
+        }
+        let maximum_samples = max_canvas_megasamples
+            .checked_mul(1_000_000)
+            .filter(|samples| *samples > 0)
+            .ok_or_else(|| PyValueError::new_err("max_canvas_megasamples must be positive"))?;
+        let options = options
+            .as_ref()
+            .map_or_else(StackOptions::default, |options| options.inner.clone());
+        // Planning reads every light with the GIL released, taking it back
+        // before each one to ask whether to stop.
+        let raised: Mutex<Option<PyErr>> = Mutex::new(None);
+        let planned = py.detach(|| {
+            LiveStacker::open_fits_expanding(
+                &paths,
+                bias.as_deref(),
+                dark.as_deref(),
+                flat.as_deref(),
+                dark_exposure_seconds,
+                options,
+                maximum_samples,
+                |_, _, _, _| {
+                    let stop = Python::attach(|py| {
+                        let asked = py.check_signals().and_then(|()| match &cancel {
+                            Some(cancel) => cancel
+                                .call0(py)
+                                .and_then(|value| value.bind(py).is_truthy()),
+                            None => Ok(false),
+                        });
+                        asked.unwrap_or_else(|error| {
+                            // Re-raised once planning unwinds, so the caller
+                            // sees KeyboardInterrupt or their own exception.
+                            *raised.lock().unwrap() = Some(error);
+                            true
+                        })
+                    });
+                    if stop {
+                        seiza_stacking::Continue::No
+                    } else {
+                        seiza_stacking::Continue::Yes
+                    }
+                },
+            )
+        });
+        if let Some(error) = raised.lock().unwrap().take() {
+            return Err(error);
+        }
+        Ok(Self {
+            inner: Some(planned.map_err(stack_error)?),
+        })
+    }
+
     /// Reopen a versioned on-disk context and continue adding frames.
     #[staticmethod]
     fn open_context(py: Python<'_>, path: PathBuf) -> PyResult<Self> {
@@ -1187,6 +1319,32 @@ impl PyLiveStacker {
         Ok(py
             .detach(|| measure_depth(stacker.view()))
             .map(|sample| PySnrSample { inner: sample }))
+    }
+
+    /// The lens distortion an expanded canvas was planned through, as a
+    /// dict, or ``None`` when planning measured none.
+    #[getter]
+    fn expanded_lens<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Option<Bound<'py, pyo3::types::PyDict>>> {
+        let Some(lens) = self.active()?.expanded_lens() else {
+            return Ok(None);
+        };
+        let dict = pyo3::types::PyDict::new(py);
+        dict.set_item("center_x", lens.center_x)?;
+        dict.set_item("center_y", lens.center_y)?;
+        dict.set_item("decenter_pixels", lens.decenter_pixels)?;
+        dict.set_item("k1", lens.k1)?;
+        dict.set_item("k2", lens.k2)?;
+        dict.set_item("largest_shift_pixels", lens.largest_shift_pixels)?;
+        dict.set_item("overlap_rms_pixels", lens.overlap_rms_pixels)?;
+        dict.set_item(
+            "undistorted_overlap_rms_pixels",
+            lens.undistorted_overlap_rms_pixels,
+        )?;
+        dict.set_item("focal_length_pixels", lens.focal_length_pixels)?;
+        Ok(Some(dict))
     }
 
     fn snapshot(&self, py: Python<'_>) -> PyResult<PyStackSnapshot> {

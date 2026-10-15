@@ -42,6 +42,52 @@ that aligns to it; a channel count that differs from the alignment image's
 ends the search at once. `LiveStacker::open_fits_with_reference_image_candidates`
 does the same from paths.
 
+`LiveStacker::with_expanding_reference` plans a canvas for a connected set of
+overlapping lights, such as mosaic panels or a dithered stack whose edges
+should be kept, and starts an empty stack on it. The first path anchors the WCS
+and photometric scale. Every other frame registers against the footprints of
+the panels already placed, not the whole canvas, and a frame that starts a new
+panel is refit against every star it covers. Frames may differ in rotation by
+any amount. A frame that cannot join is rejected with the reason when pushed;
+planning fails when nothing joins the anchor, an input changes or cannot be read,
+or the canvas limit is exceeded. The canvas supplies alignment and
+normalization only, so push every light, including the anchor: planned paths
+reuse their planned transforms, and fail if the file has changed since, while
+other frames register through the panels. `maximum_samples` bounds the
+canvas's pixels times channels. A similarity places every frame; a frame
+lying mostly within one panel also gets the registration model's warp
+against it, which follows lens distortion across a meridian flip, while a
+panel's first frame keeps its similarity and comes from the anchor's side of
+the pier where one connects. The lens bends neighboring panels' shared edges
+opposite ways, which those similarities cannot follow, so once every frame
+has joined, one radial distortion (two coefficients about an axis that may lie
+off the sensor's center) is fitted where the panels' first frames overlap,
+with each panel's camera rotation onto the anchor's tangent plane when the
+anchor's `FOCALLEN` and `XPIXSZ` give its focal length. When it explains what
+the similarities leave, the canvas is planned again on undistorted grids, and
+every frame's warp leads through the lens onto its own pixels;
+`LiveStacker::expanded_lens` reports what was measured. Panel starts approximate
+the fitted sky projection with a quadratic, or a cubic when needed, retaining
+a 0.02-pixel error limit checked on both fitting and independent grid points.
+A failed rebuild keeps the original plan and reports its reason in the planning
+notes. Later planned frames match stars through that geometric prediction before
+refining their warp; a similarity alone can miss stars near the edges of a wide
+tangent plane even when its central matches have small residuals. Before fitting, known
+camera, dimension, binning, pixel-size or focal-length conflicts among joined
+frames disable the shared lens fit; pixel size and focal length allow 1% rounding
+tolerance. Missing metadata allows fitting with an unverified-compatibility
+note. Filter and date changes are ignored. `expansion_planning_notes()` exposes
+these notes for newly planned stacks; reopening a context does not rerun the
+check. A lens-corrected
+canvas drops the original WCS, including SIP: plate-solve its output to obtain
+astrometry for the undistorted grid. Without lens correction, the anchor WCS
+is retained with its reference pixel shifted. Bayer drizzle and
+drizzled reintegration are refused. Saved contexts keep the panels, each
+with the stars planning matched it by, and the lens, so a frame added after
+reopening registers exactly as it would have before saving; older readers
+reject them. A context saved before panels kept their stars still opens,
+and its panels then match the stars of the canvas beneath them.
+
 Live delta-sigma rejection cannot remove trails admitted during its warm-up.
 `LiveStacker::reintegrate` fixes that for a live stack. The stacker keeps a
 ledger of every admitted frame: its source file, the calibration masters that

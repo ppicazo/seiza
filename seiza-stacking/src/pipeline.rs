@@ -917,7 +917,14 @@ fn prepare_decoded(
     };
     Ok(prepare_frame(
         half.reference,
-        half.registrar,
+        crate::stack::FrameRegistration {
+            registrar: half.registrar,
+            canvas: half.canvas_registrar,
+            known: crate::expand::registration_for(
+                half.planned_registrations,
+                frame.source.as_ref(),
+            )?,
+        },
         half.options,
         half.reference_noise,
         frame.image,

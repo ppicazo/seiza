@@ -627,9 +627,11 @@ changed:
 
 | Option | Default | What it does |
 |---|---|---|
-| `--reference auto\|first` | `auto` | `auto` scores every frame on a half-resolution view (star signal over sky noise, which seeing, trailing, haze and twilight all lower) and, among frames near the best score, takes the flattest sky. `first` keeps the first frame given. |
+| `--reference auto\|first\|expand` | `auto` | `auto` scores every frame on a half-resolution view (star signal over sky noise, which seeing, trailing, haze and twilight all lower) and, among frames near the best score, takes the flattest sky. `first` keeps the first frame given. `expand` auto-selects an anchor and grows the canvas to include connected overlapping panels (see below). |
 | `--reference-image PATH` | none | Use a common FITS/XISF reference for separate channel stacks, including `--reintegrate` and `--drizzle`. Sets only the alignment grid and WCS. `--reference auto\|first` selects a light within this channel for normalization and noise weighting. No external-reference pixels are integrated unless its path is also listed as a light. |
-| `--registration-model similarity\|affine\|quadratic` | `quadratic` | After the similarity match, fit a polynomial to up to 2 000 stars to follow lens distortion. A frame with too few stars keeps its similarity. |
+| `--max-canvas-megasamples` | `256` | Largest canvas `expand` may grow, in millions of samples (pixels times color channels). A run peaks at about 40 bytes per sample, so the default allows about 10 GB. |
+| `--min-overlap` | `0.60`, or `0.10` with `expand` | Expansion requires this fraction of the smaller finite footprint to overlap the growing template. Fixed canvases measure coverage of the reference grid. |
+| `--registration-model similarity\|affine\|quadratic` | `quadratic` | After the similarity match, fit a polynomial to up to 2 000 stars to follow lens distortion. A frame with too few stars keeps its similarity. Under `expand`, each panel's first frame is placed through the lens the panels' overlaps measure (see below). |
 | `--normalization none\|global\|local\|local-background` | `local-background` | `local-background` keeps one gain per channel, measured from star photometry, and matches each tile's background to the reference's, so frames whose sky gradients differ leave no seams where coverage changes. `local` also fits a gain per tile. |
 | `--local-tile-size` | `256` | Tile size for `local` and `local-background`. |
 | `--weighting equal\|inverse-noise` | `inverse-noise` | Weight each frame by the inverse of its noise variance relative to the reference, so hazy frames count for less. |
@@ -653,6 +655,128 @@ ImageIntegration and DrizzleIntegration took 6 min 54 s and 2 min 41 s for
 WBPP's whole run with 2x drizzle took 7 min 5 s for 1.77px. Seiza's times are
 from an i5-1340P laptop (4 performance and 8 efficiency cores, 16 threads,
 32 GB) in October 2026.
+
+### Expanding beyond the reference frame
+
+Use `--reference expand` for overlapping mosaic panels or a dithered stack whose
+outer edges should be retained:
+
+```sh
+seiza stack Ha-panel1/*.fits Ha-panel2/*.fits Ha-panel3/*.fits --reference expand --output Ha-mosaic.fits --reintegrate
+```
+
+A planning pass anchors on the clearest frame and connects the others through
+shared stars, building a canvas that holds their transformed footprints. Panels can
+connect through other panels: the third panel need not overlap the first. Each
+frame registers against the footprints of the panels already placed rather than
+the whole canvas, so a narrow overlap still finds its stars, and a frame that
+starts a new panel is refit against every star it covers so that its far edge
+meets its other neighbors. A match must pair more stars than the best of the
+transforms searched would pair by chance, which keeps a frame that shares no sky
+from joining through a coincidence in a crowded field. Frames are then integrated
+on that grid, once each; the planning template contributes no exposure. The
+anchor's pixel scale and orientation stay fixed, and its WCS reference pixel moves
+when the canvas extends left or upward. Uncovered pixels remain undefined.
+
+A similarity places every frame. With the default `--registration-model
+quadratic`, a frame lying mostly within one panel is then warped onto it, which
+follows lens distortion across a meridian flip. A panel's first frame cannot be
+warped that way, since a quadratic fitted through a narrow overlap would
+extrapolate across the rest of the frame; it is taken from the anchor's side of
+the pier whenever such a frame connects, and placed through the lens (see
+below). Expansion does not feather or blend mosaic seams, or drizzle
+(`--drizzle` and `--bayer-drizzle` are refused). Sessions
+may differ in rotation, as when the camera comes off between nights, so
+expansion admits a frame at any rotation; matching, residual, and scale checks
+guard against a false placement, as does requiring a match to pair a share of
+the stars it claims to overlap, so the hot pixels that uncalibrated lights of
+another target share with the mosaic cannot place them. A frame that cannot join
+the connected mosaic, such as one of another target or cloud, is rejected with
+the reason, and the
+mosaic is built from the rest; expansion fails when nothing joins the
+anchor, an input changes or cannot be read, or the canvas would exceed
+`--max-canvas-megasamples`. One set of
+calibration masters applies to every frame, so lights whose sessions need
+different flats are better stacked per session first and their stacks
+expanded. The default overlap threshold is 10%; change it with
+`--min-overlap`. Expansion bounds each search by the panels it matches;
+`--max-registration-drift` and `--max-registration-drift-fraction` are intended
+for ordinary fixed-reference stacks.
+
+On a three-panel Rosette mosaic from an ASI6200MM (9576x6388), three
+uncalibrated 900 s lights per panel and filter, panels shot months apart with
+about 15% overlap, each of H-alpha, O-III and S-II connected all 9 frames into a
+canvas of 165 to 167 megapixels in 31 to 44 s on a 16-core desktop, peaking at
+6.0 to 6.7 GB. Frames registered to their own panel at 0.05 to 0.09 px RMS,
+including those from the other side of the pier, where a similarity alone left
+1.2 px, and the panels' first frames met through the lens at 0.08 to 0.15 px.
+
+Lens distortion bends the shared edges of two panels opposite ways, and a
+similarity placing a panel's first frame through their overlap fits its middle
+and misses its ends: by up to 17 px on that mosaic, so stars there appeared
+twice, or, under live rejection, as rings whose cores the first panel's frames
+had rejected from the second's. So once every frame has joined, one radial
+distortion, two coefficients about an axis that may lie off the sensor's
+center, is fitted where the panels' first frames overlap. This shared lens
+model assumes one optical train and sensor geometry; combining different
+rigs or focal reducers needs separate distortion models. Before fitting, joined
+frames are checked for conflicting camera identity, dimensions, binning, pixel
+size and focal length. Pixel size and focal length allow 1% rounding tolerance.
+A known conflict skips the shared lens fit and keeps the first registration
+plan. Missing metadata allows fitting but reports that optical compatibility
+could not be verified. Filters and dates do not cause conflicts. Notes appear
+on stderr and in `configuration.expansion_planning_notes` in the JSON report.
+Matching metadata is a compatibility check, not proof of identical optics.
+Where the anchor's
+`FOCALLEN` and `XPIXSZ` give the focal length, each panel is placed on the
+anchor's tangent plane by a rotation of the camera rather than a similarity,
+which a wide mosaic's panels, several degrees apart, need. When the lens
+explains what the similarities leave, the canvas is planned again on
+undistorted grids: only the anchor and each panel's first frame are read again,
+the other frames register by the stars planning kept, and every frame's warp
+leads through the lens onto its own pixels. The JSON report's
+`configuration.expanded_lens` records the measured axis, coefficients, largest
+shift, and the overlaps' residual with and without it; the stack is planned on
+similarities alone when no lens is found, as for a single panel. Lens correction
+changes the pixel grid, so the original WCS (including SIP distortion) is
+omitted; plate-solve the output mosaic to obtain valid astrometry. Without a
+lens correction, the anchor WCS is retained with its reference pixel shifted. On the
+Rosette mosaic's 215 S-II lights, the lens moved stars up to 63 px about an axis
+127 px off center, and the panels' first frames met at 0.12 px RMS through it,
+against 11.8 px fitted without it. A night that had sat 2 to 3 px off its
+neighbors along both seams then matched the full stack to 0.07 px (95th
+percentile, 0.13 px at most), and the rings were gone. A panel's brightness
+is measured only on stars that pair star with star across the overlap;
+measured where a similarity put them, the O-III panels came out 1.8 and 3.5
+times too bright, where pairing star with star shows they differ by under 25%.
+When too few stars pair up, a panel keeps its own scale and only its
+background is matched, since noise from skies on different nights says nothing
+of transparency. On synthetic 3x3 mosaics with 12% overlaps, every corner
+landed within 0.11 px of its true position.
+
+`--normalization none` preserves the input intensities; it does not disable
+registration or canvas expansion. The default `local-background` matches panel
+brightness through their overlaps: panels differing only in gain and offset
+match exactly. A gradient within one panel cannot be told apart from the sky,
+though, and the canvas does not feather. Uncalibrated lights also carry their
+vignetting into every overlap. In a synthetic test, a gradient spanning a third of the sky level across one panel
+left steps of about a tenth of it, and shifted the panel beyond by about half of
+it. For seamless backgrounds, stack each panel on its own, flatten each panel
+stack with `seiza background` (see [Background extraction](#background-extraction)),
+and expand the flattened panel stacks into the mosaic.
+
+`--reintegrate` uses the same expanded canvas and recorded transforms.
+Planning reads every frame before the integration pass. Each frame being
+registered and the reintegration scratch, four bytes per sample per frame, both
+span the full canvas. A saved stack context keeps the panels, with the stars planning
+matched each by (its first frame's), and the lens planning measured, so a
+frame added after reopening registers exactly as it would have before saving.
+
+For S/H/O, run expansion separately for each filter and register the resulting
+three mosaics together afterward. Independent expansion runs may choose different
+anchors and dimensions. `--reference expand` cannot currently be combined with
+`--reference-image`; use the shared-reference option when a fixed common grid is
+required.
 
 Raw calibration sequences can be integrated into reusable masters first:
 

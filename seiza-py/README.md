@@ -261,9 +261,11 @@ for frame in result.frames:
 background to the reference's so frame edges leave no seams. `demosaic` chooses
 how one-shot-colour frames are demosaiced: `"vng"` (the default) keeps each
 star's colour across its profile, `"mhc"` gives slightly sharper stars but rings
-around small ones, and `"bilinear"` is fastest. The CLI's other stacking
-options (registration model, interpolation, weighting, Bayer drizzle) are not
-yet exposed here.
+around small ones, and `"bilinear"` is fastest. `registration_model` is
+`"similarity"` (the default here), `"affine"`, or `"quadratic"`, which fits a
+polynomial to follow lens distortion, for example across a meridian flip; the
+CLI defaults to `"quadratic"`. The CLI's other stacking options (interpolation,
+weighting, Bayer drizzle) are not yet exposed here.
 
 The first light is the reference unless `reference="auto"`, which scores every
 light and takes the best, as the CLI's `--reference auto` does. The result's
@@ -303,6 +305,43 @@ for index, path, reason in selection.skipped:
     print(f"{path} did not align: {reason}")
 stacker.push_fits(selection.path)
 ```
+
+`LiveStacker.open_fits_expanding(paths)` grows the canvas past the anchor to
+hold every connected, overlapping light, as the CLI's `--reference expand`
+does: mosaic panels, including ones that connect only through other panels,
+or a dithered stack whose edges should be kept. The first path anchors the WCS
+and photometric scale, so put `choose_reference`'s choice first to anchor on
+the clearest light. Lights may differ in rotation by any amount. A light that
+cannot join, such as one of another target, comes back rejected with the
+reason; `StackError` is raised only when nothing joins the anchor. The stack starts empty; push every light, the
+anchor included:
+
+```python
+from pathlib import Path
+
+anchor = seiza.choose_reference(panel_lights).reference_path
+order = [anchor] + [path for path in panel_lights if Path(path) != anchor]
+options = seiza.StackOptions(
+    normalization="local-background",
+    minimum_overlap=0.1,
+    registration_model="quadratic",  # warps frames across a meridian flip
+)
+stacker = seiza.LiveStacker.open_fits_expanding(
+    order, options=options, dark="master-dark.fits", flat="master-flat.fits"
+)
+dispositions, report = stacker.push_fits_pipelined(order)
+stacker.finish("mosaic.fits")
+```
+
+`max_canvas_megasamples` (256 by default) bounds the canvas's pixels times
+channels; a run peaks at about 40 bytes per sample. When the panels' overlaps
+show one lens distortion bending them all, planning undoes it and
+`stacker.expanded_lens` describes it as a dict (its axis, coefficients,
+largest shift in pixels, and the overlaps' residual with and without it);
+otherwise it is `None`. `cancel`, a callable, is
+asked before each light is planned, and Ctrl-C also stops planning. Drizzle is
+not supported on an expanded canvas. See the CLI documentation for how panels
+are matched and what the result looks like on real data.
 
 For live integration, construct from a FITS path or a C-contiguous mono/HWC
 RGB NumPy `float32` array. An array-based stacker accepts only already-linear,

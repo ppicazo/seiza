@@ -538,6 +538,9 @@ pub struct LiveStacker {
     reference_metadata: FrameMetadata,
     pub(crate) registrar: Registrar,
     alignment_reference: Option<LinearImage>,
+    planned_registrations: std::collections::HashMap<PathBuf, crate::expand::PlannedRegistration>,
+    /// Registers frames to an expanded canvas through its panels.
+    pub(crate) canvas_registrar: Option<crate::expand::CanvasRegistrar>,
     /// Per-channel noise of the reference frame, the unit of frame weights.
     /// Empty when frames are weighted equally.
     reference_noise: Vec<f32>,
@@ -564,6 +567,10 @@ pub struct LiveStacker {
 }
 
 enum ReferenceContribution {
+    Expanded {
+        noise: Vec<f32>,
+        canvas: crate::expand::CanvasRegistrar,
+    },
     Integrated(Option<BayerLayout>),
     External {
         image: LinearImage,
@@ -658,7 +665,11 @@ impl LiveStacker {
             };
             match prepare_frame(
                 &alignment.image,
-                &registrar,
+                FrameRegistration {
+                    registrar: &registrar,
+                    canvas: None,
+                    known: None,
+                },
                 &geometry_options,
                 &[],
                 channel.image,
@@ -704,6 +715,131 @@ impl LiveStacker {
             ),
         })
         .into())
+    }
+
+    /// Plan the union of a connected set of overlapping light frames, then
+    /// start an empty stack on that grid. The first path anchors the WCS and
+    /// photometric scale. Every path must subsequently be pushed explicitly.
+    /// Planning places frames by similarity at any rotation. A frame that
+    /// cannot join is rejected, with the reason, when pushed; planning fails
+    /// when nothing joins the first path, an input changes or cannot be read,
+    /// or the canvas limit is exceeded. `maximum_samples` bounds
+    /// the canvas's pixels times channels; with frames being prepared, a
+    /// stack peaks at about 40 bytes per sample. Each frame registers against the panels it overlaps, so a
+    /// narrow overlap need not hold the canvas's brightest stars, and a frame
+    /// lying mostly within one panel also gets the registration model's
+    /// warp against that panel. Each panel starts from a frame on the
+    /// anchor's side of the pier where one connects. Bayer drizzle and
+    /// drizzled reintegration are not supported on the canvas.
+    pub fn with_expanding_reference(
+        paths: &[PathBuf],
+        calibration: CalibrationMasters,
+        mut options: StackOptions,
+        maximum_samples: usize,
+        progress: impl FnMut(&Path, usize, usize, usize) -> crate::Continue,
+    ) -> Result<Self> {
+        options.validate()?;
+        if options.cfa_integration == CfaIntegration::BayerDrizzle {
+            return Err(Error::Stack(
+                "an expanded canvas does not support Bayer drizzle".into(),
+            ));
+        }
+        // Sessions differ in rotation whenever the camera comes off between
+        // them; matching, residual, and scale checks guard against a false
+        // placement instead.
+        options.acceptance.maximum_rotation_degrees = 180.0;
+        let plan = crate::expand::plan(paths, &calibration, &options, maximum_samples, progress)?;
+        // Panels bound each registration's search; the canvas diagonal bounds
+        // any frame's displacement from its center.
+        options.registration.maximum_drift_pixels =
+            (plan.image.width as f64).hypot(plan.image.height as f64);
+        let mut stacker = Self::from_prepared(
+            plan.image,
+            plan.headers,
+            plan.metadata,
+            calibration,
+            options,
+            FrameInputMode::CalibrateAndPrepare,
+            ReferenceContribution::Expanded {
+                noise: plan.noise,
+                canvas: plan.canvas,
+            },
+        )?;
+        stacker.planned_registrations = plan.registrations;
+        Ok(stacker)
+    }
+
+    /// [`Self::with_expanding_reference`] from FITS or XISF paths, with the
+    /// duplicate-input and output-path protection of [`Self::open_fits`] and
+    /// the masters' paths kept, so a reopened context can still reintegrate.
+    /// Every light must differ from every master. Push every light, the
+    /// anchor included.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_fits_expanding<P: AsRef<Path>>(
+        paths: &[P],
+        bias_path: Option<&Path>,
+        dark_path: Option<&Path>,
+        flat_path: Option<&Path>,
+        dark_exposure_seconds: Option<f64>,
+        options: StackOptions,
+        maximum_samples: usize,
+        progress: impl FnMut(&Path, usize, usize, usize) -> crate::Continue,
+    ) -> Result<Self> {
+        let masters = [bias_path, dark_path, flat_path];
+        for path in paths {
+            distinct_input_paths(std::iter::once(Some(path.as_ref())).chain(masters))?;
+        }
+        let calibration = CalibrationMasters::from_fits_paths(
+            bias_path,
+            dark_path,
+            flat_path,
+            dark_exposure_seconds,
+        )?;
+        let paths = paths
+            .iter()
+            .map(|path| path.as_ref().to_path_buf())
+            .collect::<Vec<_>>();
+        let mut stacker = Self::with_expanding_reference(
+            &paths,
+            calibration,
+            options,
+            maximum_samples,
+            progress,
+        )?;
+        stacker.input_paths = distinct_input_paths(masters)?;
+        stacker
+            .ledger
+            .set_current_calibration(crate::replay::CalibrationRecord::from_paths(
+                bias_path,
+                dark_path,
+                flat_path,
+                dark_exposure_seconds,
+            ));
+        Ok(stacker)
+    }
+
+    /// The lens distortion an expanded canvas was planned through, when
+    /// planning found the panels' overlaps bent by one.
+    pub fn expanded_lens(&self) -> Option<crate::ExpandedLens> {
+        self.canvas_registrar
+            .as_ref()
+            .and_then(crate::expand::CanvasRegistrar::lens_summary)
+    }
+
+    /// Metadata compatibility notes from expansion planning. Empty for
+    /// ordinary stacks and reopened contexts, which do not rerun planning.
+    pub fn expansion_planning_notes(&self) -> &[String] {
+        self.canvas_registrar
+            .as_ref()
+            .map_or(&[], |canvas| canvas.planning_notes())
+    }
+
+    /// The largest frame displacement registration accepts, in reference
+    /// pixels: on an expanded canvas, its diagonal.
+    pub fn effective_maximum_drift_pixels(&self) -> f64 {
+        self.options
+            .registration
+            .effective_maximum_drift_pixels(self.reference.width, self.reference.height)
     }
 
     /// Start a stack from an already-prepared linear reference, with no
@@ -760,7 +896,13 @@ impl LiveStacker {
         let configuration_fingerprint =
             stack_configuration_fingerprint(&options, &calibration, input_mode)?;
         let reference_is_integrated = matches!(contribution, ReferenceContribution::Integrated(_));
+        let mut canvas_registrar = None;
         let (registrar, reference_noise, reference_cfa, alignment_reference) = match contribution {
+            ReferenceContribution::Expanded { noise, canvas } => {
+                let registrar = canvas.anchor_registrar();
+                canvas_registrar = Some(canvas);
+                (registrar, noise, None, None)
+            }
             ReferenceContribution::Integrated(cfa) => (
                 Registrar::new(&reference, options.registration.clone())?,
                 if options.weighting.is_equal() {
@@ -821,6 +963,8 @@ impl LiveStacker {
             reference_metadata,
             registrar,
             alignment_reference,
+            planned_registrations: Default::default(),
+            canvas_registrar,
             reference_noise,
             accumulator,
             reference_headers,
@@ -949,18 +1093,41 @@ impl LiveStacker {
     /// registration reference, calibration, online moments, and source ledger.
     pub fn open_context(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let restored = context::read(path)?;
-        let registrar = Registrar::new(
+        let mut restored = context::read(path)?;
+        if restored.expanded_lens.is_some() {
+            // Early lens contexts retained the raw anchor's WCS even though
+            // their pixels were already on the undistorted canvas.
             restored
-                .alignment_reference
-                .as_ref()
-                .unwrap_or(&restored.reference),
-            restored.options.registration.clone(),
-        )
-        .map_err(|error| Error::StackContextRead {
+                .reference_headers
+                .retain(|(key, _)| !crate::fits::preserve_wcs_key(key));
+        }
+        let read_error = |error: Error| Error::StackContextRead {
             path: path.to_path_buf(),
             message: error.to_string(),
-        })?;
+        };
+        let canvas_registrar = (!restored.expanded_panels.is_empty())
+            .then(|| {
+                crate::expand::CanvasRegistrar::new(
+                    &restored.reference,
+                    &restored.expanded_panels,
+                    restored.expanded_panel_stars,
+                    restored.expanded_lens,
+                    &restored.options.registration,
+                )
+            })
+            .transpose()
+            .map_err(read_error)?;
+        let registrar = match &canvas_registrar {
+            Some(canvas) => canvas.anchor_registrar(),
+            None => Registrar::new(
+                restored
+                    .alignment_reference
+                    .as_ref()
+                    .unwrap_or(&restored.reference),
+                restored.options.registration.clone(),
+            )
+            .map_err(read_error)?,
+        };
         let configuration_fingerprint = stack_configuration_fingerprint(
             &restored.options,
             &restored.calibration,
@@ -973,6 +1140,8 @@ impl LiveStacker {
             reference_metadata: restored.reference_metadata,
             registrar,
             alignment_reference: restored.alignment_reference,
+            planned_registrations: Default::default(),
+            canvas_registrar,
             reference_noise: restored.reference_noise,
             accumulator: Accumulator {
                 mean: restored.mean,
@@ -1031,6 +1200,20 @@ impl LiveStacker {
                 input_paths: &self.input_paths,
                 input_mode: self.input_mode,
                 ledger: &self.ledger,
+                expanded_panels: &self
+                    .canvas_registrar
+                    .as_ref()
+                    .map(crate::expand::CanvasRegistrar::regions)
+                    .unwrap_or_default(),
+                expanded_panel_stars: self
+                    .canvas_registrar
+                    .as_ref()
+                    .map(crate::expand::CanvasRegistrar::panel_stars)
+                    .unwrap_or_default(),
+                expanded_lens: self
+                    .canvas_registrar
+                    .as_ref()
+                    .and_then(crate::expand::CanvasRegistrar::lens),
             },
         )
     }
@@ -1215,7 +1398,14 @@ impl LiveStacker {
             .map(crate::replay::FrameCache::files);
         let prepared = prepare_frame(
             &self.reference,
-            &self.registrar,
+            FrameRegistration {
+                registrar: &self.registrar,
+                canvas: self.canvas_registrar.as_ref(),
+                known: crate::expand::registration_for(
+                    &self.planned_registrations,
+                    frame.source.as_ref(),
+                )?,
+            },
             &self.options,
             &self.reference_noise,
             frame.image,
@@ -1270,7 +1460,11 @@ impl LiveStacker {
         // A frame with no source file cannot be replayed, so none is kept.
         let prepared = prepare_frame(
             &self.reference,
-            &self.registrar,
+            FrameRegistration {
+                registrar: &self.registrar,
+                canvas: self.canvas_registrar.as_ref(),
+                known: None,
+            },
             &self.options,
             &self.reference_noise,
             frame,
@@ -1298,6 +1492,8 @@ impl LiveStacker {
             PreparationHalf {
                 reference: &self.reference,
                 registrar: &self.registrar,
+                planned_registrations: &self.planned_registrations,
+                canvas_registrar: self.canvas_registrar.as_ref(),
                 calibration: &self.calibration,
                 options: &self.options,
                 reference_noise: &self.reference_noise,
@@ -1311,6 +1507,7 @@ impl LiveStacker {
                 input_paths: &mut self.input_paths,
                 ledger: &mut self.ledger,
                 frame_cache: cache_admissions,
+                expanded_canvas: self.canvas_registrar.is_some(),
             },
         )
     }
@@ -1566,7 +1763,7 @@ fn distinct_input_paths<'a>(
 }
 
 /// Calibrate and prepare a light used as a channel's photometric target.
-fn prepare_reference(
+pub(crate) fn prepare_reference(
     mut reference: FitsFrame,
     calibration: &CalibrationMasters,
     options: &StackOptions,
@@ -1584,7 +1781,7 @@ fn prepare_reference(
 }
 
 /// Measure noise before any registration resampling changes its variance.
-fn measure_reference_noise(reference: &LinearImage) -> Result<Vec<f32>> {
+pub(crate) fn measure_reference_noise(reference: &LinearImage) -> Result<Vec<f32>> {
     crate::snr::frame_noise(reference)
         .filter(|noise| noise.iter().all(|value| value.is_finite() && *value > 0.0))
         .ok_or_else(|| {
@@ -1728,6 +1925,36 @@ impl PreparedFrame {
     }
 }
 
+/// How [`prepare_frame`] finds a frame's transform: a planned registration
+/// when one is known, else through an expanded canvas's panels, else
+/// against the reference.
+pub(crate) struct FrameRegistration<'a> {
+    pub registrar: &'a Registrar,
+    pub canvas: Option<&'a crate::expand::CanvasRegistrar>,
+    pub known: Option<std::result::Result<&'a crate::RegistrationResult, &'a str>>,
+}
+
+impl FrameRegistration<'_> {
+    fn register(&self, frame: &LinearImage) -> Result<crate::RegistrationResult> {
+        match (self.known, self.canvas) {
+            (Some(Ok(known)), _) => Ok(known.clone()),
+            (Some(Err(reason)), _) => Err(Error::Registration(format!(
+                "could not join the mosaic: {reason}"
+            ))),
+            (None, Some(canvas)) => canvas.register(frame),
+            (None, None) => self.registrar.register(frame),
+        }
+    }
+
+    /// The reference stars photometric normalization measures.
+    fn reference_star_positions(&self) -> Vec<(f64, f64)> {
+        match self.canvas {
+            Some(canvas) => canvas.star_positions(),
+            None => self.registrar.reference_star_positions(),
+        }
+    }
+}
+
 /// Register and normalize one frame against the immutable reference.
 ///
 /// Every gate applied here — channel count, registration quality, scale,
@@ -1741,7 +1968,7 @@ impl PreparedFrame {
 /// from the source; see [`LiveStacker::retain_frames_for_reintegration`].
 pub(crate) fn prepare_frame(
     reference: &LinearImage,
-    registrar: &Registrar,
+    target: FrameRegistration<'_>,
     options: &StackOptions,
     reference_noise: &[f32],
     frame: LinearImage,
@@ -1756,7 +1983,7 @@ pub(crate) fn prepare_frame(
             )),
         ));
     }
-    let registration = match registrar.register(&frame) {
+    let registration = match target.register(&frame) {
         Ok(registration) => registration,
         Err(error) => {
             let message = match error {
@@ -1815,7 +2042,15 @@ pub(crate) fn prepare_frame(
         .par_iter()
         .filter(|value| value.is_finite())
         .count();
-    let overlap_fraction = finite_samples as f32 / registered.sample_count() as f32;
+    // On an expanded canvas, coverage is relative to the frame's own finite
+    // footprint; a fixed grid measures coverage of the reference.
+    let offered = if target.canvas.is_some() {
+        (frame.data.iter().filter(|value| value.is_finite()).count() as f64
+            * registration.transform.scale.powi(2)) as f32
+    } else {
+        registered.sample_count() as f32
+    };
+    let overlap_fraction = (finite_samples as f32 / offered.max(1.0)).min(1.0);
     if overlap_fraction < criteria.minimum_overlap_fraction {
         return Ok(PreparedFrame::Rejected(
             FrameRejectionReason::InsufficientOverlap {
@@ -1836,7 +2071,7 @@ pub(crate) fn prepare_frame(
             crate::normalization::photometric_gains(
                 reference,
                 &registered,
-                &registrar.reference_star_positions(),
+                &target.reference_star_positions(),
             )
         })
         .flatten()
@@ -1977,6 +2212,9 @@ pub(crate) fn prepare_frame(
 pub(crate) struct PreparationHalf<'a> {
     pub(crate) reference: &'a LinearImage,
     pub(crate) registrar: &'a Registrar,
+    pub(crate) planned_registrations:
+        &'a std::collections::HashMap<PathBuf, crate::expand::PlannedRegistration>,
+    pub(crate) canvas_registrar: Option<&'a crate::expand::CanvasRegistrar>,
     pub(crate) calibration: &'a CalibrationMasters,
     pub(crate) options: &'a StackOptions,
     pub(crate) reference_noise: &'a [f32],
@@ -1994,6 +2232,8 @@ pub(crate) struct IntegrationHalf<'a> {
     input_paths: &'a mut Vec<PathBuf>,
     ledger: &'a mut crate::replay::Ledger,
     frame_cache: Option<crate::replay::CacheAdmissions<'a>>,
+    /// Integrated fractions count the frame's finite footprint.
+    expanded_canvas: bool,
 }
 
 impl IntegrationHalf<'_> {
@@ -2027,12 +2267,14 @@ impl IntegrationHalf<'_> {
             self.accumulator
                 .classify(&registered.data, self.options.rejection, weights);
         // A photosite frame offers one sample per pixel, not one per channel.
-        let offered = if photosites {
+        let offered = if self.expanded_canvas {
+            registered.data.iter().filter(|v| v.is_finite()).count()
+        } else if photosites {
             registered.pixel_count()
         } else {
             registered.sample_count()
         };
-        let integrated_fraction = would_accept as f32 / offered as f32;
+        let integrated_fraction = would_accept as f32 / offered.max(1) as f32;
         if integrated_fraction < self.options.acceptance.minimum_integrated_fraction {
             return self.reject(FrameRejectionReason::InsufficientIntegratedSamples {
                 measured: integrated_fraction,
@@ -2416,7 +2658,7 @@ fn should_reject_weighted_sample(
 /// Angular distance from the closest valid German-equatorial-mount pier
 /// orientation. A meridian flip rotates the camera by 180 degrees, so a
 /// transform near either zero or half a turn has the same admission error.
-fn rotation_deviation_degrees(rotation_radians: f64) -> f64 {
+pub(crate) fn rotation_deviation_degrees(rotation_radians: f64) -> f64 {
     let modulo_half_turn = rotation_radians.to_degrees().rem_euclid(180.0);
     modulo_half_turn.min(180.0 - modulo_half_turn)
 }
@@ -3071,6 +3313,9 @@ mod tests {
                 input_paths: &stacker.input_paths,
                 input_mode: stacker.input_mode,
                 ledger: &stacker.ledger,
+                expanded_panels: &[],
+                expanded_panel_stars: Vec::new(),
+                expanded_lens: None,
             },
         )
         .unwrap();
@@ -3095,6 +3340,159 @@ mod tests {
             restored.push(frame()).unwrap(),
             FrameDisposition::Accepted(_)
         ));
+    }
+
+    /// Contexts saved before expanded canvases kept their panels' stars
+    /// hold the panels alone; reopened, each panel matches the stars of the
+    /// canvas beneath it, and frames still join.
+    #[test]
+    fn expanded_context_without_panel_stars_still_registers_frames() {
+        let (width, height, step) = (320_usize, 240_usize, 200_usize);
+        let sky_width = width + step;
+        let mut state = 0x5eed_u64;
+        let mut random = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as f64 / (1u64 << 31) as f64
+        };
+        let stars = (0..450)
+            .map(|_| {
+                (
+                    random() * sky_width as f64,
+                    random() * height as f64,
+                    300.0 + 3000.0 * random(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let directory = tempfile::tempdir().unwrap();
+        let panel = |name: &str, offset: f64| {
+            let mut data = vec![100.0_f32; width * height];
+            for &(sx, sy, peak) in &stars {
+                let x = sx - offset;
+                for py in (sy as isize - 4).max(0)..(sy as isize + 5).min(height as isize) {
+                    for px in (x as isize - 4).max(0)..(x as isize + 5).min(width as isize) {
+                        let d2 = (px as f64 - x).powi(2) + (py as f64 - sy).powi(2);
+                        data[py as usize * width + px as usize] +=
+                            (peak * (-d2 / 3.2).exp()) as f32;
+                    }
+                }
+            }
+            let path = directory.path().join(name);
+            seiza_fits::write_f32_image(
+                &path,
+                width,
+                height,
+                seiza_fits::F32ImageData::Mono(&data),
+                &[],
+            )
+            .unwrap();
+            path
+        };
+        let paths = [panel("a.fits", 0.0), panel("b.fits", step as f64)];
+        let mut options = StackOptions {
+            normalization: NormalizationMode::None,
+            ..StackOptions::default()
+        };
+        options.acceptance.minimum_overlap_fraction = 0.1;
+        let mut stacker = LiveStacker::with_expanding_reference(
+            &paths,
+            CalibrationMasters::default(),
+            options,
+            usize::MAX,
+            |_, _, _, _| crate::Continue::Yes,
+        )
+        .unwrap();
+        let placed = paths
+            .iter()
+            .map(|path| match stacker.push_fits(path).unwrap() {
+                FrameDisposition::Accepted(diagnostics) => diagnostics.transform,
+                other => panic!("{other:?}"),
+            })
+            .collect::<Vec<_>>();
+        let canvas = stacker.canvas_registrar.as_ref().unwrap();
+        let path = directory.path().join("before-panel-stars.seiza-stack");
+        context::write(
+            &path,
+            context::ContextWriteState {
+                reference_is_integrated: stacker.reference_is_integrated,
+                alignment_reference: stacker.alignment_reference.as_ref(),
+                reference_image_path: stacker.reference_image_path.as_deref(),
+                options: &stacker.options,
+                calibration: &stacker.calibration,
+                reference: &stacker.reference,
+                reference_headers: &stacker.reference_headers,
+                reference_metadata: &stacker.reference_metadata,
+                mean: &stacker.accumulator.mean,
+                m2: &stacker.accumulator.m2,
+                count: &stacker.accumulator.count,
+                rejected: &stacker.accumulator.rejected,
+                weight_sum: stacker.accumulator.weight_sum.as_deref(),
+                reference_noise: &stacker.reference_noise,
+                accepted_frames: stacker.accepted_frames,
+                rejected_frames: stacker.rejected_frames,
+                input_paths: &stacker.input_paths,
+                input_mode: stacker.input_mode,
+                ledger: &stacker.ledger,
+                expanded_panels: &canvas.regions(),
+                // As written before panels kept their stars.
+                expanded_panel_stars: Vec::new(),
+                expanded_lens: None,
+            },
+        )
+        .unwrap();
+        let mut restored = LiveStacker::open_context(&path).unwrap();
+        assert_eq!(
+            restored.canvas_registrar.as_ref().unwrap().regions(),
+            canvas.regions()
+        );
+        let late = panel("late.fits", step as f64 + 3.4);
+        let FrameDisposition::Accepted(diagnostics) = restored.push_fits(&late).unwrap() else {
+            panic!("a frame joins a context saved without panel stars");
+        };
+        // It lands where the panel it repeats was planned, 3.4px further on.
+        let (x, y) = diagnostics.transform.apply(0.0, 0.0);
+        let (px, py) = placed[1].apply(3.4, 0.0);
+        assert!((x - px).hypot(y - py) < 0.5, "{x},{y} against {px},{py}");
+        assert!(diagnostics.registration_rms_pixels < 0.5, "{diagnostics:?}");
+    }
+
+    #[test]
+    fn older_lens_context_drops_raw_anchor_wcs_on_reopening() {
+        let reference = stacking_star_field(160, 128);
+        let mut stacker = LiveStacker::from_linear(reference, StackOptions::default()).unwrap();
+        stacker.reference_is_integrated = false;
+        stacker.canvas_registrar = Some(
+            crate::expand::CanvasRegistrar::new(
+                &stacker.reference,
+                &[ReferenceRegion {
+                    x: 0,
+                    y: 0,
+                    width: 160,
+                    height: 128,
+                }],
+                None,
+                Some(crate::lens::LensDistortion::none(160, 128)),
+                &stacker.options.registration,
+            )
+            .unwrap(),
+        );
+        // Simulate a context written before raw WCS was invalidated.
+        stacker.reference_headers = vec![
+            ("CRPIX1".into(), HeaderValue::Float(80.5)),
+            ("CTYPE1".into(), HeaderValue::String("RA---TAN-SIP".into())),
+            ("A_2_0".into(), HeaderValue::Float(1.0e-5)),
+            ("EXPTIME".into(), HeaderValue::Float(60.0)),
+        ];
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("old-lens.context");
+        stacker.save_context(&path).unwrap();
+        let restored = LiveStacker::open_context(&path).unwrap();
+        assert!(restored.expanded_lens().is_some());
+        assert_eq!(
+            restored.reference_headers(),
+            &[("EXPTIME".into(), HeaderValue::Float(60.0))]
+        );
     }
 
     #[test]

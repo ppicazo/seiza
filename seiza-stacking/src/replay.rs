@@ -58,14 +58,14 @@ impl FrameSource {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct SourceStamp {
+pub(crate) struct SourceStamp {
     bytes: u64,
     modified_seconds: u64,
     modified_nanos: u32,
 }
 
 impl SourceStamp {
-    fn of(path: &Path) -> Option<Self> {
+    pub(crate) fn of(path: &Path) -> Option<Self> {
         let metadata = std::fs::metadata(path).ok()?;
         let modified = metadata
             .modified()
@@ -1791,6 +1791,11 @@ impl LiveStacker {
         progress: impl FnMut(BatchStackPass, usize, usize),
     ) -> Result<(BatchStackResult, DrizzleResult)> {
         drizzle.validate()?;
+        if self.canvas_registrar.is_some() {
+            return Err(Error::Stack(
+                "drizzle is not supported on an expanded canvas".into(),
+            ));
+        }
         let (result, drizzled) = self.replay(options, Some(drizzle), progress)?;
         Ok((result, drizzled.expect("a drizzle was requested")))
     }

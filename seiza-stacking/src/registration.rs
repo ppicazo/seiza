@@ -313,9 +313,45 @@ impl RegistrationModel {
 /// coordinates, the direction resampling reads. Coordinates are centred on
 /// the reference frame and scaled by half its larger dimension before the
 /// terms are formed, so the coefficients stay well conditioned.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+///
+/// A lens-corrected warp must be serialized with a human-readable format
+/// such as JSON, or through a saved stack context. Standalone compact binary
+/// serialization is refused because its legacy layout cannot hold a lens.
+#[derive(Clone, Debug, PartialEq)]
 pub struct PolynomialWarp {
+    order: u8,
+    center_x: f64,
+    center_y: f64,
+    scale: f64,
+    x: Vec<f64>,
+    y: Vec<f64>,
+    /// The lens distortion between the polynomial's undistorted source
+    /// positions and the source's pixels, when an expanded canvas measured
+    /// one.
+    distortion: Option<crate::lens::LensDistortion>,
+}
+
+/// A warp as self-describing encodings carry it. A warp without distortion
+/// reads and writes as it did before distortion existed; readers that
+/// predate it refuse one with.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PolynomialWarpWire {
+    order: u8,
+    center_x: f64,
+    center_y: f64,
+    scale: f64,
+    x: Vec<f64>,
+    y: Vec<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    distortion: Option<crate::lens::LensDistortion>,
+}
+
+/// A warp as compact binary encodings carry it, which cannot tell an absent
+/// field from the next value, so it holds no distortion: a context records
+/// its canvas's lens once, and restores it to every warp.
+#[derive(Deserialize, Serialize)]
+struct PolynomialWarpCompact {
     order: u8,
     center_x: f64,
     center_y: f64,
@@ -324,10 +360,95 @@ pub struct PolynomialWarp {
     y: Vec<f64>,
 }
 
+impl Serialize for PolynomialWarp {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let Self {
+            order,
+            center_x,
+            center_y,
+            scale,
+            x,
+            y,
+            distortion,
+        } = self.clone();
+        if serializer.is_human_readable() {
+            PolynomialWarpWire {
+                order,
+                center_x,
+                center_y,
+                scale,
+                x,
+                y,
+                distortion,
+            }
+            .serialize(serializer)
+        } else {
+            if distortion.is_some() {
+                return Err(serde::ser::Error::custom(
+                    "binary warp serialization cannot preserve lens distortion; use JSON or a stack context",
+                ));
+            }
+            PolynomialWarpCompact {
+                order,
+                center_x,
+                center_y,
+                scale,
+                x,
+                y,
+            }
+            .serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PolynomialWarp {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if deserializer.is_human_readable() {
+            let wire = PolynomialWarpWire::deserialize(deserializer)?;
+            Ok(Self {
+                order: wire.order,
+                center_x: wire.center_x,
+                center_y: wire.center_y,
+                scale: wire.scale,
+                x: wire.x,
+                y: wire.y,
+                distortion: wire.distortion,
+            })
+        } else {
+            let compact = PolynomialWarpCompact::deserialize(deserializer)?;
+            Ok(Self {
+                order: compact.order,
+                center_x: compact.center_x,
+                center_y: compact.center_y,
+                scale: compact.scale,
+                x: compact.x,
+                y: compact.y,
+                distortion: None,
+            })
+        }
+    }
+}
+
 impl PolynomialWarp {
-    /// The polynomial order: 1 for affine, 2 for quadratic.
+    /// The polynomial order: 1 for affine, 2 for quadratic, 3 for cubic.
     pub fn order(&self) -> u8 {
         self.order
+    }
+
+    /// The same map on a reference grid whose origin lies `dx`, `dy` before
+    /// this one's, as when the reference is a region of a larger image.
+    pub(crate) fn translated(&self, dx: f64, dy: f64) -> Self {
+        Self {
+            center_x: self.center_x + dx,
+            center_y: self.center_y + dy,
+            ..self.clone()
+        }
     }
 
     /// The source position of a reference pixel.
@@ -343,13 +464,54 @@ impl PolynomialWarp {
             source_x += term * cx;
             source_y += term * cy;
         }
-        (source_x, source_y)
+        match &self.distortion {
+            Some(distortion) => distortion.distort(source_x, source_y),
+            None => (source_x, source_y),
+        }
+    }
+
+    /// This polynomial read as reaching undistorted source positions, which
+    /// `distortion` carries onto the source's pixels.
+    pub(crate) fn with_distortion(self, distortion: crate::lens::LensDistortion) -> Self {
+        Self {
+            distortion: Some(distortion),
+            ..self
+        }
+    }
+
+    /// A context saves this lens separately and attaches it after decoding
+    /// the legacy warp payload. Refuse to discard any other distortion.
+    pub(crate) fn for_context(mut self, lens: Option<crate::lens::LensDistortion>) -> Result<Self> {
+        if self.distortion != lens {
+            return Err(Error::Stack(
+                "frame warp does not share the context's lens".into(),
+            ));
+        }
+        self.distortion = None;
+        Ok(self)
+    }
+
+    /// The first-order polynomial equal to the inverse of `transform`.
+    pub(crate) fn from_similarity(transform: SimilarityTransform) -> Self {
+        let inverse = transform.inverse_map();
+        let (x0, y0) = inverse(0.0, 0.0);
+        let (x1, y1) = inverse(1.0, 0.0);
+        let (x2, y2) = inverse(0.0, 1.0);
+        Self {
+            order: 1,
+            center_x: 0.0,
+            center_y: 0.0,
+            scale: 1.0,
+            x: vec![x0, x1 - x0, x2 - x0],
+            y: vec![y0, y1 - y0, y2 - y0],
+            distortion: None,
+        }
     }
 
     /// Check the order, coefficient counts, and that every value is finite.
     pub fn validate(&self) -> Result<()> {
         let terms = Self::term_count(self.order);
-        if !(1..=2).contains(&self.order)
+        if !(1..=3).contains(&self.order)
             || self.x.len() != terms
             || self.y.len() != terms
             || !(self.scale.is_finite() && self.scale > 0.0)
@@ -358,8 +520,11 @@ impl PolynomialWarp {
             || self.x.iter().chain(&self.y).any(|value| !value.is_finite())
         {
             return Err(Error::Registration(
-                "polynomial warp must be order 1 or 2 with finite coefficients".into(),
+                "polynomial warp must be order 1, 2 or 3 with finite coefficients".into(),
             ));
+        }
+        if let Some(distortion) = &self.distortion {
+            distortion.validate()?;
         }
         Ok(())
     }
@@ -367,15 +532,29 @@ impl PolynomialWarp {
     fn term_count(order: u8) -> usize {
         match order {
             1 => 3,
+            3 => 10,
             _ => 6,
         }
     }
 
-    fn terms(order: u8, u: f64, v: f64) -> [f64; 6] {
+    fn terms(order: u8, u: f64, v: f64) -> [f64; 10] {
         if order == 1 {
-            [1.0, u, v, 0.0, 0.0, 0.0]
+            [1.0, u, v, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        } else if order == 3 {
+            [
+                1.0,
+                u,
+                v,
+                u * u,
+                u * v,
+                v * v,
+                u * u * u,
+                u * u * v,
+                u * v * v,
+                v * v * v,
+            ]
         } else {
-            [1.0, u, v, u * u, u * v, v * v]
+            [1.0, u, v, u * u, u * v, v * v, 0.0, 0.0, 0.0, 0.0]
         }
     }
 
@@ -386,9 +565,9 @@ impl PolynomialWarp {
         let center_y = height as f64 * 0.5;
         let scale = width.max(height) as f64 * 0.5;
         let count = Self::term_count(order);
-        let mut normal = [[0.0_f64; 6]; 6];
-        let mut right_x = [0.0_f64; 6];
-        let mut right_y = [0.0_f64; 6];
+        let mut normal = [[0.0_f64; 10]; 10];
+        let mut right_x = [0.0_f64; 10];
+        let mut right_y = [0.0_f64; 10];
         for &((reference_x, reference_y), (source_x, source_y)) in pairs {
             let terms = Self::terms(
                 order,
@@ -412,13 +591,14 @@ impl PolynomialWarp {
             scale,
             x,
             y,
+            distortion: None,
         })
     }
 }
 
 /// Solve the leading `count` x `count` system by Gaussian elimination with
 /// partial pivoting.
-fn solve(mut matrix: [[f64; 6]; 6], mut right: [f64; 6], count: usize) -> Option<Vec<f64>> {
+fn solve(mut matrix: [[f64; 10]; 10], mut right: [f64; 10], count: usize) -> Option<Vec<f64>> {
     for column in 0..count {
         let pivot = (column..count)
             .max_by(|&a, &b| matrix[a][column].abs().total_cmp(&matrix[b][column].abs()))?;
@@ -454,7 +634,7 @@ fn solve(mut matrix: [[f64; 6]; 6], mut right: [f64; 6], count: usize) -> Option
 }
 
 /// A reference position and the source position of the same star.
-type PointPair = ((f64, f64), (f64, f64));
+pub(crate) type PointPair = ((f64, f64), (f64, f64));
 
 /// Stars detected for a polynomial fit, against 200 for matching.
 const DISTORTION_STARS: usize = 2_000;
@@ -485,7 +665,7 @@ impl Default for RegistrationOptions {
 
 impl RegistrationOptions {
     /// Stars to detect: the matching set, or more for a polynomial fit.
-    fn dense_star_count(&self) -> usize {
+    pub(crate) fn dense_star_count(&self) -> usize {
         if self.model.is_similarity() {
             self.maximum_stars
         } else {
@@ -569,10 +749,40 @@ impl Registrar {
     /// Detect stars in the reference frame and prepare the matching index.
     pub fn new(reference: &LinearImage, options: RegistrationOptions) -> Result<Self> {
         options.validate()?;
+        let stars = detect(reference, &options, options.dense_star_count());
+        Self::from_stars(reference.width, reference.height, stars, options)
+    }
+
+    /// A registrar for a `width` by `height` reference whose stars were
+    /// detected already, brightest first, as [`Self::detected_stars`] gives
+    /// them back.
+    pub(crate) fn from_stars(
+        width: usize,
+        height: usize,
+        stars: Vec<DetectedStar>,
+        options: RegistrationOptions,
+    ) -> Result<Self> {
+        options.validate()?;
+        // Saved panel detections enter here without passing through the
+        // detector. Reject corrupt coordinates before indexing or fitting.
+        if stars.iter().any(|star| {
+            !star.x.is_finite()
+                || !star.y.is_finite()
+                || star.x < 0.0
+                || star.y < 0.0
+                || star.x >= width as f64
+                || star.y >= height as f64
+                || !star.flux.is_finite()
+                || !star.peak.is_finite()
+        }) {
+            return Err(Error::Registration(
+                "reference stars must be finite and lie within the reference image".into(),
+            ));
+        }
         // The detector sorts by brightness before truncating, so the first
         // `maximum_stars` of a dense detection are exactly the matching set.
-        let dense_count = options.dense_star_count();
-        let mut reference_stars = detect(reference, &options, dense_count);
+        let mut reference_stars = stars;
+        reference_stars.truncate(options.dense_star_count());
         let dense_stars = if options.model.is_similarity() {
             Vec::new()
         } else {
@@ -596,11 +806,10 @@ impl Registrar {
         }
         let reference_index =
             StarSpatialIndex::new(&reference_stars, options.match_tolerance_pixels);
-        let maximum_drift_pixels =
-            options.effective_maximum_drift_pixels(reference.width, reference.height);
+        let maximum_drift_pixels = options.effective_maximum_drift_pixels(width, height);
         Ok(Self {
-            width: reference.width,
-            height: reference.height,
+            width,
+            height,
             reference_stars,
             reference_index,
             reference_triangles,
@@ -609,6 +818,16 @@ impl Registrar {
             maximum_drift_pixels,
             options,
         })
+    }
+
+    /// Every reference star detected, brightest first: what
+    /// [`Self::from_stars`] rebuilds this registrar from.
+    pub(crate) fn detected_stars(&self) -> &[DetectedStar] {
+        if self.dense_stars.is_empty() {
+            &self.reference_stars
+        } else {
+            &self.dense_stars
+        }
     }
 
     /// Positions of the reference frame's brightest stars, on its grid.
@@ -621,7 +840,59 @@ impl Registrar {
 
     /// Find the best transform aligning `source` to the reference frame.
     pub fn register(&self, source: &LinearImage) -> Result<RegistrationResult> {
-        let dense_source = detect(source, &self.options, self.options.dense_star_count());
+        self.register_stars(&self.detect_source_stars(source))
+    }
+
+    /// Detect a source frame's stars once, to register it against several
+    /// references with [`Self::register_stars`].
+    pub(crate) fn detect_source_stars(&self, source: &LinearImage) -> Vec<DetectedStar> {
+        detect(source, &self.options, self.options.dense_star_count())
+    }
+
+    /// [`Self::register`] with the source's stars already detected.
+    pub(crate) fn register_stars(
+        &self,
+        dense_source: &[DetectedStar],
+    ) -> Result<RegistrationResult> {
+        let mut result = self.register_similarity_stars(dense_source)?;
+        if let Some((warp, pairs, rms)) = self.warp_stars(result.transform, dense_source) {
+            result.warp = Some(warp);
+            result.matched_stars = pairs;
+            result.rms_error_pixels = rms;
+        }
+        Ok(result)
+    }
+
+    /// Refine a similarity found elsewhere: pair the source's brightest
+    /// stars within the match tolerance of where `initial` carries them, and
+    /// refit as [`Self::register_similarity_stars`] does, without searching.
+    pub(crate) fn refine_similarity_stars(
+        &self,
+        initial: SimilarityTransform,
+        dense_source: &[DetectedStar],
+    ) -> Result<RegistrationResult> {
+        let source_stars = &dense_source[..dense_source.len().min(self.options.maximum_stars)];
+        let pairs = matched_pairs(
+            initial,
+            source_stars,
+            &self.reference_stars,
+            &self.reference_index,
+            self.options.match_tolerance_pixels,
+        );
+        if pairs.len() < self.options.minimum_matches.max(3) {
+            return Err(Error::Registration(format!(
+                "only {} stars pair where the initial transform places them",
+                pairs.len()
+            )));
+        }
+        self.refine_registration((pairs.len(), 0.0, initial, pairs), source_stars)
+    }
+
+    /// The similarity [`Self::register_stars`] finds, before any warp.
+    pub(crate) fn register_similarity_stars(
+        &self,
+        dense_source: &[DetectedStar],
+    ) -> Result<RegistrationResult> {
         let source_stars = &dense_source[..dense_source.len().min(self.options.maximum_stars)];
         if source_stars.len() < self.options.minimum_matches.max(3) {
             return Err(Error::Registration(format!(
@@ -688,15 +959,50 @@ impl Registrar {
                 self.maximum_drift_pixels
             ))
         })?;
-        let mut result = self.refine_registration(best, source_stars)?;
-        if let Some(order) = self.options.model.polynomial_order()
-            && let Some((warp, pairs, rms)) = self.fit_warp(order, result.transform, &dense_source)
-        {
-            result.warp = Some(warp);
-            result.matched_stars = pairs;
-            result.rms_error_pixels = rms;
-        }
-        Ok(result)
+        self.refine_registration(best, source_stars)
+    }
+
+    /// The polynomial warp [`Self::register_stars`] fits around `transform`,
+    /// with the pairs it kept and their RMS residual; `None` for a similarity
+    /// model or when too few stars pair up.
+    pub(crate) fn warp_stars(
+        &self,
+        transform: SimilarityTransform,
+        dense_source: &[DetectedStar],
+    ) -> Option<(PolynomialWarp, usize, f64)> {
+        self.fit_warp(
+            self.options.model.polynomial_order()?,
+            transform,
+            dense_source,
+        )
+    }
+
+    /// Match through a geometric prediction instead of a similarity. At
+    /// the edge of a wide tangent plane a similarity can miss stars by
+    /// tens of pixels even when the camera's pose is already known.
+    pub(crate) fn warp_stars_seeded(
+        &self,
+        seed: &PolynomialWarp,
+        source_stars: &[DetectedStar],
+    ) -> Option<(PolynomialWarp, usize, f64)> {
+        let order = self.options.model.polynomial_order()?.max(seed.order());
+        let index = StarSpatialIndex::new(source_stars, DISTORTION_PAIR_PIXELS);
+        let mut seen = std::collections::HashSet::new();
+        let pairs = self
+            .dense_stars
+            .iter()
+            .filter_map(|reference| {
+                let (x, y) = seed.apply(reference.x, reference.y);
+                let (matched, _) =
+                    index.nearest_within(x, y, source_stars, DISTORTION_PAIR_PIXELS)?;
+                if !seen.insert(matched) {
+                    return None;
+                }
+                let source = &source_stars[matched];
+                Some(((reference.x, reference.y), (source.x, source.y)))
+            })
+            .collect();
+        self.fit_warp_pairs(order, pairs)
     }
 
     /// Pair the dense source stars with the dense reference stars through the
@@ -710,8 +1016,7 @@ impl Registrar {
         transform: SimilarityTransform,
         source_stars: &[DetectedStar],
     ) -> Option<(PolynomialWarp, usize, f64)> {
-        let minimum = PolynomialWarp::term_count(order) * DISTORTION_PAIRS_PER_TERM;
-        let mut pairs = source_stars
+        let pairs = source_stars
             .iter()
             .filter_map(|star| {
                 let (x, y) = transform.apply(star.x, star.y);
@@ -725,6 +1030,15 @@ impl Registrar {
                 Some(((reference.x, reference.y), (star.x, star.y)))
             })
             .collect::<Vec<_>>();
+        self.fit_warp_pairs(order, pairs)
+    }
+
+    fn fit_warp_pairs(
+        &self,
+        order: u8,
+        mut pairs: Vec<PointPair>,
+    ) -> Option<(PolynomialWarp, usize, f64)> {
+        let minimum = PolynomialWarp::term_count(order) * DISTORTION_PAIRS_PER_TERM;
         if pairs.len() < minimum {
             return None;
         }
@@ -796,6 +1110,73 @@ impl Registrar {
             warp: None,
         })
     }
+}
+
+/// Refit a similarity found elsewhere against the stars of `reference`,
+/// pairing each source star within the match tolerance of where `initial`
+/// carries it. A star cut by the edge of either image has a biased centroid,
+/// and a narrow overlap holds many, so stars within a few pixels of an edge
+/// or of an undefined reference sample are left out. `None` when fewer than
+/// the minimum matches pair up. Up to `stars` of the brightest on each side
+/// take part.
+pub(crate) fn refine_similarity(
+    reference: &LinearImage,
+    source: &LinearImage,
+    source_stars: &[DetectedStar],
+    initial: SimilarityTransform,
+    options: &RegistrationOptions,
+    stars: usize,
+) -> Option<RegistrationResult> {
+    const MARGIN: isize = 6;
+    let defined = |image: &LinearImage, star: &DetectedStar| {
+        let (cx, cy) = (star.x.round() as isize, star.y.round() as isize);
+        (cy - MARGIN..=cy + MARGIN).all(|y| {
+            (cx - MARGIN..=cx + MARGIN).all(|x| {
+                x >= 0
+                    && y >= 0
+                    && (x as usize) < image.width
+                    && (y as usize) < image.height
+                    && image.data[(y as usize * image.width + x as usize) * image.channels]
+                        .is_finite()
+            })
+        })
+    };
+    let reference_stars = detect(reference, options, stars)
+        .into_iter()
+        .filter(|star| defined(reference, star))
+        .collect::<Vec<_>>();
+    let source_stars = source_stars[..source_stars.len().min(stars)]
+        .iter()
+        .filter(|star| defined(source, star))
+        .cloned()
+        .collect::<Vec<_>>();
+    let source_stars = &source_stars[..];
+    let index = StarSpatialIndex::new(&reference_stars, options.match_tolerance_pixels);
+    let mut transform = initial;
+    let mut pairs = Vec::new();
+    for _ in 0..3 {
+        pairs = matched_pairs(
+            transform,
+            source_stars,
+            &reference_stars,
+            &index,
+            options.match_tolerance_pixels,
+        );
+        if pairs.len() < options.minimum_matches {
+            return None;
+        }
+        transform = fit_similarity(&pairs, source_stars, &reference_stars).ok()?;
+    }
+    let rms = (pair_squared_error(transform, &pairs, source_stars, &reference_stars)
+        / pairs.len() as f64)
+        .sqrt();
+    Some(RegistrationResult {
+        transform,
+        matched_stars: pairs.len(),
+        rms_error_pixels: rms,
+        drift_pixels: 0.0,
+        warp: None,
+    })
 }
 
 /// Resample a source image through a fitted source-to-reference transform.
@@ -1413,6 +1794,16 @@ fn retain_scored_transform(
     }
 }
 
+/// Up to `max_stars` of an image's brightest stars, as registration
+/// detects them.
+pub(crate) fn detect_stars(
+    image: &LinearImage,
+    options: &RegistrationOptions,
+    max_stars: usize,
+) -> Vec<DetectedStar> {
+    detect(image, options, max_stars)
+}
+
 fn detect(
     image: &LinearImage,
     options: &RegistrationOptions,
@@ -1714,6 +2105,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn geometric_seed_pairs_stars_beyond_the_similarity_search_radius() {
+        let mut state = 721_u64;
+        let mut random = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (state >> 33) as f64 / (1_u64 << 31) as f64
+        };
+        let reference = (0..1200)
+            .map(|_| star(30.0 + 900.0 * random(), 30.0 + 900.0 * random()))
+            .collect::<Vec<_>>();
+        let geometry = |x: f64, y: f64| (x + 0.02 * x + 0.00003 * x * y, y + 0.01 * x);
+        let source = reference
+            .iter()
+            .map(|s| {
+                let (x, y) = geometry(s.x, s.y);
+                star(x + 0.3, y - 0.2)
+            })
+            .collect::<Vec<_>>();
+        let pairs = reference
+            .iter()
+            .map(|s| ((s.x, s.y), geometry(s.x, s.y)))
+            .collect::<Vec<_>>();
+        let seed = PolynomialWarp::fit(2, 1000, 1000, &pairs).unwrap();
+        let registrar = Registrar::from_stars(
+            1000,
+            1000,
+            reference,
+            RegistrationOptions {
+                maximum_stars: 2000,
+                model: RegistrationModel::Quadratic,
+                ..RegistrationOptions::default()
+            },
+        )
+        .unwrap();
+        let old = registrar.warp_stars(SimilarityTransform::IDENTITY, &source);
+        let (warp, count, rms) = registrar.warp_stars_seeded(&seed, &source).unwrap();
+        assert!(count > 1100 && rms < 1e-8, "{count} pairs at {rms}");
+        assert!(old.is_none_or(|(_, n, r)| n < count / 2 || r > 0.25));
+        for (x, y) in [(1.0, 2.0), (992.0, 998.0), (451.2, 179.3)] {
+            let expected = geometry(x, y);
+            let actual = warp.apply(x, y);
+            assert!((actual.0 - expected.0 - 0.3).hypot(actual.1 - expected.1 + 0.2) < 1e-8);
+        }
+    }
+
     fn lanczos(source: &LinearImage, transform: SimilarityTransform) -> LinearImage {
         resample_region_to_reference_with(
             source,
@@ -1737,6 +2173,29 @@ mod tests {
             translation_y: dy,
             ..SimilarityTransform::IDENTITY
         }
+    }
+
+    #[test]
+    fn lens_warps_cannot_silently_lose_distortion_in_binary_serialization() {
+        let plain = PolynomialWarp::from_similarity(shift(3.0, 5.0));
+        let bytes = postcard::to_stdvec(&plain).unwrap();
+        assert_eq!(
+            postcard::from_bytes::<PolynomialWarp>(&bytes).unwrap(),
+            plain
+        );
+        let lens = crate::lens::LensDistortion::none(160, 128);
+        let warped = plain.clone().with_distortion(lens);
+        assert!(postcard::to_stdvec(&warped).is_err());
+        assert_eq!(
+            serde_json::from_str::<PolynomialWarp>(&serde_json::to_string(&warped).unwrap())
+                .unwrap(),
+            warped,
+        );
+        assert!(warped.clone().for_context(None).is_err());
+        assert_eq!(
+            postcard::to_stdvec(&warped.for_context(Some(lens)).unwrap()).unwrap(),
+            bytes
+        );
     }
 
     #[test]
@@ -2396,6 +2855,7 @@ mod tests {
             scale: 16.0,
             x: vec![15.3, 16.1, 0.4, 0.3, -0.2, 0.1],
             y: vec![8.6, -0.3, 15.8, 0.1, 0.25, -0.15],
+            distortion: None,
         };
         let similarities = [
             SimilarityTransform::IDENTITY,

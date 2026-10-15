@@ -312,6 +312,7 @@ class StackOptions:
     normalization: str
     local_tile_size: int | None
     demosaic: str
+    registration_model: str
     rejection: str
     maximum_drift_pixels: float
     maximum_drift_fraction: float
@@ -345,6 +346,7 @@ class StackOptions:
         minimum_integrated_fraction: float = 0.50,
         demosaic: str = "vng",
         match_tolerances: MatchTolerances | None = None,
+        registration_model: str = "similarity",
     ) -> None: ...
 
 class FrameDisposition:
@@ -456,6 +458,18 @@ class LiveStacker:
         dark_exposure_seconds: float | None = None,
     ) -> tuple[LiveStacker, ChannelReferenceSelection]: ...
     @staticmethod
+    def open_fits_expanding(
+        paths: Sequence[str | Path],
+        *,
+        options: StackOptions | None = None,
+        bias: str | Path | None = None,
+        dark: str | Path | None = None,
+        flat: str | Path | None = None,
+        dark_exposure_seconds: float | None = None,
+        max_canvas_megasamples: int = 256,
+        cancel: Callable[[], bool] | None = None,
+    ) -> LiveStacker: ...
+    @staticmethod
     def open_context(path: str | Path) -> LiveStacker: ...
     @property
     def accepted_frames(self) -> int: ...
@@ -485,6 +499,8 @@ class LiveStacker:
     ) -> tuple[list[FrameDisposition], PipelineReport]: ...
     def push(self, image: npt.NDArray[np.float32]) -> FrameDisposition: ...
     def save_context(self, path: str | Path) -> None: ...
+    @property
+    def expanded_lens(self) -> dict[str, float | None] | None: ...
     def snapshot(self) -> StackSnapshot: ...
     def retain_frames_for_reintegration(
         self,
