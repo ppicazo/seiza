@@ -342,6 +342,38 @@ network, since the library cannot tell a network mount from a local disk, and
 `normalized_full_scale=65535.0` when the set mixes PixInsight XISF frames with
 16-bit camera data.
 
+Before pushing a light under masters you chose yourself, ask whether they
+accept it. `validate_calibration()` raises `StackError` naming the reading that
+failed and the tolerance in force; `compatible_calibration()` answers the same
+question as the masters it would keep and why it would drop the rest. Pass the
+`MatchTolerances` you matched the masters under, so both judge with your gate:
+
+```python
+light = seiza.FrameSignature(width=6248, height=4176, channels=1, rotation_deg=113.8)
+wide = seiza.MatchTolerances(rotation_deg=180.0)
+stacker.validate_calibration(light, wide)        # None, or raises StackError
+kept, dropped = stacker.compatible_calibration(light, wide)
+```
+
+Passing `tolerances` replaces the stack's own whole: a field you leave unset
+takes the built-in default, not the stack's value. Both calls raise
+`StackError` for a tolerance that is NaN, infinite, negative, or a rotation
+above 180 degrees, which already accepts any angle.
+
+The stack judges every light it is given under its own gate, so give it the
+same one, or the light is refused when you push it.
+`StackOptions(match_tolerances=...)` sets the gate a stack opens with, which
+also judges the reference. `set_match_tolerances()` changes it for the lights
+pushed after, and `match_tolerances()` reads it back. Each admitted frame keeps
+the gate it was admitted under, and `reintegrate()` judges it by that gate, so
+you can widen the gate for one light and narrow it again after:
+
+```python
+stacker.set_match_tolerances(wide)
+stacker.push_fits("light-113.8deg.fits")
+stacker.set_match_tolerances()                   # the defaults again
+```
+
 A stacker built from FITS or XISF paths can integrate its admitted frames again
 from their files, with leave-one-out rejection that removes trails the online
 pass kept, and can drizzle that integration onto a finer grid as WBPP's

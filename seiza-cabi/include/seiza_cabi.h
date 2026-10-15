@@ -320,9 +320,12 @@ typedef struct {
 
  Every field is optional: set a `SEIZA_TOLERANCE_HAS_*` bit to override that
  tolerance, leave it clear to take the default. A zeroed struct therefore
- means "all defaults", and passing a null pointer anywhere one of these is
- accepted means the same. An override that is negative or not a number is
- ignored in favour of the default.
+ means "all defaults", and so does a null pointer, except where a live
+ stacker call says null means the stack's own gate. An override that is
+ negative, not a number, infinite, or a rotation above 180 degrees is
+ ignored in favour of the default. Unset fields always take the built-in
+ defaults, never the stack's own gate: a non-null struct replaces it
+ whole.
 
  The defaults are what a rig's own scatter needs rather than what a
  specification promises. [`seiza_match_tolerances_default`] fills one in if
@@ -786,8 +789,11 @@ char *seiza_stack_choose_reference_json(const char *paths_json,
  example, `"demosaic": "vng" | "mhc" | "bilinear"`,
  `"interpolation": "bilinear" | "lanczos3"`,
  `"normalization": {"mode": "local-background", "options": {"tile_size": 256}}`,
- `"weighting": {"mode": "inverse-noise-variance"}`, or
- `"registration": {"model": "quadratic"}`. All files
+ `"weighting": {"mode": "inverse-noise-variance"}`,
+ `"registration": {"model": "quadratic"}`, or
+ `"match_tolerances": {"rotation_deg": 5.0}`, the gate the reference and
+ every pushed light are judged under against the masters (tolerances left
+ out keep their defaults). All files
  are fully read during this call and are not kept open afterward.
 
  # Safety
@@ -905,9 +911,11 @@ bool seiza_live_stacker_save_context(const SeizaLiveStacker *stacker,
  JSON shape: `{"schemaVersion":1,"kept":["bias","dark"],"dropped":
  [{"kind":"flat","reason":"flat set aside: rotation light=..."}]}` — `kept`
  lists only masters that are loaded and acceptable; a master that was never
- loaded appears in neither list. `tolerances` may be null for the defaults.
- Returns a string released with [`seiza_string_free`], or null with
- `error_out` set.
+ loaded appears in neither list. `tolerances` may be null for the stack's
+ own: those it opened with (`match_tolerances` in its options JSON) or
+ was last given by [`seiza_live_stacker_set_match_tolerances`]. Returns a
+ string released with [`seiza_string_free`], or null with `error_out`
+ set.
 
  # Safety
 
@@ -921,6 +929,74 @@ char *seiza_live_stacker_compatible_calibration_json(const SeizaLiveStacker *sta
                                                      const SeizaFrameSignature *signature,
                                                      const SeizaMatchTolerances *tolerances,
                                                      char **error_out);
+
+/*
+ Whether every active master of the stacker accepts a prospective light:
+ the yes-or-no form of [`seiza_live_stacker_compatible_calibration_json`],
+ asking exactly the same questions, so it answers 1 exactly when that
+ drops nothing.
+
+ Returns 1 when the light is acceptable (and always with no masters
+ loaded), 0 when a master refuses it — with `error_out` set to why,
+ naming the reading and, for a measured gap, the tolerance in force, as
+ in `master flat does not match the light frame's optical configuration:
+ rotation light=113.8deg master=3.2deg (110.60 deg apart, tolerance
+ 2.00)` — and -1 with `error_out` set when an argument is invalid.
+
+ `tolerances` may be null for the stack's own, as in
+ [`seiza_live_stacker_compatible_calibration_json`]. A host that widened
+ a gate to choose its masters asks with the same gate here.
+
+ # Safety
+
+ As [`seiza_live_stacker_compatible_calibration_json`].
+ */
+int32_t seiza_live_stacker_validate_calibration(const SeizaLiveStacker *stacker,
+                                                const SeizaFrameSignature *signature,
+                                                const SeizaMatchTolerances *tolerances,
+                                                char **error_out);
+
+/*
+ Judge the lights pushed from now on under `tolerances`: how close a
+ light's readings must be to the masters' for them to calibrate it. A
+ host that widened a gate to choose its masters — a rotator that scatters
+ more than two degrees, or a flat taken from the nearest other angle on
+ purpose — sets the same gate here, or the light is refused when it is
+ pushed. To judge the reference under it too, open the stack with
+ `match_tolerances` in its options JSON instead.
+
+ Frames already admitted keep the gate they were admitted under, and a
+ reintegration judges each by its own, so a gate can be widened for one
+ light and narrowed again after it. A saved context keeps it, and the
+ configuration fingerprint changes with it. Null, a zeroed struct and any
+ cleared flag mean the defaults, as everywhere a `SeizaMatchTolerances`
+ is taken. Returns false with `error_out` set for a stack created from
+ prepared arrays, whose frames are never calibrated.
+
+ # Safety
+
+ `stacker` must be a live stacker from this library, with this call
+ externally synchronized against every other operation on it.
+ `tolerances` must be null or reference an initialized
+ `SeizaMatchTolerances`. When non-null, `error_out` must point to
+ writable storage for one pointer.
+ */
+bool seiza_live_stacker_set_match_tolerances(SeizaLiveStacker *stacker,
+                                             const SeizaMatchTolerances *tolerances,
+                                             char **error_out);
+
+/*
+ Fill `tolerances` with the stack's own, every flag set: the gate its
+ lights are judged under now.
+
+ # Safety
+
+ `stacker` must be a live stacker from this library, with this read
+ externally synchronized against mutable operations. `tolerances` must
+ point at writable storage for one `SeizaMatchTolerances`.
+ */
+bool seiza_live_stacker_match_tolerances(const SeizaLiveStacker *stacker,
+                                         SeizaMatchTolerances *tolerances);
 
 /*
  Returns an owned JSON snapshot of the live stack's resumable identity and

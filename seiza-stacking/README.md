@@ -286,6 +286,38 @@ may be scaled by exposure; a dark that still contains its pedestal must have
 the same known positive exposure as the light. With no masters, preprocessed
 lights remain valid inputs.
 
+The gates are `seiza_calibration::MatchTolerances`, and a live stack keeps
+its own in `StackOptions::match_tolerances`, the defaults unless set. A host
+that chose its masters under its own tolerances — a rotator that scatters more
+than two degrees, or a flat borrowed on purpose from the nearest other angle —
+gives the stack the same gate, and the reference, every push, pipelined push
+and channel reference are judged under it. `LiveStacker::set_match_tolerances`
+changes the gate for the lights pushed from then on, and a master swap leaves
+it as it was. Each admitted frame keeps the gate it was admitted under, and a
+reintegration judges it by that gate, so a host can widen the gate for one
+light and narrow it after. Options, a saved context and the configuration
+fingerprint record only the tolerances a light is admitted by;
+`master_temperature_c` and `flat_session_seconds` read back as their defaults.
+
+Tolerances that are NaN, infinite, negative, or a rotation above 180 degrees
+are refused with an error, never clamped: `StackOptions::validate`,
+`set_match_tolerances`, `compatible_for_light_with` and the `_with` validators
+return it, and `save_context` will not write such a context.
+`MatchTolerances::validate` is the same check for a host's own input. A
+rotation of 180 already accepts any angle.
+
+Masters given to `set_calibration` live only in memory, so once they are
+replaced, frames admitted under them can no longer be reintegrated
+(`reintegration_unavailable` says so). `set_calibration_from_fits_paths` keeps
+reintegration.
+
+Outside a stack, `validate_light_frame_with` and `validate_light_signature_with`
+judge one light under the tolerances you pass, for a host that runs its own
+pass over the lights. `compatible_for_light_with` asks the same questions and
+names what it would set aside, so validation passes exactly when it sets aside
+nothing. A refusal names the reading that failed and the tolerance in force, as
+in `rotation light=113.8deg master=3.2deg (110.60 deg apart, tolerance 2.00)`.
+
 Darks that caught stray light, such as dawn through an open roof, look like
 ordinary darks in their headers. `MasterBuildOptions::dark_level_screening`
 measures each dark's robust level and sets aside any frame more than a set

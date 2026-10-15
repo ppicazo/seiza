@@ -465,6 +465,96 @@ def test_compatible_calibration_names_what_a_light_could_accept():
     assert seiza.optics_match(light, flat, wide)
 
 
+def test_validate_calibration_honors_the_callers_tolerances(tmp_path):
+    """A flat from 3.2 degrees, chosen on purpose for a light at 113.8.
+
+    Under the default two-degree gate the light is refused, and the refusal
+    names the gate; asked with the gate the host chose the flat under, it
+    passes. The yes-or-no answer agrees with compatible_calibration.
+    """
+    reference = tmp_path / "reference.fits"
+    flat = tmp_path / "master-flat.fits"
+    header = fits.Header()
+    header["IMAGETYP"] = "LIGHT"
+    header["ROTATANG"] = 3.2
+    fits.writeto(reference, synthetic_star_field(), header, overwrite=True)
+    header = fits.Header()
+    header["SEIZAMST"] = "FLAT"
+    header["ROTATANG"] = 3.2
+    fits.writeto(flat, np.ones((128, 160), dtype=np.float32), header, overwrite=True)
+    stacker = seiza.LiveStacker(reference, flat=flat, options=no_adjustment_options())
+
+    light = seiza.FrameSignature(width=160, height=128, channels=1, rotation_deg=113.8)
+    with pytest.raises(seiza.StackError, match="tolerance 2.00"):
+        stacker.validate_calibration(light)
+    kept, dropped = stacker.compatible_calibration(light)
+    assert kept == []
+    assert len(dropped) == 1
+
+    wide = seiza.MatchTolerances(rotation_deg=180.0)
+    assert stacker.validate_calibration(light, wide) is None
+    kept, dropped = stacker.compatible_calibration(light, wide)
+    assert kept == ["flat"]
+    assert dropped == []
+
+    # Tighter than the defaults refuses what they accept.
+    near = seiza.FrameSignature(width=160, height=128, channels=1, rotation_deg=4.7)
+    assert stacker.validate_calibration(near) is None
+    with pytest.raises(seiza.StackError, match="tolerance 1.00"):
+        stacker.validate_calibration(near, seiza.MatchTolerances(rotation_deg=1.0))
+
+    # A tolerance no comparison can use is refused, not read as "anything".
+    for unusable in (float("nan"), float("inf"), -1.0, 360.0):
+        tolerances = seiza.MatchTolerances(rotation_deg=unusable)
+        with pytest.raises(seiza.StackError, match="rotation_deg"):
+            stacker.validate_calibration(light, tolerances)
+        with pytest.raises(seiza.StackError, match="rotation_deg"):
+            stacker.compatible_calibration(light, tolerances)
+
+
+def test_a_stack_admits_lights_under_its_own_gate(tmp_path):
+    """The stack's gate: set when it opens or later, and kept per frame."""
+    flat = tmp_path / "master-flat.fits"
+    header = fits.Header()
+    header["SEIZAMST"] = "FLAT"
+    header["ROTATANG"] = 3.2
+    fits.writeto(flat, np.ones((128, 160), dtype=np.float32), header, overwrite=True)
+
+    def light(name, rotation_deg):
+        path = tmp_path / name
+        header = fits.Header()
+        header["IMAGETYP"] = "LIGHT"
+        header["ROTATANG"] = rotation_deg
+        fits.writeto(path, synthetic_star_field(), header, overwrite=True)
+        return path
+
+    reference = light("reference.fits", 3.2)
+    wide = seiza.MatchTolerances(rotation_deg=180.0)
+    stacker = seiza.LiveStacker(reference, flat=flat, options=no_adjustment_options())
+    assert stacker.match_tolerances().rotation_deg == 2.0
+    assert not stacker.push_fits(light("turned-1.fits", 113.8)).accepted
+
+    stacker.set_match_tolerances(wide)
+    assert stacker.match_tolerances().rotation_deg == 180.0
+    signature = seiza.FrameSignature(width=160, height=128, channels=1, rotation_deg=113.8)
+    assert stacker.validate_calibration(signature) is None
+    assert stacker.push_fits(light("turned-2.fits", 113.8)).accepted
+    stacker.set_match_tolerances()
+    assert stacker.match_tolerances().rotation_deg == 2.0
+    assert not stacker.push_fits(light("turned-3.fits", 113.8)).accepted
+    with pytest.raises(seiza.StackError, match="finite"):
+        stacker.set_match_tolerances(seiza.MatchTolerances(rotation_deg=float("inf")))
+
+    # A reference is judged under the gate in the options it opens with.
+    turned = light("turned-reference.fits", 113.8)
+    with pytest.raises(seiza.StackError, match="tolerance 2.00"):
+        seiza.LiveStacker(turned, flat=flat, options=no_adjustment_options())
+    options = seiza.StackOptions(normalization="none", rejection="none", match_tolerances=wide)
+    assert options.match_tolerances.rotation_deg == 180.0
+    gated = seiza.LiveStacker(turned, flat=flat, options=options)
+    assert gated.match_tolerances().rotation_deg == 180.0
+
+
 def test_reintegrate_and_drizzle_reject_a_reference_trail(tmp_path):
     clean = synthetic_star_field()
     paths = []

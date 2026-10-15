@@ -250,6 +250,64 @@ class SatelliteCatalog:
         max_element_age_s: float | None = 604_800.0,
     ) -> TrackSearchResult: ...
 
+class FrameSignature:
+    camera: str | None
+    telescope: str | None
+    width: int | None
+    height: int | None
+    channels: int | None
+    binning_x: int | None
+    binning_y: int | None
+    gain: int | None
+    offset: int | None
+    readout_mode: int | None
+    bayer_pattern: str | None
+    filter: str | None
+    focal_length_mm: float | None
+    rotation_deg: float | None
+    exposure_seconds: float | None
+    camera_temp_c: float | None
+    captured_at_unix: int | None
+    def __init__(
+        self,
+        camera: str | None = None,
+        telescope: str | None = None,
+        width: int | None = None,
+        height: int | None = None,
+        channels: int | None = None,
+        binning_x: int | None = None,
+        binning_y: int | None = None,
+        gain: int | None = None,
+        offset: int | None = None,
+        readout_mode: int | None = None,
+        bayer_pattern: str | None = None,
+        filter: str | None = None,
+        focal_length_mm: float | None = None,
+        rotation_deg: float | None = None,
+        exposure_seconds: float | None = None,
+        camera_temp_c: float | None = None,
+        captured_at_unix: int | None = None,
+    ) -> None: ...
+
+class MatchTolerances:
+    exposure_seconds: float
+    exposure_fraction: float
+    dark_temperature_c: float
+    master_temperature_c: float
+    rotation_deg: float
+    focal_length_mm: float
+    flat_session_seconds: int
+    def __init__(
+        self,
+        exposure_seconds: float | None = None,
+        exposure_fraction: float | None = None,
+        dark_temperature_c: float | None = None,
+        master_temperature_c: float | None = None,
+        rotation_deg: float | None = None,
+        focal_length_mm: float | None = None,
+        flat_session_seconds: int | None = None,
+    ) -> None: ...
+
 class StackOptions:
     normalization: str
     local_tile_size: int | None
@@ -257,6 +315,7 @@ class StackOptions:
     rejection: str
     maximum_drift_pixels: float
     maximum_drift_fraction: float
+    match_tolerances: MatchTolerances
     def __init__(
         self,
         *,
@@ -285,6 +344,7 @@ class StackOptions:
         maximum_normalization_gain: float = 4.0,
         minimum_integrated_fraction: float = 0.50,
         demosaic: str = "vng",
+        match_tolerances: MatchTolerances | None = None,
     ) -> None: ...
 
 class FrameDisposition:
@@ -403,6 +463,18 @@ class LiveStacker:
     def rejected_frames(self) -> int: ...
     @property
     def reference_integrated(self) -> bool: ...
+    def compatible_calibration(
+        self,
+        light: FrameSignature,
+        tolerances: MatchTolerances | None = None,
+    ) -> tuple[list[str], list[str]]: ...
+    def validate_calibration(
+        self,
+        light: FrameSignature,
+        tolerances: MatchTolerances | None = None,
+    ) -> None: ...
+    def match_tolerances(self) -> MatchTolerances: ...
+    def set_match_tolerances(self, tolerances: MatchTolerances | None = None) -> None: ...
     def push_fits(self, path: str | Path) -> FrameDisposition: ...
     def push_fits_pipelined(
         self,
@@ -869,6 +941,53 @@ def build_flat(
     sigma_high: float = 3.0,
     cancel: Callable[[], bool] | None = None,
 ) -> MasterResult: ...
+def sensor_matches(reference: FrameSignature, candidate: FrameSignature) -> bool: ...
+def optics_match(
+    reference: FrameSignature,
+    candidate: FrameSignature,
+    tolerances: MatchTolerances | None = None,
+) -> bool: ...
+def describe_sensor_mismatch(reference: FrameSignature, candidate: FrameSignature) -> str: ...
+def describe_optics_mismatch(
+    reference: FrameSignature,
+    candidate: FrameSignature,
+    tolerances: MatchTolerances | None = None,
+) -> str: ...
+def rotation_matches(
+    reference: float | None,
+    candidate: float | None,
+    tolerance_deg: float | None = None,
+) -> bool: ...
+def exposure_matches(
+    reference: FrameSignature,
+    candidate: FrameSignature,
+    tolerances: MatchTolerances | None = None,
+) -> bool: ...
+def temperature_matches(
+    reference: FrameSignature,
+    candidate: FrameSignature,
+    tolerances: MatchTolerances | None = None,
+) -> bool: ...
+def coherent_subset_indices(
+    candidates: Sequence[FrameSignature],
+    flats: bool = False,
+    minimum: int = 2,
+    tolerances: MatchTolerances | None = None,
+) -> list[int]: ...
+def coherent_subset(
+    candidates: Sequence[FrameSignature],
+    flats: bool = False,
+    minimum: int = 2,
+    tolerances: MatchTolerances | None = None,
+) -> list[FrameSignature]: ...
+def sort_by_proximity(
+    frames: Sequence[FrameSignature],
+    reference_unix: int | None = None,
+) -> list[FrameSignature]: ...
+def fit_flat_pedestal(
+    light: npt.NDArray[np.float32],
+    flat: npt.NDArray[np.float32],
+) -> float | None: ...
 def gaussian_blur(
     image: npt.NDArray[np.uint8] | npt.NDArray[np.float32],
     sigma: float,
