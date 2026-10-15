@@ -1018,7 +1018,7 @@ impl PyLiveStacker {
         flat: Option<PathBuf>,
         dark_exposure_seconds: Option<f64>,
         max_canvas_megasamples: usize,
-        cancel: Option<PyObject>,
+        cancel: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         if paths.is_empty() {
             return Err(PyValueError::new_err("at least one light is required"));
@@ -1044,7 +1044,7 @@ impl PyLiveStacker {
         // Planning reads every light with the GIL released, taking it back
         // before each one to ask whether to stop.
         let raised: Mutex<Option<PyErr>> = Mutex::new(None);
-        let planned = py.allow_threads(|| {
+        let planned = py.detach(|| {
             LiveStacker::open_fits_expanding(
                 &paths,
                 bias.as_deref(),
@@ -1054,7 +1054,7 @@ impl PyLiveStacker {
                 options,
                 maximum_samples,
                 |_, _, _, _| {
-                    let stop = Python::with_gil(|py| {
+                    let stop = Python::attach(|py| {
                         let asked = py.check_signals().and_then(|()| match &cancel {
                             Some(cancel) => cancel
                                 .call0(py)
