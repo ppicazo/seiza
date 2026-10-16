@@ -310,6 +310,10 @@ struct LabelRequest {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StopRequest {
+    /// Pull a wide view toward the image centre while retaining `focus`
+    /// as the target, rather than zooming in to keep it centred.
+    #[serde(default)]
+    pull_back_to_whole_image: bool,
     /// The target the stop visits, as a plan names it; not used.
     #[serde(default)]
     #[allow(dead_code)]
@@ -505,6 +509,7 @@ impl From<(f64, f64)> for AskedUsed {
 #[serde(rename_all = "camelCase")]
 struct FitResponse {
     zoom: AskedUsed,
+    motion_zoom: AskedUsed,
     pan: AskedUsed,
     lead: AskedUsed,
     truck: AskedUsed,
@@ -524,6 +529,7 @@ impl From<&FitSummary> for FitResponse {
     fn from(fit: &FitSummary) -> Self {
         Self {
             zoom: fit.zoom.into(),
+            motion_zoom: fit.motion_zoom.into(),
             pan: fit.pan.into(),
             lead: fit.lead.into(),
             truck: fit.truck.into(),
@@ -719,6 +725,7 @@ fn video_options(request: &VideoRequest) -> Result<VideoOptions, String> {
             .map(|stop| {
                 let base = seiza_parallax::TourStop::default();
                 seiza_parallax::TourStop {
+                    pull_back_to_whole_image: stop.pull_back_to_whole_image,
                     focus: stop.focus.map(|[x, y]| (x, y)),
                     dolly: stop.dolly.unwrap_or(base.dolly),
                     zoom: stop.zoom.unwrap_or(base.zoom),
@@ -915,7 +922,11 @@ fn split(
 /// `pan`, `zoom`, `zoomEnd`, `rotateDegrees` `[first, last]`, `easing`
 /// ("inOut", "linear"), `quality` ("standard", "high"), `growthLimit`,
 /// `fadeFrom`, `tour` (stops `[{focus, dolly, zoom, rotateDegrees, pan,
-/// travel, hold, spinDegrees, push, title, card, depthParsecs}]`, `card`
+/// travel, hold, spinDegrees, push, title, card, depthParsecs,
+/// pullBackToWholeImage}]`, `pullBackToWholeImage` (false by default)
+/// moves a wide view toward the image centre while retaining `focus`
+/// as the target; dolly 0 and zoom 1 frame the image centre, and tighter
+/// views approach the target. `card` is
 /// an image shown as the title would be, in its place, each centring
 /// its focus point on the plane at `depthParsecs`, or on the plane the
 /// image shows there if absent, gliding through held stops
@@ -1042,6 +1053,7 @@ fn solution(
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PlannedStopResponse {
+    pull_back_to_whole_image: bool,
     name: Option<String>,
     focus: Option<[f64; 2]>,
     dolly: f64,
@@ -1082,6 +1094,7 @@ impl PlannedTourResponse {
                 .stops
                 .iter()
                 .map(|planned| PlannedStopResponse {
+                    pull_back_to_whole_image: planned.stop.pull_back_to_whole_image,
                     name: planned.name.clone(),
                     focus: planned.stop.focus.map(|(x, y)| [x, y]),
                     dolly: planned.stop.dolly,
@@ -1339,7 +1352,8 @@ pub unsafe extern "C" fn seiza_parallax_reconfigure_json(
 /// how fitting the camera to the
 /// image changed the framing asked for: `zoom`, `pan`, `lead` and `truck`
 /// for the single move and `stops[].zoom`, `stops[].pan` and
-/// `stops[].dolly` for a tour, each `{asked, used}`, and `inside`, false
+/// `stops[].dolly` for a tour, each `{asked, used}`. `motionZoom` is the
+/// peak extra zoom fitted between fixed tour endpoints. `inside` is false
 /// when some frames still show past the image's edge. Returns a string
 /// released with `seiza_string_free`, or null with `error_out` set.
 ///
@@ -2056,7 +2070,7 @@ mod tests {
             r#"{"watermark": {"image": "logo.png", "corner": "topLeft", "size": 0.1,
                 "opacity": 0.5},
                "introCard": "start.png", "outroCard": "end.png", "cardSeconds": 4,
-               "tour": [{"hold": 1}, {"focus": [10, 20], "card": "stop.png"}]}"#,
+               "tour": [{"hold": 1}, {"focus": [10, 20], "card": "stop.png", "pullBackToWholeImage": true}]}"#,
         )
         .unwrap();
         assert_eq!(styled.watermark, None);
@@ -2070,6 +2084,8 @@ mod tests {
         assert_eq!(styled.outro_card, Some(PathBuf::from("end.png")));
         assert_eq!(styled.card_seconds, 4.0);
         assert_eq!(styled.tour[1].card, Some(PathBuf::from("stop.png")));
+        assert!(!styled.tour[0].pull_back_to_whole_image);
+        assert!(styled.tour[1].pull_back_to_whole_image);
         let both = video(r#"{"watermark": {"text": true, "image": "logo.png"}}"#).unwrap();
         assert!(both.watermark.is_some() && both.watermark_image.is_some());
         assert_eq!(both.watermark_corner, Corner::BottomRight);
@@ -3002,6 +3018,38 @@ mod tests {
         for video in [video, repainted, cleared, counted] {
             unsafe { seiza_parallax_free(video) };
         }
+    }
+
+    #[test]
+    fn transition_fit_is_reported_without_changing_endpoint_zooms() {
+        let directory = tempfile::tempdir().unwrap();
+        let request = self::request(
+            directory.path(),
+            r#"
+            "tourGlide": 0,
+            "tour": [{"hold": 1}, {"travel": 3, "hold": 1, "rotateDegrees": 180}]
+        "#,
+        );
+        let mut error = ptr::null_mut();
+        let video = unsafe {
+            seiza_parallax_prepare_json(
+                request.as_ptr(),
+                ptr::null(),
+                None,
+                ptr::null_mut(),
+                &mut error,
+            )
+        };
+        assert!(!video.is_null(), "{}", take_error(error));
+        let fit = summary(video)["fit"].clone();
+        assert_eq!(fit["inside"], true);
+        assert_eq!(fit["zoom"]["used"], 1.0);
+        assert_eq!(fit["motionZoom"]["asked"], 1.0);
+        assert!(fit["motionZoom"]["used"].as_f64().unwrap() > 1.0);
+        for stop in fit["stops"].as_array().unwrap() {
+            assert_eq!(stop["zoom"]["used"], 1.0);
+        }
+        unsafe { seiza_parallax_free(video) };
     }
 
     #[test]

@@ -3044,7 +3044,11 @@ bool seiza_live_stacker_light_rotation(const SeizaLiveStacker *stacker,
  `pan`, `zoom`, `zoomEnd`, `rotateDegrees` `[first, last]`, `easing`
  ("inOut", "linear"), `quality` ("standard", "high"), `growthLimit`,
  `fadeFrom`, `tour` (stops `[{focus, dolly, zoom, rotateDegrees, pan,
- travel, hold, spinDegrees, push, title, card, depthParsecs}]`, `card`
+ travel, hold, spinDegrees, push, title, card, depthParsecs,
+ pullBackToWholeImage}]`, `pullBackToWholeImage` (false by default)
+ moves a wide view toward the image centre while retaining `focus`
+ as the target; dolly 0 and zoom 1 frame the image centre, and tighter
+ views approach the target. `card` is
  an image shown as the title would be, in its place, each centring
  its focus point on the plane at `depthParsecs`, or on the plane the
  image shows there if absent, gliding through held stops
@@ -3226,7 +3230,8 @@ SeizaParallax *seiza_parallax_reconfigure_json(const SeizaParallax *video,
  how fitting the camera to the
  image changed the framing asked for: `zoom`, `pan`, `lead` and `truck`
  for the single move and `stops[].zoom`, `stops[].pan` and
- `stops[].dolly` for a tour, each `{asked, used}`, and `inside`, false
+ `stops[].dolly` for a tour, each `{asked, used}`. `motionZoom` is the
+ peak extra zoom fitted between fixed tour endpoints. `inside` is false
  when some frames still show past the image's edge. Returns a string
  released with `seiza_string_free`, or null with `error_out` set.
 

@@ -199,6 +199,9 @@ pub struct Shot {
     /// How fast a tour moves on through a stop it holds at, as a share of
     /// its pace between stops: it never quite stops. At 0 it comes to rest.
     pub glide: f64,
+    /// Peak extra lens magnification fitted between protected tour endpoints.
+    /// One leaves the path unchanged; the endpoint frames always keep their lens.
+    pub motion_zoom: f64,
     /// A tour that loops: its last stop shows its first stop's view, the
     /// frame after the last is the first, and the camera drifts through
     /// that join at one steady pace. Unlooped, the last stop's hold is a
@@ -238,6 +241,7 @@ impl Default for Shot {
             rotation: (0.0, 0.0),
             tour: Vec::new(),
             glide: 0.2,
+            motion_zoom: 1.0,
             looped: false,
             width: 1920,
             height: 1080,
@@ -581,10 +585,31 @@ impl Shot {
                 near: log_near.exp().clamp(0.01, 1.0),
                 pan,
                 swing: (0.0, 0.0),
-                magnification: log_zoom.exp(),
+                magnification: log_zoom.exp() * self.transition_zoom(t),
                 turn,
             },
         )
+    }
+
+    /// A smooth lens excursion between fixed endpoints. With no glide, the
+    /// endpoint holds stay fixed too; gliding holds can use the extra room.
+    fn transition_zoom(&self, t: f64) -> f64 {
+        if self.motion_zoom <= 1.0 || self.tour.len() < 2 {
+            return 1.0;
+        }
+        let times = tour_times(&self.tour);
+        let last = times.len() - 1;
+        let total = times[last].1;
+        let (start, end) = if self.glide <= 0.0 {
+            (times[0].1, times[last].0)
+        } else {
+            (0.0, total)
+        };
+        if end <= start {
+            return 1.0;
+        }
+        let u = ((t * total - start) / (end - start)).clamp(0.0, 1.0);
+        self.motion_zoom.powf(16.0 * u * u * (1.0 - u).powi(2))
     }
 
     /// The camera that frames `placement`, its lens keeping the angle that
@@ -752,24 +777,27 @@ impl Shot {
             let share = if zoomed(1.0).is_some() {
                 1.0
             } else if zoomed(0.0).is_none() {
-                // Even without turning some stop needs more than half
-                // again, which the pan is not to blame for: the whole tour
-                // zooms in together, keeping what pan fits at that zoom.
-                let zoom = least_zoom(&|zoom| Self {
-                    zoom,
-                    ..panned(0.0)
-                });
-                let share = largest(&|share| Self {
-                    zoom,
-                    ..panned(share)
-                });
-                return (
-                    Self {
-                        zoom,
-                        ..panned(share)
-                    },
-                    share,
-                );
+                // A stop needing more than half again must not magnify
+                // the opening or unrelated stops. Keep fitting locally,
+                // with the same generous search limit as the single move.
+                // If even that cannot fit, leave an explicit failed fit
+                // rather than changing the entire tour's lens.
+                let wide = |share| self.zoom_stops(scene, &depths, panned(share), 64.0, halted);
+                let share = if wide(1.0).is_some() {
+                    1.0
+                } else {
+                    let (mut low, mut high) = (0.0, 1.0);
+                    for _ in 0..20 {
+                        let middle = (low + high) / 2.0;
+                        if wide(middle).is_some() {
+                            low = middle;
+                        } else {
+                            high = middle;
+                        }
+                    }
+                    low
+                };
+                return (wide(share).unwrap_or_else(|| panned(0.0)), share);
             } else {
                 let (mut low, mut high) = (0.0, 1.0);
                 for _ in 0..20 {
@@ -782,20 +810,11 @@ impl Shot {
                 }
                 low
             };
-            // Past half again even without turning, the whole tour zooms in
-            // together.
             let fitted = match zoomed(share) {
                 Some(fitted) => self.with_less_fill(scene, &depths, fitted, &panned(share), halted),
-                None => {
-                    let zoom = least_zoom(&|zoom| Self {
-                        zoom,
-                        ..panned(share)
-                    });
-                    Self {
-                        zoom,
-                        ..panned(share)
-                    }
-                }
+                None => self
+                    .zoom_stops(scene, &depths, panned(share), 64.0, halted)
+                    .unwrap_or_else(|| panned(0.0)),
             };
             return (fitted, share);
         }
@@ -930,23 +949,66 @@ impl Shot {
         let asked: Vec<f64> = shot.tour.iter().map(|stop| stop.zoom).collect();
         let times = tour_times(&shot.tour);
         let total = times.last().map_or(0.0, |&(_, leave)| leave);
+        // Protect endpoints only if their own held motion fits. Ignore
+        // neighbour-dependent glide here: fitting the neighbour gives it room.
+        // An authored spin or push still belongs to the endpoint itself.
+        let held = Self {
+            glide: 0.0,
+            ..shot.clone()
+        };
+        let last = shot.tour.len() - 1;
+        let keep = |index: usize, endpoint: usize| {
+            !shot.looped
+                && held.inside(scene, &held.view(scene, endpoint), depths)
+                && (0..held.frames).into_par_iter().all(|frame| {
+                    let now = held.progress(frame) * total;
+                    now < times[index].0
+                        || now > times[index].1
+                        || held.inside(scene, &held.view(scene, frame), depths)
+                })
+        };
+        let keep_first = keep(0, 0);
+        let keep_last = keep(last, shot.frames.saturating_sub(1));
+        let protected = |index| (index == 0 && keep_first) || (index == last && keep_last);
+        let asked_motion_zoom = shot.motion_zoom;
         for _ in 0..400 {
             if halted() {
                 return None;
             }
             let mut bump = vec![false; shot.tour.len()];
+            let mut bump_motion = false;
             let outside: Vec<usize> = (0..shot.frames)
                 .into_par_iter()
                 .filter(|&frame| !shot.inside(scene, &shot.view(scene, frame), depths))
                 .collect();
             for frame in outside {
-                bump[stops_at(&times, shot.progress(frame) * total).0] = true;
+                let (nearer, other) = stops_at(&times, shot.progress(frame) * total);
+                let index = if nearer == 0 && keep_first {
+                    other.max(1)
+                } else if nearer == last && keep_last {
+                    other.min(last - 1)
+                } else {
+                    nearer
+                };
+                if protected(index) {
+                    // Two fixed endpoints have no neighbouring stop to zoom.
+                    // Fit the motion between them without changing either lens.
+                    bump_motion = true;
+                } else {
+                    bump[index] = true;
+                }
             }
             if shot.looped {
                 joined(&mut bump);
             }
-            if !bump.contains(&true) {
+            if !bump.contains(&true) && !bump_motion {
                 return Some(shot);
+            }
+            if bump_motion {
+                if shot.motion_zoom >= asked_motion_zoom * most {
+                    return None;
+                }
+                shot.motion_zoom = (shot.motion_zoom * 1.02).min(asked_motion_zoom * most);
             }
             for (index, stop) in shot.tour.iter_mut().enumerate() {
                 if bump[index] {
@@ -3980,6 +4042,125 @@ mod tour_tests {
         let into = state(1.0)[4] - state(1.0 - step)[4];
         let out = state(step)[4] - state(0.0)[4];
         assert!(into > 0.0 && (into - out).abs() < 1e-6, "{into} {out}");
+    }
+
+    #[test]
+    fn a_wide_off_centre_stop_does_not_magnify_the_whole_tour() {
+        let scene = scene();
+        for glide in [0.0, 0.2] {
+            let mut shot = tour();
+            shot.glide = glide;
+            shot.tour[1].focus = (520.0, 65.0);
+            shot.tour[1].dolly = 0.35;
+            shot.tour[1].pan = 0.0;
+            shot.tour[1].rotation = 11_f64.to_radians();
+            let (before, _) = shot.fitted(&scene);
+            assert!(before.stays_inside(&scene));
+            assert_eq!(before.zoom, shot.zoom);
+            assert_eq!(before.tour[0].zoom, shot.tour[0].zoom);
+            assert!(before.tour[1].zoom > shot.tour[1].zoom * 1.5);
+
+            // Pull back to the original camera distance, framing the
+            // whole image instead of keeping an edge target centred.
+            shot.tour[1].dolly = 0.0;
+            shot.tour[1].focus = shot.tour[0].focus;
+            let (after, _) = shot.fitted(&scene);
+            assert!(after.stays_inside(&scene));
+            assert_eq!(after.zoom, before.zoom);
+            assert_eq!(after.tour[0].zoom, before.tour[0].zoom);
+            assert!(after.tour[1].zoom < before.tour[1].zoom);
+            for (x, y) in [(100.0, 100.0), (299.5, 199.5), (500.0, 300.0)] {
+                let a = before.view(&scene, 0).project(x, y, 400.0).unwrap();
+                let b = after.view(&scene, 0).project(x, y, 400.0).unwrap();
+                assert!((a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9);
+                assert!((a.2 - b.2).abs() < 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn endpoint_spins_fit_their_own_holds() {
+        let scene = scene();
+        for endpoint in [0, 2] {
+            let mut shot = tour();
+            shot.tour = vec![
+                Stop {
+                    focus: (299.5, 199.5),
+                    hold: 2.0,
+                    ..Stop::default()
+                },
+                Stop {
+                    focus: (280.0, 190.0),
+                    dolly: 0.3,
+                    travel: 1.0,
+                    hold: 1.0,
+                    ..Stop::default()
+                },
+                Stop {
+                    focus: (299.5, 199.5),
+                    travel: 1.0,
+                    hold: 2.0,
+                    ..Stop::default()
+                },
+            ];
+            shot.tour[endpoint].spin = std::f64::consts::TAU;
+            for glide in [0.0, 0.2] {
+                shot.glide = glide;
+                let (fitted, _) = shot.fitted(&scene);
+                assert!(
+                    fitted.stays_inside(&scene),
+                    "endpoint {endpoint}, glide {glide}"
+                );
+                assert!(fitted.tour[endpoint].zoom > 1.0);
+                assert_eq!(fitted.zoom, shot.zoom);
+                assert_eq!(fitted.motion_zoom, 1.0);
+            }
+        }
+    }
+
+    #[test]
+    fn a_two_stop_turn_fits_without_changing_either_endpoint() {
+        let scene = scene();
+        for turn in [std::f64::consts::PI, std::f64::consts::TAU] {
+            for glide in [0.0, 0.2] {
+                let mut shot = tour();
+                shot.glide = glide;
+                shot.tour = vec![
+                    Stop {
+                        focus: (299.5, 199.5),
+                        hold: 1.0,
+                        ..Stop::default()
+                    },
+                    Stop {
+                        focus: (299.5, 199.5),
+                        rotation: turn,
+                        travel: 3.0,
+                        hold: 1.0,
+                        ..Stop::default()
+                    },
+                ];
+                let (fitted, _) = shot.fitted(&scene);
+                assert!(fitted.stays_inside(&scene), "turn {turn}, glide {glide}");
+                assert_eq!(fitted.zoom, shot.zoom);
+                assert!(fitted.motion_zoom > 1.0);
+                for (a, b) in fitted.tour.iter().zip(&shot.tour) {
+                    assert_eq!(a.zoom, b.zoom);
+                }
+                for frame in [0, shot.frames - 1] {
+                    for (x, y) in [(0.0, 0.0), (299.5, 199.5), (599.0, 399.0)] {
+                        let a = shot.view(&scene, frame).project(x, y, 400.0).unwrap();
+                        let b = fitted.view(&scene, frame).project(x, y, 400.0).unwrap();
+                        assert!((a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9);
+                        assert!((a.2 - b.2).abs() < 1e-9);
+                    }
+                }
+                if glide == 0.0 {
+                    assert_eq!(fitted.transition_zoom(0.1), 1.0);
+                    assert_eq!(fitted.transition_zoom(0.9), 1.0);
+                }
+                assert_eq!(shot.fitted(&scene).0, fitted);
+            }
+        }
     }
 
     #[test]

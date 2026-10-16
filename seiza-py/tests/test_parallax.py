@@ -191,6 +191,68 @@ def test_a_tour_sets_the_length_and_takes_strings_or_dicts(tmp_path):
         video(tmp_path, tour=["whole", {"dolli": 0.5}])
 
 
+def test_pulling_back_an_edge_target_keeps_the_opening_unchanged(tmp_path):
+    scene, _ = video(tmp_path)
+    opening = {"focus": None, "hold": 0.2}
+    target = {"focus": (280.0, 40.0), "dolly": 0.35, "rotate_deg": 11.0, "travel": 0.8, "hold": 0.3}
+    closing = {"focus": None, "travel": 0.8, "hold": 0.2}
+    before = scene.reconfigure(tour=[opening, target, closing], size=(160, 120), fps=10)
+    pulled = {**target, "dolly": 0.0, "pull_back_to_whole_image": True}
+    after = scene.reconfigure(tour=[opening, pulled, closing], size=(160, 120), fps=10)
+    np.testing.assert_array_equal(before.frame(0), after.frame(0))
+    assert not np.array_equal(before.frame(10), after.frame(10))
+    assert pulled["focus"] == target["focus"]
+
+
+@pytest.mark.parametrize("endpoint", [0, 2])
+def test_endpoint_spins_fit_the_entire_hold(tmp_path, endpoint):
+    scene, _ = video(tmp_path)
+    stops = [
+        {"hold": 2.0},
+        {"focus": (150.0, 110.0), "dolly": 0.3, "travel": 1.0, "hold": 1.0},
+        {"travel": 1.0, "hold": 2.0},
+    ]
+    stops[endpoint]["spin_deg"] = 360.0
+    made = scene.reconfigure(tour=stops, size=(160, 120), fps=10, tour_glide=0)
+    fit = made.summary["fit"]
+    assert fit["inside"]
+    assert fit["stops"][endpoint]["zoom"][1] > 1.0
+    assert fit["motion_zoom"] == (1.0, 1.0)
+    assert all(not np.any(np.all(frame == 0, axis=-1)) for frame in made)
+
+
+@pytest.mark.parametrize("turn", [180.0, 360.0])
+@pytest.mark.parametrize("glide", [0.0, 0.2])
+def test_two_stop_turn_keeps_the_opening_and_closing_views(tmp_path, turn, glide):
+    scene, _ = video(tmp_path)
+    stops = [{"hold": 1.0}, {"travel": 3.0, "hold": 1.0, "rotate_deg": turn}]
+    made = scene.reconfigure(tour=stops, size=(160, 120), fps=10, tour_glide=glide)
+    fit = made.summary["fit"]
+    assert fit["inside"] and fit["zoom"] == (1.0, 1.0)
+    assert all(stop["zoom"] == (1.0, 1.0) for stop in fit["stops"])
+    assert fit["motion_zoom"][0] == 1.0 and fit["motion_zoom"][1] > 1.0
+    for index, stop in [(0, stops[0]), (made.frame_count - 1, stops[-1])]:
+        still = scene.reconfigure(tour=[stop, {**stop, "travel": 1.0}], size=(160, 120), fps=10, tour_glide=0)
+        np.testing.assert_array_equal(made.frame(index), still.frame(0))
+    assert all(not np.any(np.all(frame == 0, axis=-1)) for frame in made)
+
+
+def test_pull_back_overall_zoom_matches_equivalent_stop_zoom(tmp_path):
+    starless, stars, wcs = field()
+    starless[116:123, 277:284] = [1.0, 0.0, 0.0]
+    scene = seiza.ParallaxVideo(
+        starless, stars, wcs, distance_pc=400.0, online=False,
+        objects=str(tmp_path / "no-objects.bin"), size=(160, 120), seconds=1, fps=10,
+    )
+    stops = [{"hold": 0.2}, {"focus": (280.0, 119.5), "pull_back_to_whole_image": True, "travel": 1.0, "hold": 0.2}]
+    overall = scene.reconfigure(tour=stops, zoom=4.0, size=(160, 120), fps=10, tour_glide=0)
+    local = scene.reconfigure(tour=[{**stop, "zoom": 4.0} for stop in stops], zoom=1.0, size=(160, 120), fps=10, tour_glide=0)
+    for index in range(overall.frame_count):
+        np.testing.assert_array_equal(overall.frame(index), local.frame(index))
+    last = overall.frame(overall.frame_count - 1)
+    assert np.any((last[..., 0] > 200) & (last[..., 1] < 50) & (last[..., 2] < 50))
+
+
 def test_a_tour_plan_comes_back_editable_and_goes_back_in(tmp_path):
     # With no object catalog there is nothing to tour.
     _, _, wcs = field()
