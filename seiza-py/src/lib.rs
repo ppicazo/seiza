@@ -387,6 +387,16 @@ struct PySolution {
     /// RMS of match residuals, arcseconds.
     #[pyo3(get)]
     rms_arcsec: f64,
+    /// The chance that a wrong field would match this well, across every
+    /// candidate the search tried. Near 0 for a sure solution.
+    #[pyo3(get)]
+    false_match_probability: f64,
+    /// Where :func:`solve_with_prior` found the solution:
+    /// ``"header-checked"``, ``"header-hint"``, ``"blind"``, or
+    /// ``"header-unchecked"`` when nothing solved and the image's own WCS
+    /// stands unchecked. ``None`` from the other solves.
+    #[pyo3(get)]
+    source: Option<&'static str>,
     width: u32,
     height: u32,
 }
@@ -396,10 +406,8 @@ impl PySolution {
     /// Sky coordinates of the image center, `(ra_deg, dec_deg)`.
     #[getter]
     fn center(&self) -> (f64, f64) {
-        self.wcs.wcs.pixel_to_world(
-            (self.width as f64 - 1.0) / 2.0,
-            (self.height as f64 - 1.0) / 2.0,
-        )
+        let middle = seiza::image_center(self.width, self.height);
+        self.wcs.wcs.pixel_to_world(middle.0, middle.1)
     }
 
     #[getter]
@@ -467,8 +475,97 @@ fn solution_to_py(solution: seiza::solve::Solution, dimensions: (u32, u32)) -> P
         wcs: PyWcs { wcs: solution.wcs },
         matched_stars: solution.matched_stars,
         rms_arcsec: solution.rms_arcsec,
+        false_match_probability: solution.false_match_probability,
+        source: None,
         width: dimensions.0,
         height: dimensions.1,
+    }
+}
+
+/// How often a solve asks Python whether to stop. Every check would take
+/// the GIL, and a blind solve checks from every core at once.
+const CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The limits a Python solve runs under, and any exception its `cancel`
+/// predicate (or Ctrl-C) raised, kept to re-raise once the solve returns.
+struct PySolveLimits {
+    limits: seiza::SolveLimits,
+    raised: std::sync::Arc<std::sync::Mutex<Option<PyErr>>>,
+}
+
+impl PySolveLimits {
+    /// `time_limit` in seconds; `cancel` a callable returning true to stop.
+    /// Without `cancel` the solve still stops on Ctrl-C.
+    fn new(time_limit: Option<f64>, cancel: Option<Py<PyAny>>) -> PyResult<Self> {
+        let limits = match time_limit {
+            None => seiza::SolveLimits::default(),
+            Some(seconds) if seconds.is_finite() && seconds > 0.0 => {
+                seiza::SolveLimits::within(std::time::Duration::from_secs_f64(seconds))
+            }
+            Some(_) => {
+                return Err(PyValueError::new_err(
+                    "time_limit must be a positive number of seconds",
+                ));
+            }
+        };
+        let raised = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let signal = {
+            let raised = std::sync::Arc::clone(&raised);
+            // The last time Python was asked, and whether it said stop.
+            let asked: std::sync::Mutex<(Option<std::time::Instant>, bool)> =
+                std::sync::Mutex::new((None, false));
+            seiza::CancelSignal::new(move || {
+                let Ok(mut asked) = asked.lock() else {
+                    return true;
+                };
+                if asked.1 {
+                    return true;
+                }
+                if asked.0.is_some_and(|last| last.elapsed() < CANCEL_POLL) {
+                    return false;
+                }
+                asked.0 = Some(std::time::Instant::now());
+                asked.1 = Python::attach(|py| {
+                    let stop = py.check_signals().and_then(|()| match &cancel {
+                        Some(cancel) => cancel
+                            .call0(py)
+                            .and_then(|value| value.bind(py).is_truthy()),
+                        None => Ok(false),
+                    });
+                    stop.unwrap_or_else(|error| {
+                        if let Ok(mut slot) = raised.lock() {
+                            slot.get_or_insert(error);
+                        }
+                        true
+                    })
+                });
+                asked.1
+            })
+        };
+        Ok(Self {
+            limits: limits.with_cancel(signal),
+            raised,
+        })
+    }
+
+    /// The solve's result for Python: an exception the predicate raised,
+    /// `TimeoutError` at the time limit, or `SolveError`.
+    fn finish(
+        self,
+        result: Result<seiza::solve::Solution, seiza::Error>,
+        dimensions: (u32, u32),
+    ) -> PyResult<PySolution> {
+        if let Some(error) = self.raised.lock().ok().and_then(|mut slot| slot.take()) {
+            return Err(error);
+        }
+        result
+            .map(|solution| solution_to_py(solution, dimensions))
+            .map_err(|error| match error {
+                seiza::Error::TimedOut => {
+                    pyo3::exceptions::PyTimeoutError::new_err(error.to_string())
+                }
+                other => SolveError::new_err(other.to_string()),
+            })
     }
 }
 
@@ -572,7 +669,7 @@ fn detect(
 /// Plate solve with an approximate position and pixel-scale hint.
 #[pyfunction]
 #[pyo3(signature = (stars, catalog, width, height, *, ra, dec, scale_arcsec_px,
-    radius_deg=2.0, scale_tolerance=0.2, sip_order=0))]
+    radius_deg=2.0, scale_tolerance=0.2, sip_order=0, time_limit=None, cancel=None))]
 #[allow(clippy::too_many_arguments)]
 fn solve(
     py: Python<'_>,
@@ -586,6 +683,8 @@ fn solve(
     radius_deg: f64,
     scale_tolerance: f64,
     sip_order: u8,
+    time_limit: Option<f64>,
+    cancel: Option<Py<PyAny>>,
 ) -> PyResult<PySolution> {
     if sip_order > 5 {
         return Err(PyValueError::new_err("sip_order must be between 0 and 5"));
@@ -599,17 +698,24 @@ fn solve(
         scale_tolerance,
         sip_order,
     };
-    let solution = py
-        .detach(|| seiza::solve::solve(&stars, catalog.backend.as_trait(), &hint, (width, height)));
-    solution
-        .map(|solution| solution_to_py(solution, (width, height)))
-        .map_err(|error| SolveError::new_err(error.to_string()))
+    let limits = PySolveLimits::new(time_limit, cancel)?;
+    let solution = py.detach(|| {
+        seiza::solve::solve_with_limits(
+            &stars,
+            catalog.backend.as_trait(),
+            &hint,
+            (width, height),
+            &limits.limits,
+        )
+    });
+    limits.finish(solution, (width, height))
 }
 
 /// Plate solve with no position hint using a whole-sky pattern index.
 #[pyfunction]
 #[pyo3(signature = (stars, catalog, index, width, height, *,
-    min_scale_arcsec_px=0.1, max_scale_arcsec_px=20.0, sip_order=0))]
+    min_scale_arcsec_px=0.1, max_scale_arcsec_px=20.0, sip_order=0, time_limit=None,
+    cancel=None))]
 #[allow(clippy::too_many_arguments)]
 fn solve_blind(
     py: Python<'_>,
@@ -621,6 +727,8 @@ fn solve_blind(
     min_scale_arcsec_px: f64,
     max_scale_arcsec_px: f64,
     sip_order: u8,
+    time_limit: Option<f64>,
+    cancel: Option<Py<PyAny>>,
 ) -> PyResult<PySolution> {
     if sip_order > 5 {
         return Err(PyValueError::new_err("sip_order must be between 0 and 5"));
@@ -634,18 +742,18 @@ fn solve_blind(
         sip_order,
         ..seiza::blind::BlindParams::default()
     };
+    let limits = PySolveLimits::new(time_limit, cancel)?;
     let solution = py.detach(|| {
-        seiza::blind::solve_blind(
+        seiza::blind::solve_blind_with_limits(
             &stars,
             catalog.backend.as_trait(),
             &index.index,
             &params,
             (width, height),
+            &limits.limits,
         )
     });
-    solution
-        .map(|solution| solution_to_py(solution, (width, height)))
-        .map_err(|error| SolveError::new_err(error.to_string()))
+    limits.finish(solution, (width, height))
 }
 
 fn dataset_by_file_name(name: &str) -> PyResult<seiza::downloads::Dataset> {
@@ -785,6 +893,99 @@ fn read_photo_metadata(
     Ok(json.call_method1("loads", (value.to_string(),))?.unbind())
 }
 
+/// What a FITS or XISF file says about where it points, read without
+/// decoding its pixels: ``{"wcs": Wcs or None, "center": (ra, dec) or None,
+/// "scale_arcsec_px": float or None}``, from its WCS cards or PixInsight
+/// solution, its RA/DEC or OBJCTRA/OBJCTDEC, and its PIXSCALE or pixel size
+/// over focal length. Pass it to :func:`solve_with_prior`.
+#[pyfunction]
+fn read_solve_prior(py: Python<'_>, path: PathBuf) -> PyResult<Py<PyDict>> {
+    let prior = seiza_image_io::read_solve_prior(&path)
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    let dict = PyDict::new(py);
+    dict.set_item("wcs", prior.wcs.map(|wcs| PyWcs { wcs }))?;
+    dict.set_item("center", prior.center)?;
+    dict.set_item("scale_arcsec_px", prior.scale_arcsec_px)?;
+    Ok(dict.unbind())
+}
+
+/// Solve with what the image says about itself: check its own WCS, else
+/// search around its pointing and scale, else (with an ``index``) solve
+/// blind, trying near its scale first; and when nothing solves, return its
+/// own WCS unchecked, with ``source == "header-unchecked"``. ``prior`` is a
+/// dict like :func:`read_solve_prior` returns; any key may be missing or
+/// ``None``. The other arguments are as for :func:`solve_blind`.
+#[pyfunction]
+#[pyo3(signature = (stars, catalog, width, height, prior, *, index=None,
+    min_scale_arcsec_px=0.1, max_scale_arcsec_px=20.0, sip_order=0, time_limit=None,
+    cancel=None))]
+#[allow(clippy::too_many_arguments)]
+fn solve_with_prior(
+    py: Python<'_>,
+    stars: &Bound<'_, PyAny>,
+    catalog: &Bound<'_, PyStarCatalog>,
+    width: u32,
+    height: u32,
+    prior: &Bound<'_, PyDict>,
+    index: Option<&Bound<'_, PyBlindIndex>>,
+    min_scale_arcsec_px: f64,
+    max_scale_arcsec_px: f64,
+    sip_order: u8,
+    time_limit: Option<f64>,
+    cancel: Option<Py<PyAny>>,
+) -> PyResult<PySolution> {
+    if sip_order > 5 {
+        return Err(PyValueError::new_err("sip_order must be between 0 and 5"));
+    }
+    let stars = extract_stars(stars)?;
+    let item = |key: &str| -> PyResult<Option<Bound<'_, PyAny>>> {
+        Ok(prior.get_item(key)?.filter(|value| !value.is_none()))
+    };
+    let prior = seiza::prior::SolvePrior {
+        wcs: match item("wcs")? {
+            Some(value) => Some(
+                value
+                    .cast::<PyWcs>()
+                    .map_err(|_| PyValueError::new_err("prior[\"wcs\"] must be a seiza.Wcs"))?
+                    .get()
+                    .wcs
+                    .clone(),
+            ),
+            None => None,
+        },
+        center: item("center")?
+            .map(|center| center.extract::<(f64, f64)>())
+            .transpose()?,
+        scale_arcsec_px: item("scale_arcsec_px")?
+            .map(|scale| scale.extract::<f64>())
+            .transpose()?,
+    };
+    let catalog = catalog.get();
+    let index = index.map(|index| index.get());
+    let params = seiza::blind::BlindParams {
+        min_scale_arcsec_px,
+        max_scale_arcsec_px,
+        sip_order,
+        ..seiza::blind::BlindParams::default()
+    };
+    let limits = PySolveLimits::new(time_limit, cancel)?;
+    let found = py.detach(|| {
+        seiza::prior::solve_with_prior(
+            &stars,
+            catalog.backend.as_trait(),
+            index.map(|index| &index.index),
+            &prior,
+            &params,
+            (width, height),
+            &limits.limits,
+        )
+    });
+    let source = found.as_ref().ok().map(|found| found.source.as_str());
+    let mut solution = limits.finish(found.map(|found| found.solution), (width, height))?;
+    solution.source = source;
+    Ok(solution)
+}
+
 #[pymodule]
 #[pyo3(name = "seiza")]
 fn seiza_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -803,6 +1004,8 @@ fn seiza_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(solve_blind, m)?)?;
     m.add_function(wrap_pyfunction!(fetch_catalogs, m)?)?;
     m.add_function(wrap_pyfunction!(read_photo_metadata, m)?)?;
+    m.add_function(wrap_pyfunction!(read_solve_prior, m)?)?;
+    m.add_function(wrap_pyfunction!(solve_with_prior, m)?)?;
     color::register(m)?;
     color_calibration::register(m)?;
     deconvolution::register(m)?;

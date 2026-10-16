@@ -160,6 +160,10 @@ class Solution:
     @property
     def rms_arcsec(self) -> float: ...
     @property
+    def false_match_probability(self) -> float: ...
+    @property
+    def source(self) -> str | None: ...
+    @property
     def center(self) -> tuple[float, float]: ...
     @property
     def ra(self) -> float: ...
@@ -663,6 +667,8 @@ def plan_parallax_tour(
     targets: int | None = None,
     hold: float = 1.5,
     motion: float = 1.0,
+    crop: tuple[int, int, int, int] | None = None,
+    framing: str = "fill",
 ) -> dict[str, Any]: ...
 
 ParallaxImage = Union[str, Path, npt.NDArray[np.float32], npt.NDArray[np.uint8]]
@@ -702,7 +708,9 @@ class ParallaxVideo:
         ] = (),
         auto_planes: bool = False,
         distance_overrides: Mapping[str, float] | Sequence[tuple[str, float]] = (),
+        crop: tuple[int, int, int, int] | None = None,
         start: str = "focus",
+        framing: str = "fill",
         dolly: float = 0.4,
         truck: float = 0.0,
         truck_angle_deg: float = 0.0,
@@ -754,6 +762,7 @@ class ParallaxVideo:
         auto_tour: bool | int | Mapping[str, Any] | None = None,
         *,
         size: str | tuple[int, int] | None = None,
+        framing: str | None = None,
     ) -> dict[str, Any]: ...
     def with_dust_map(
         self,
@@ -797,6 +806,8 @@ def solve(
     radius_deg: float = 2.0,
     scale_tolerance: float = 0.2,
     sip_order: int = 0,
+    time_limit: float | None = None,
+    cancel: Callable[[], bool] | None = None,
 ) -> Solution: ...
 def solve_blind(
     stars: Sequence[StarInput],
@@ -808,6 +819,23 @@ def solve_blind(
     min_scale_arcsec_px: float = 0.1,
     max_scale_arcsec_px: float = 20.0,
     sip_order: int = 0,
+    time_limit: float | None = None,
+    cancel: Callable[[], bool] | None = None,
+) -> Solution: ...
+def read_solve_prior(path: str | Path) -> dict[str, Any]: ...
+def solve_with_prior(
+    stars: Sequence[StarInput],
+    catalog: StarCatalog,
+    width: int,
+    height: int,
+    prior: Mapping[str, Any],
+    *,
+    index: BlindIndex | None = None,
+    min_scale_arcsec_px: float = 0.1,
+    max_scale_arcsec_px: float = 20.0,
+    sip_order: int = 0,
+    time_limit: float | None = None,
+    cancel: Callable[[], bool] | None = None,
 ) -> Solution: ...
 def fetch_catalogs(
     datasets: str | Sequence[str] | None = None,

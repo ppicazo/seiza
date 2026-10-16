@@ -18,8 +18,8 @@ use image::{Rgb32FImage, RgbImage};
 use seiza::wcs::{Sip, Wcs};
 use seiza_parallax::{
     Corner, CustomLabel, DepthPlane, DistanceOverride, Dust, DustMap, Easing, Event, FfmpegSink,
-    FrameFn, FrameSink, Parallax, ParallaxOptions, PlaneMask, PngSequence, Quality, SmallStars,
-    Start,
+    FrameFn, FrameSink, Framing, Parallax, ParallaxOptions, PlaneMask, PngSequence, Quality,
+    SmallStars, Start,
 };
 use seiza_parallax::{FitSummary, SceneOptions, VideoOptions};
 use serde::{Deserialize, Serialize};
@@ -69,7 +69,7 @@ pub type SeizaParallaxFrameCallback =
 /// solution, the catalogs and how the stars are placed. Changing any of
 /// them needs a new [`seiza_parallax_prepare_json`];
 /// [`seiza_parallax_reconfigure_json`] refuses them.
-const SCENE_FIELDS: [&str; 27] = [
+const SCENE_FIELDS: [&str; 28] = [
     "image",
     "starless",
     "stars",
@@ -97,6 +97,7 @@ const SCENE_FIELDS: [&str; 27] = [
     "planes",
     "autoPlanes",
     "distanceOverrides",
+    "crop",
 ];
 
 /// Everything a parallax video takes, as one JSON object: the scene's
@@ -154,6 +155,10 @@ struct SceneRequest {
     auto_planes: Option<bool>,
     /// Distances for catalogued objects in place of the catalogue's.
     distance_overrides: Option<Vec<DistanceOverrideRequest>>,
+    /// Film part of the image: `[x, y, width, height]` in image pixels.
+    /// Every other image point, such as a focus or a stop's, counts in
+    /// the cropped image.
+    crop: Option<[usize; 4]>,
 }
 
 /// A distance for a catalogued object, by name, in place of the
@@ -185,6 +190,9 @@ struct VideoRequest {
     focus: Option<[f64; 2]>,
     /// "focus" or "whole".
     start: Option<String>,
+    /// "fill" or "fit": how the widest view meets an image of another
+    /// shape than the frame, filling the frame or showing all the image.
+    framing: Option<String>,
     dolly: Option<f64>,
     truck: Option<f64>,
     truck_angle_degrees: Option<f64>,
@@ -215,7 +223,7 @@ struct VideoRequest {
     /// End the tour where it began, so the video loops.
     tour_loop: Option<bool>,
     /// "720p", "1080p", "1440p" or "4k", each with "-portrait" for the tall
-    /// form, or "WIDTHxHEIGHT".
+    /// form or "-image" for the image's shape, or "WIDTHxHEIGHT".
     size: Option<String>,
     seconds: Option<f64>,
     fps: Option<u32>,
@@ -342,8 +350,19 @@ impl AutoTourRequest {
             targets: self.targets,
             hold: self.hold.unwrap_or(defaults.hold),
             motion: self.motion.unwrap_or(defaults.motion),
+            ..defaults
         }
     }
+}
+
+/// "fill" or "fit", by the name a request gives.
+fn framing(name: &Option<String>, default: Framing) -> Result<Framing, String> {
+    choice(
+        name,
+        "framing",
+        &[("fill", Framing::Fill), ("fit", Framing::Fit)],
+        default,
+    )
 }
 
 /// A watermark's text: true for "Rendered with seiza.fyi", or the text.
@@ -382,6 +401,10 @@ struct WcsRequest {
     cd: [[f64; 2]; 2],
     #[serde(default)]
     sip: Option<SipRequest>,
+    /// What `crpix` counts from: 0, as the C ABI returns a WCS (and the
+    /// default), or 1, as a FITS header does.
+    #[serde(default, rename = "pixelOrigin")]
+    pixel_origin: Option<u8>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -442,7 +465,11 @@ struct SummaryResponse {
     labelled_objects: usize,
     /// How the fit changed the framing asked for.
     fit: FitResponse,
+    /// The plate solution of the image as given, before any crop, to pass
+    /// back as `wcs` with the same images.
     wcs: WcsResponse,
+    /// The part of the image filmed, `[x, y, width, height]`, or null.
+    crop: Option<[usize; 4]>,
 }
 
 /// A depth plane lifted: its name, distance, how that was found, the
@@ -636,6 +663,9 @@ fn scene_options(request: &SceneRequest) -> Result<SceneOptions, String> {
                 distance_pc: given.distance_parsecs,
             })
             .collect(),
+        crop: request
+            .crop
+            .map(|[x, y, width, height]| (x, y, width, height)),
     })
 }
 
@@ -648,7 +678,7 @@ fn video_options(request: &VideoRequest) -> Result<VideoOptions, String> {
         Some(WatermarkRequest::Plain(text)) => (Some(text), &unstyled),
         Some(WatermarkRequest::Styled(style)) => (style.text.as_ref(), style),
     };
-    Ok(VideoOptions {
+    let mut options = VideoOptions {
         focus: request.focus.map(|[x, y]| (x, y)),
         start: choice(
             &request.start,
@@ -656,6 +686,7 @@ fn video_options(request: &VideoRequest) -> Result<VideoOptions, String> {
             &[("focus", Start::Focus), ("whole", Start::Whole)],
             defaults.start,
         )?,
+        framing: framing(&request.framing, defaults.framing)?,
         dolly: request.dolly.unwrap_or(defaults.dolly),
         truck: request.truck.unwrap_or(defaults.truck),
         truck_angle_deg: request
@@ -707,10 +738,6 @@ fn video_options(request: &VideoRequest) -> Result<VideoOptions, String> {
         tour_glide: request.tour_glide.unwrap_or(defaults.tour_glide),
         tour_titles: request.tour_titles.unwrap_or(defaults.tour_titles),
         tour_loop: request.tour_loop.unwrap_or(defaults.tour_loop),
-        size: match &request.size {
-            Some(size) => seiza_parallax::parse_frame_size(size)?,
-            None => defaults.size,
-        },
         seconds: request.seconds.unwrap_or(defaults.seconds),
         fps: request.fps.unwrap_or(defaults.fps),
         overlay: request.overlay.unwrap_or(defaults.overlay),
@@ -752,14 +779,23 @@ fn video_options(request: &VideoRequest) -> Result<VideoOptions, String> {
         intro_card: request.intro_card.clone(),
         outro_card: request.outro_card.clone(),
         card_seconds: request.card_seconds.unwrap_or(defaults.card_seconds),
-    })
+        ..defaults
+    };
+    if let Some(size) = &request.size {
+        options.set_frame_size(seiza_parallax::parse_frame_size_or_shape(size)?);
+    }
+    Ok(options)
 }
 
 impl WcsRequest {
-    fn wcs(&self) -> Wcs {
-        Wcs {
+    fn wcs(&self) -> Result<Wcs, String> {
+        let origin = match self.pixel_origin.unwrap_or(0) {
+            origin @ (0 | 1) => f64::from(origin),
+            other => return Err(format!("wcs pixelOrigin must be 0 or 1, not {other}")),
+        };
+        Ok(Wcs {
             crval: (self.crval[0], self.crval[1]),
-            crpix: (self.crpix[0], self.crpix[1]),
+            crpix: (self.crpix[0] - origin, self.crpix[1] - origin),
             cd: self.cd,
             sip: self.sip.as_ref().map(|sip| Sip {
                 order: sip.order,
@@ -768,7 +804,7 @@ impl WcsRequest {
                 ap: sip.ap.clone(),
                 bp: sip.bp.clone(),
             }),
-        }
+        })
     }
 }
 
@@ -869,8 +905,13 @@ fn split(
 /// image stays with the nebula unless given a distance, and so do the
 /// nebulae inside a nebula that stays), `distanceOverrides` (`[{object, distanceParsecs}]`:
 /// distances for catalogued objects, by name, in place of the catalogue's,
-/// for the nebula's distance and the automatic planes), `start` ("focus",
-/// "whole"), `dolly`, `truck`, `truckAngleDegrees`,
+/// for the nebula's distance and the automatic planes), `crop` (`[x, y,
+/// width, height]` in image pixels: film that part of the image, every
+/// other image point counting in it), `start` ("focus", "whole"),
+/// `framing` ("fill", the default, fills the frame and cuts the ends of
+/// the image's longer side when the image and frame differ in shape;
+/// "fit" shows all the image at the widest, with black beside it),
+/// `dolly`, `truck`, `truckAngleDegrees`,
 /// `pan`, `zoom`, `zoomEnd`, `rotateDegrees` `[first, last]`, `easing`
 /// ("inOut", "linear"), `quality` ("standard", "high"), `growthLimit`,
 /// `fadeFrom`, `tour` (stops `[{focus, dolly, zoom, rotateDegrees, pan,
@@ -887,7 +928,9 @@ fn split(
 /// and out), `tourLoop` (end where the tour began, adding a last stop at
 /// the first's view unless it ends there, so the last frame leads into the
 /// first), `size` ("720p", "1080p", "1440p", "4k", each with
-/// "-portrait", or "WIDTHxHEIGHT"), `seconds`, `fps`, `overlay`,
+/// "-portrait", or with "-image" for the image's own shape with that
+/// longer side, so "4k-image" films a 4:3 image at 3840x2880, all of it;
+/// or "WIDTHxHEIGHT"), `seconds`, `fps`, `overlay`,
 /// `overlayDensity`, `labels` (`[{x, y, radius, text}]`), `labelColor`
 /// ("#RRGGBB"), `watermark` (true, the text, or `{text, image, corner,
 /// size, opacity}`: `text` true or the text, `image` a picture such as a
@@ -960,7 +1003,7 @@ fn solution(
     context: usize,
 ) -> Result<Wcs, String> {
     if let Some(wcs) = &request.scene.wcs {
-        return Ok(wcs.wcs());
+        return wcs.wcs();
     }
     let minimum = request.scene.minimum_scale_arcsec_per_pixel.unwrap_or(0.1);
     let maximum = request
@@ -973,19 +1016,25 @@ fn solution(
         minimum,
         maximum,
         2,
+        &seiza::SolveLimits::default(),
     )?;
     let wcs = solved.solution.wcs;
+    let message = if solved.source == crate::SolveSource::HeaderUnchecked {
+        format!(
+            "using the image's own astrometric solution ({:.3}\"/px); it could not be checked against the catalog",
+            wcs.scale_arcsec_per_px()
+        )
+    } else {
+        format!(
+            "solved: {:.3}\"/px, {} stars matched",
+            wcs.scale_arcsec_per_px(),
+            solved.solution.matched_stars
+        )
+    };
     send(
         events,
         context,
-        serde_json::json!({
-            "kind": "note",
-            "message": format!(
-                "solved: {:.3}\"/px, {} stars matched",
-                wcs.scale_arcsec_per_px(),
-                solved.solution.matched_stars
-            ),
-        }),
+        serde_json::json!({ "kind": "note", "message": message }),
     );
     Ok(wcs)
 }
@@ -1054,8 +1103,9 @@ impl PlannedTourResponse {
 /// Plan a tour of the catalogued objects in an image, for the caller to
 /// edit before making the video. The request is
 /// [`seiza_parallax_prepare_json`]'s: the image (`image`, else `stars` or
-/// `starless`) gives the size, and is blind-solved without `wcs`; `size`
-/// is the video's frame; `objects` or `catalogDirectory` the object
+/// `starless`) gives the size, and is blind-solved without `wcs`; `crop`
+/// the part filmed; `size` and `framing` the video's frame; `objects` or
+/// `catalogDirectory` the object
 /// catalog; and `autoTour` (`{targets, hold, motion}`, each optional) how
 /// to plan. Returns JSON, released with `seiza_string_free`:
 /// `{"focus": [x, y], "focusName", "seconds", "tour": [{name, focus,
@@ -1093,17 +1143,29 @@ pub unsafe extern "C" fn seiza_parallax_plan_tour_json(
             .ok_or("give the image to plan a tour of")?;
         let dimensions = open_display(&path)?.dimensions();
         let wcs = solution(&request, &path, events, context)?;
-        let auto = request
+        let (wcs, (width, height)) = match options.scene.crop {
+            Some(crop) => seiza_parallax::crop_wcs(&wcs, dimensions, crop)
+                .map_err(|error| error.to_string())?,
+            None => (wcs, dimensions),
+        };
+        let auto = seiza_parallax::AutoTour {
+            framing: options.video.framing,
+            ..request
+                .video
+                .auto_tour
+                .as_ref()
+                .map(AutoTourRequest::auto_tour)
+                .unwrap_or_default()
+        };
+        let frame = options
             .video
-            .auto_tour
-            .as_ref()
-            .map(AutoTourRequest::auto_tour)
-            .unwrap_or_default();
+            .sized_for((width as usize, height as usize))
+            .size;
         let plan = seiza_parallax::plan_tour(
             &wcs,
-            dimensions,
+            (width, height),
             options.scene.objects.as_deref(),
-            options.video.size,
+            frame,
             &auto,
         )
         .map_err(|error| error.to_string())?;
@@ -1117,9 +1179,11 @@ pub unsafe extern "C" fn seiza_parallax_plan_tour_json(
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ScenePlanRequest {
-    /// "720p", "1080p", "1440p" or "4k", each with "-portrait", or
-    /// "WIDTHxHEIGHT"; the video's own frame if absent.
+    /// "720p", "1080p", "1440p" or "4k", each with "-portrait" or
+    /// "-image", or "WIDTHxHEIGHT"; the video's own frame if absent.
     size: Option<String>,
+    /// "fill" or "fit"; the video's own if absent.
+    framing: Option<String>,
     auto_tour: Option<AutoTourRequest>,
 }
 
@@ -1130,10 +1194,11 @@ struct ScenePlanRequest {
 /// same scene would be. [`seiza_parallax_plan_tour_json`] plans from the
 /// catalogue alone, without the scene's planes.
 ///
-/// `settings_json` is `{"size", "autoTour": {targets, hold, motion}}`, each
-/// optional: `size` the frame the tour is for ("720p", "1080p", "1440p",
-/// "4k", each with "-portrait", or "WIDTHxHEIGHT"; the video's own if
-/// absent), and `autoTour` how to plan. Returns
+/// `settings_json` is `{"size", "framing", "autoTour": {targets, hold,
+/// motion}}`, each optional: `size` the frame the tour is for ("720p",
+/// "1080p", "1440p", "4k", each with "-portrait" or "-image", or
+/// "WIDTHxHEIGHT"; the video's own if absent), `framing` "fill" or "fit"
+/// (the video's own if absent), and `autoTour` how to plan. Returns
 /// [`seiza_parallax_plan_tour_json`]'s JSON, released with
 /// `seiza_string_free`, its stops carrying their planes' `depthParsecs`.
 /// Its `tour`, with any stops or titles dropped, moved or changed, goes
@@ -1162,14 +1227,19 @@ pub unsafe extern "C" fn seiza_parallax_plan_scene_tour_json(
         let request: ScenePlanRequest = serde_json::from_str(&settings_json)
             .map_err(|error| format!("invalid tour plan settings JSON: {error}"))?;
         let frame = match &request.size {
-            Some(size) => seiza_parallax::parse_frame_size(size)?,
+            Some(size) => {
+                seiza_parallax::parse_frame_size_or_shape(size)?.for_image(video.image_size())
+            }
             None => video.size(),
         };
-        let auto = request
-            .auto_tour
-            .as_ref()
-            .map(AutoTourRequest::auto_tour)
-            .unwrap_or_default();
+        let auto = seiza_parallax::AutoTour {
+            framing: framing(&request.framing, video.shot().framing)?,
+            ..request
+                .auto_tour
+                .as_ref()
+                .map(AutoTourRequest::auto_tour)
+                .unwrap_or_default()
+        };
         auto.check()?;
         let plan = video
             .plan_tour(&auto, frame)
@@ -1185,8 +1255,8 @@ pub unsafe extern "C" fn seiza_parallax_plan_scene_tour_json(
 ///
 /// `settings_json` is a complete set of the video's settings, as in
 /// [`seiza_parallax_prepare_json`] but for the scene's: the single move
-/// (`focus`, `start`, `dolly`, `truck`, `truckAngleDegrees`, `pan`, `zoom`,
-/// `zoomEnd`, `rotateDegrees`, `easing`), a tour (`tour`, `autoTour`,
+/// (`focus`, `start`, `framing`, `dolly`, `truck`, `truckAngleDegrees`,
+/// `pan`, `zoom`, `zoomEnd`, `rotateDegrees`, `easing`), a tour (`tour`, `autoTour`,
 /// `tourGlide`, `tourTitles`, `tourLoop`), the output (`size`, `seconds`, `fps`, `quality`,
 /// `growthLimit`, `fadeFrom`), the labels (`overlay`, `overlayDensity`,
 /// `labels`, `labelColor`, `watermark`) and the cards (`introCard`,
@@ -1194,7 +1264,7 @@ pub unsafe extern "C" fn seiza_parallax_plan_scene_tour_json(
 /// defaults, not the first video's. Turns are taken as given, unwrapped:
 /// `rotateDegrees` [0, 360] turns once anticlockwise and [0, -360] once
 /// clockwise, and a stop's `rotateDegrees` likewise. A field that would
-/// change the scene (the images, plate solution, catalogs, distances,
+/// change the scene (the images, crop, plate solution, catalogs, distances,
 /// `distanceFocus`, star placement, galaxies, depth planes or dust) is
 /// refused: those
 /// need a new preparation, except a dust map, which
@@ -1263,7 +1333,10 @@ pub unsafe extern "C" fn seiza_parallax_reconfigure_json(
 /// the dust
 /// (`dustTransmission` `{median, thickest}`, `dustGiven` when a map gave
 /// it, and `starsInFrontOfDust`, the stars it brought in front), objects
-/// labelled, the WCS used, and `fit`, how fitting the camera to the
+/// labelled, `wcs`, the plate solution of the image as given (before any
+/// crop, so it goes back into a request with the same images as it is),
+/// `crop`, the part filmed (`[x, y, width, height]`, or null), and `fit`,
+/// how fitting the camera to the
 /// image changed the framing asked for: `zoom`, `pan`, `lead` and `truck`
 /// for the single move and `stops[].zoom`, `stops[].pan` and
 /// `stops[].dolly` for a tour, each `{asked, used}`, and `inside`, false
@@ -1288,7 +1361,7 @@ pub unsafe extern "C" fn seiza_parallax_summary_json(
         let video = &owner.video;
         let summary = video.summary();
         let (width, height) = video.size();
-        let wcs = video.wcs();
+        let wcs = video.source_wcs();
         owned_json(&SummaryResponse {
             schema_version: 1,
             frames: video.frames(),
@@ -1336,7 +1409,11 @@ pub unsafe extern "C" fn seiza_parallax_summary_json(
                     ap: sip.ap.clone(),
                     bp: sip.bp.clone(),
                 }),
+                pixel_origin: 0,
             },
+            crop: video
+                .crop()
+                .map(|(x, y, width, height)| [x, y, width, height]),
         })
     })
     .unwrap_or(ptr::null_mut())
@@ -1876,6 +1953,82 @@ mod tests {
     };
     use seiza::catalog::{DistanceStar, StarDistanceCatalogBuilder};
     use std::ffi::CStr;
+
+    #[test]
+    fn a_wcs_reads_its_pixel_origin() {
+        let read = |json: &str| serde_json::from_str::<WcsRequest>(json).unwrap().wcs();
+        let base = r#""crval":[10.0,20.0],"crpix":[101.0,51.0],"cd":[[0.001,0.0],[0.0,0.001]]"#;
+        // As this ABI returns it, counted from 0, by default or by name.
+        assert_eq!(read(&format!("{{{base}}}")).unwrap().crpix, (101.0, 51.0));
+        assert_eq!(
+            read(&format!("{{{base},\"pixelOrigin\":0}}"))
+                .unwrap()
+                .crpix,
+            (101.0, 51.0)
+        );
+        // As a FITS header gives it, counted from 1.
+        assert_eq!(
+            read(&format!("{{{base},\"pixelOrigin\":1}}"))
+                .unwrap()
+                .crpix,
+            (100.0, 50.0)
+        );
+        assert!(read(&format!("{{{base},\"pixelOrigin\":2}}")).is_err());
+    }
+
+    #[test]
+    fn framing_crop_and_an_image_shaped_size_read_from_their_fields() {
+        let request = parse_request(
+            r#"{"crop": [10, 20, 300, 200], "framing": "fit", "size": "1080p-image"}"#,
+        )
+        .unwrap();
+        let options = options(&request).unwrap();
+        assert_eq!(options.scene.crop, Some((10, 20, 300, 200)));
+        assert_eq!(options.video.framing, Framing::Fit);
+        assert_eq!(options.video.image_shaped_size, Some(1920));
+        assert_eq!(options.video.sized_for((300, 200)).size, (1920, 1280));
+        // A fixed size clears an image-shaped one, and the defaults stay.
+        let plain = video_options(&parse_video(r#"{"size": "720p"}"#).unwrap()).unwrap();
+        assert_eq!(
+            (plain.size, plain.image_shaped_size, plain.framing),
+            ((1280, 720), None, Framing::Fill)
+        );
+    }
+
+    #[test]
+    fn a_cropped_video_sizes_to_the_crop_and_gives_back_the_given_solution() {
+        let directory = tempfile::tempdir().unwrap();
+        let request = request(
+            directory.path(),
+            r#""crop": [20, 30, 200, 100], "size": "720p-image", "framing": "fit",
+               "labels": []"#,
+        );
+        let mut error = ptr::null_mut();
+        let video = unsafe {
+            seiza_parallax_prepare_json(
+                request.as_ptr(),
+                ptr::null(),
+                None,
+                ptr::null_mut(),
+                &mut error,
+            )
+        };
+        assert!(!video.is_null(), "{}", take_error(error));
+        let summary = unsafe { seiza_parallax_summary_json(video, &mut error) };
+        let parsed: serde_json::Value =
+            serde_json::from_str(&unsafe { CStr::from_ptr(summary) }.to_string_lossy()).unwrap();
+        unsafe { seiza_string_free(summary) };
+        // The 2:1 crop at the 720p frame's longer side.
+        assert_eq!(
+            (parsed["width"].as_u64(), parsed["height"].as_u64()),
+            (Some(1280), Some(640))
+        );
+        assert_eq!(parsed["crop"], serde_json::json!([20, 30, 200, 100]));
+        // The solution is the one given, so it goes back in as it is.
+        let given: serde_json::Value = serde_json::from_str(request.to_str().unwrap()).unwrap();
+        assert_eq!(parsed["wcs"]["crpix"], given["wcs"]["crpix"]);
+        unsafe { seiza_parallax_free(video) };
+    }
 
     #[test]
     fn a_watermark_and_cards_read_from_their_fields() {
@@ -2850,6 +3003,10 @@ mod tests {
                 "{\"distanceFocus\": [1, 2]}",
                 "\"distanceFocus\" changes the prepared scene",
             ),
+            (
+                "{\"crop\": [0, 0, 64, 64]}",
+                "\"crop\" changes the prepared scene",
+            ),
             ("{\"dollly\": 0.5}", "unknown field"),
         ] {
             let settings = CString::new(settings).unwrap();
@@ -3003,6 +3160,9 @@ mod tests {
         for (extra, expected) in [
             ("\"dollly\": 0.5", "unknown field"),
             ("\"start\": \"middle\"", "start must be one of"),
+            ("\"framing\": \"stretch\"", "framing must be one of"),
+            ("\"size\": \"8k-image\"", "-image follows one of"),
+            ("\"crop\": [0, 0, 100000, 100]", "lie inside"),
             ("\"size\": \"8k\"", "expected WIDTHxHEIGHT"),
             ("\"dolly\": 1.5", "dolly"),
             ("\"tour\": [{\"dolly\": 0.5}]", "at least two stops"),

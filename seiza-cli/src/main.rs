@@ -6,9 +6,9 @@ use seiza::data_paths;
 use seiza::minor_bodies::MinorBodyCatalog;
 use seiza::objects::{ObjectCatalog, ObjectKind, ObjectQuery, ObjectSort, SkyRegion};
 use seiza::raster::{PhotoMetadata, ScaleSearch};
-use seiza::solve::{SolveHint, solve};
+use seiza::solve::SolveHint;
 use seiza::star_ids::{StarIdentifierCatalog, StarLookupMatch};
-use seiza::{DetectBackend, DetectConfig, DetectedStar};
+use seiza::{DetectBackend, DetectConfig, DetectedStar, SolveLimits};
 use seiza_image_io::Format as ImageFormat;
 use seiza_satellites::{
     CacheState, CelesTrakSource, ExposureProvenance, ObserverLocation, OrbitalCatalogSource,
@@ -325,15 +325,13 @@ fn blind_params_for_detection_pass(
 }
 
 /// RA/Dec hint from FITS-compatible headers (N.I.N.A. writes RA/DEC in degrees).
-fn fits_hint(path: &std::path::Path) -> Option<(f64, f64)> {
-    let image = open_astronomy_image(path).ok()?;
-    let ra = image
-        .header_f64("RA")
-        .or_else(|| image.header_f64("OBJCTRA"))?;
-    let dec = image
-        .header_f64("DEC")
-        .or_else(|| image.header_f64("OBJCTDEC"))?;
-    Some((ra, dec))
+/// What a FITS or XISF file's headers say about where it points; empty for
+/// other files or unreadable headers. Read without decoding the pixels.
+fn header_prior(path: &std::path::Path) -> seiza::prior::SolvePrior {
+    if !is_astronomy_image_path(path) {
+        return seiza::prior::SolvePrior::default();
+    }
+    seiza_image_io::read_solve_prior(path).unwrap_or_default()
 }
 
 #[derive(Parser)]
@@ -412,9 +410,10 @@ enum Command {
         /// Search radius around the hinted center, degrees
         #[arg(long, default_value_t = 2.0)]
         radius: f64,
-        /// Approximate pixel scale, arcseconds per pixel
+        /// Approximate pixel scale, arcseconds per pixel (default: the
+        /// image's WCS, PIXSCALE, or XPIXSZ over FOCALLEN headers)
         #[arg(long)]
-        scale: f64,
+        scale: Option<f64>,
         /// Allowed relative scale error
         #[arg(long, default_value_t = 0.2)]
         scale_tolerance: f64,
@@ -422,6 +421,10 @@ enum Command {
         /// 2-5 = fit when enough matched stars support it)
         #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=5))]
         sip_order: u8,
+        /// Give up solving after this many seconds (detection not
+        /// counted)
+        #[arg(long, value_parser = parse_time_limit)]
+        time_limit: Option<std::time::Duration>,
         /// Detection threshold in noise sigmas
         #[arg(long, default_value_t = 4.0)]
         sigma: f32,
@@ -558,6 +561,10 @@ enum Command {
         /// support it)
         #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=5))]
         sip_order: u8,
+        /// Give up solving after this many seconds (detection not
+        /// counted)
+        #[arg(long, value_parser = parse_time_limit)]
+        time_limit: Option<std::time::Duration>,
         /// Detection threshold in noise sigmas
         #[arg(long, default_value_t = 4.0)]
         sigma: f32,
@@ -1287,6 +1294,7 @@ fn main() -> Result<()> {
             scale,
             scale_tolerance,
             sip_order,
+            time_limit,
             sigma,
             ignore_border,
             annotate,
@@ -1306,12 +1314,18 @@ fn main() -> Result<()> {
             satellite_sample_seconds,
             satellite_max_element_age_hours,
         } => {
+            // The headers' pointing: RA/DEC, OBJCTRA/OBJCTDEC, or a WCS's
+            // CRVAL, all well inside the search radius of the field.
+            let prior = header_prior(&image);
             let hint = match (ra, dec) {
                 (Some(ra), Some(dec)) => (ra, dec),
-                _ => fits_hint(&image).ok_or_else(|| {
-                    anyhow::anyhow!("--ra/--dec required (no RA/DEC headers found in the image)")
+                _ => prior.center.ok_or_else(|| {
+                    anyhow::anyhow!("--ra/--dec required (no position in the image's headers)")
                 })?,
             };
+            let scale = scale.or(prior.scale_arcsec_px).ok_or_else(|| {
+                anyhow::anyhow!("--scale required (no pixel scale in the image's headers)")
+            })?;
             let acquisition_jd = resolve_acquisition_jd(&image, time.as_deref())?;
             let satellite_input = match (satellites, satellites_celestrak) {
                 (Some(path), false) => Some(SatelliteInput::File(path)),
@@ -1364,6 +1378,7 @@ fn main() -> Result<()> {
                 scale,
                 scale_tolerance,
                 sip_order,
+                time_limit,
                 sigma,
                 ignore_border,
                 detection_backend,
@@ -1495,6 +1510,7 @@ fn main() -> Result<()> {
             max_hypotheses,
             max_coarse_hypotheses,
             sip_order,
+            time_limit,
             sigma,
             ignore_border,
             annotate,
@@ -1516,6 +1532,7 @@ fn main() -> Result<()> {
                     max_hypotheses,
                     max_coarse_hypotheses,
                     sip_order,
+                    time_limit,
                     sigma,
                     ignore_border,
                     detection_backend,
@@ -2443,6 +2460,17 @@ fn cone(data: &std::path::Path, ra: f64, dec: f64, radius: f64, limit: usize) ->
     Ok(())
 }
 
+/// A time limit in seconds: positive and finite.
+fn parse_time_limit(value: &str) -> std::result::Result<std::time::Duration, String> {
+    let seconds: f64 = value
+        .parse()
+        .map_err(|_| format!("{value:?} is not a number of seconds"))?;
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return Err("a time limit must be a positive number of seconds".into());
+    }
+    std::time::Duration::try_from_secs_f64(seconds).map_err(|error| error.to_string())
+}
+
 fn parse_sky_coordinate(value: &str) -> std::result::Result<SkyCoordinate, String> {
     let (ra, dec) = value
         .split_once(',')
@@ -3204,6 +3232,7 @@ fn solve_command(
     scale: f64,
     scale_tolerance: f64,
     sip_order: u8,
+    time_limit: Option<std::time::Duration>,
     sigma: f32,
     ignore_border: u32,
     detection_backend: DetectBackend,
@@ -3243,11 +3272,14 @@ fn solve_command(
         sip_order,
     };
     let started = std::time::Instant::now();
-    let solution = invocation.solve(|stars| solve(stars, &catalog, &hint, dims))?;
+    let limits = time_limit.map(SolveLimits::within).unwrap_or_default();
+    let solution = invocation
+        .solve(|stars| seiza::solve::solve_with_limits(stars, &catalog, &hint, dims, &limits))?;
     let elapsed = started.elapsed();
 
     let wcs = &solution.wcs;
-    let (ra, dec) = wcs.pixel_to_world(dims.0 as f64 / 2.0, dims.1 as f64 / 2.0);
+    let middle = seiza::image_center(dims.0, dims.1);
+    let (ra, dec) = wcs.pixel_to_world(middle.0, middle.1);
     let det = wcs.cd[0][0] * wcs.cd[1][1] - wcs.cd[0][1] * wcs.cd[1][0];
     // Position angle of north, measured in the image
     let north = wcs.world_to_pixel(wcs.crval.0, wcs.crval.1 + 0.01);
@@ -3270,6 +3302,10 @@ fn solve_command(
     println!(
         "  quality    : {} stars matched, RMS {:.3}\"",
         solution.matched_stars, solution.rms_arcsec
+    );
+    println!(
+        "  by chance  : {:.1e} (false-match probability)",
+        solution.false_match_probability
     );
     if let Some(sip) = &wcs.sip {
         println!(
@@ -3373,7 +3409,7 @@ fn solve_command(
             request.exposure.provenance
         );
         let result = satellite_catalog.tracks_in_footprint(
-            wcs,
+            |ra, dec| wcs.world_to_pixel(ra, dec),
             dims,
             &request.exposure,
             &TrackOptions {
@@ -3861,7 +3897,8 @@ fn catalog_stars_in_image(
     dims: (u32, u32),
     limit: usize,
 ) -> Vec<(f64, f64)> {
-    let (ra, dec) = wcs.pixel_to_world(dims.0 as f64 / 2.0, dims.1 as f64 / 2.0);
+    let middle = seiza::image_center(dims.0, dims.1);
+    let (ra, dec) = wcs.pixel_to_world(middle.0, middle.1);
     catalog
         .cone_search(ra, dec, field_diagonal_deg(wcs, dims) / 2.0, limit)
         .into_iter()
@@ -3897,8 +3934,13 @@ fn blind_solve_invocation(
     options: &SolveBlindOptions<'_>,
     can_retry_f32: bool,
     dims: (u32, u32),
-) -> Result<(seiza::solve::Solution, std::time::Duration)> {
-    use seiza::blind::{BlindIndex, BlindParams, solve_blind};
+) -> Result<(
+    seiza::solve::Solution,
+    std::time::Duration,
+    seiza::prior::SolveSource,
+)> {
+    use seiza::blind::{BlindIndex, BlindParams, solve_blind_with_limits};
+    use seiza::prior::{SolveSource, solve_with_prior};
 
     let mut params = BlindParams {
         min_scale_arcsec_px: search.ranges[0].0,
@@ -3936,6 +3978,67 @@ fn blind_solve_invocation(
     };
 
     let started = std::time::Instant::now();
+    let limits = options
+        .time_limit
+        .map(SolveLimits::within)
+        .unwrap_or_default();
+    // A FITS or XISF file's own WCS, pointing and scale come first; see
+    // seiza::prior.
+    let prior = header_prior(invocation.path);
+    if !prior.is_empty() {
+        // An unchecked header WCS is a last resort: hold it back while a
+        // second detection may still solve.
+        let mut unchecked = None;
+        let found = invocation.solve_with_pass(|stars, pass| {
+            let attempt_params = BlindParams {
+                min_scale_arcsec_px: search.ranges[0].0,
+                max_scale_arcsec_px: search.ranges[0].1,
+                ..blind_params_for_detection_pass(
+                    &params,
+                    can_retry_f32,
+                    options.detection_fallback_hypotheses,
+                    pass,
+                )
+            };
+            let found = solve_with_prior(
+                stars,
+                catalog,
+                Some(&index),
+                &prior,
+                &attempt_params,
+                dims,
+                &limits,
+            )?;
+            if found.source == SolveSource::HeaderUnchecked
+                && can_retry_f32
+                && pass == DetectionPass::Primary
+            {
+                unchecked = Some(found);
+                return Err(seiza::Error::Solve(
+                    "only the image's own WCS, unchecked".into(),
+                ));
+            }
+            Ok(found)
+        });
+        let found = match (found, unchecked) {
+            (Ok(found), _) => found,
+            (Err(error), Some(unchecked))
+                if !matches!(
+                    error.downcast_ref::<seiza::Error>(),
+                    Some(seiza::Error::TimedOut | seiza::Error::Cancelled)
+                ) =>
+            {
+                unchecked
+            }
+            (Err(error), _) => return Err(error),
+        };
+        if found.source == SolveSource::HeaderUnchecked {
+            eprintln!(
+                "warning: no solve succeeded; using the image's own WCS, which could not be checked against the catalog"
+            );
+        }
+        return Ok((found.solution, started.elapsed(), found.source));
+    }
     let solution = invocation.solve_with_pass(|stars, pass| {
         let mut attempt_params = blind_params_for_detection_pass(
             &params,
@@ -3946,10 +4049,10 @@ fn blind_solve_invocation(
         solve_over_ranges(&search.ranges, |(min, max)| {
             attempt_params.min_scale_arcsec_px = min;
             attempt_params.max_scale_arcsec_px = max;
-            solve_blind(stars, catalog, &index, &attempt_params, dims)
+            solve_blind_with_limits(stars, catalog, &index, &attempt_params, dims, &limits)
         })
     })?;
-    Ok((solution, started.elapsed()))
+    Ok((solution, started.elapsed(), SolveSource::Blind))
 }
 
 struct SolveBlindOptions<'a> {
@@ -3960,6 +4063,7 @@ struct SolveBlindOptions<'a> {
     max_hypotheses: usize,
     max_coarse_hypotheses: usize,
     sip_order: u8,
+    time_limit: Option<std::time::Duration>,
     sigma: f32,
     ignore_border: u32,
     detection_backend: DetectBackend,
@@ -4098,7 +4202,7 @@ fn solve_blind_command(
 
     let catalog =
         TileCatalog::open(data).with_context(|| format!("failed to open {}", data.display()))?;
-    let (solution, elapsed) = blind_solve_invocation(
+    let (solution, elapsed, source) = blind_solve_invocation(
         &mut invocation,
         &catalog,
         &search,
@@ -4107,8 +4211,12 @@ fn solve_blind_command(
         dims,
     )?;
     let wcs = &solution.wcs;
-    let (ra, dec) = wcs.pixel_to_world(dims.0 as f64 / 2.0, dims.1 as f64 / 2.0);
+    let middle = seiza::image_center(dims.0, dims.1);
+    let (ra, dec) = wcs.pixel_to_world(middle.0, middle.1);
     println!("Blind-solved in {:.2}s:", elapsed.as_secs_f64());
+    if source != seiza::prior::SolveSource::Blind {
+        println!("  solved from: {}", source.as_str());
+    }
     println!(
         "  center     : {} {}  ({ra:.5}°, {dec:.5}°)",
         hms(ra),
@@ -4118,6 +4226,10 @@ fn solve_blind_command(
     println!(
         "  quality    : {} stars matched, RMS {:.3}\"",
         solution.matched_stars, solution.rms_arcsec
+    );
+    println!(
+        "  by chance  : {:.1e} (false-match probability)",
+        solution.false_match_probability
     );
     if let Some(path) = options.wcs_path {
         solve_field::write_wcs_file(path, wcs)?;

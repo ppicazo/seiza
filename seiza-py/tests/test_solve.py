@@ -138,6 +138,84 @@ def test_wcs_transform_round_trip():
     assert len(wcs.footprint(1000, 800)) == 4
 
 
+def test_a_solution_reports_how_unlikely_it_is_by_chance():
+    catalog, stars, _ = synthetic_field()
+    solution = seiza.solve(
+        stars, catalog, WIDTH, HEIGHT, ra=CENTER[0], dec=CENTER[1], scale_arcsec_px=SCALE
+    )
+    assert 0.0 <= solution.false_match_probability < 1e-9
+
+
+def test_a_time_limit_or_cancel_stops_a_solve():
+    catalog, stars, _ = synthetic_field()
+    hint = dict(ra=CENTER[0] + 0.5, dec=CENTER[1] - 0.5, scale_arcsec_px=SCALE, radius_deg=3.0)
+    with pytest.raises(TimeoutError):
+        seiza.solve(stars, catalog, WIDTH, HEIGHT, time_limit=1e-9, **hint)
+    with pytest.raises(seiza.SolveError, match="cancelled"):
+        seiza.solve(stars, catalog, WIDTH, HEIGHT, cancel=lambda: True, **hint)
+
+    class Stop(Exception):
+        pass
+
+    def raises():
+        raise Stop
+
+    # An exception from the predicate reaches the caller as itself.
+    with pytest.raises(Stop):
+        seiza.solve(stars, catalog, WIDTH, HEIGHT, cancel=raises, **hint)
+    with pytest.raises(ValueError, match="time_limit"):
+        seiza.solve(stars, catalog, WIDTH, HEIGHT, time_limit=0.0, **hint)
+    # A predicate that never stops leaves the solve alone.
+    solution = seiza.solve(stars, catalog, WIDTH, HEIGHT, cancel=lambda: False, **hint)
+    assert solution.matched_stars >= 20
+
+
+def test_solve_with_prior_uses_what_the_image_knows():
+    catalog, stars, truth = synthetic_field()
+    # The image's own WCS, checked by a fresh fit.
+    checked = seiza.solve_with_prior(stars, catalog, WIDTH, HEIGHT, {"wcs": truth})
+    assert checked.source == "header-checked"
+    assert checked.matched_stars >= 20
+    # A pointing and a scale, searched around.
+    hinted = seiza.solve_with_prior(
+        stars,
+        catalog,
+        WIDTH,
+        HEIGHT,
+        {"center": (CENTER[0] + 0.3, CENTER[1] - 0.3), "scale_arcsec_px": SCALE * 1.1},
+    )
+    assert hinted.source == "header-hint"
+    # Stars that match nothing leave the image's own WCS, unchecked.
+    junk = [(17.0 * i % WIDTH, 29.0 * i % HEIGHT, 100.0 - i) for i in range(40)]
+    unchecked = seiza.solve_with_prior(junk, catalog, WIDTH, HEIGHT, {"wcs": truth})
+    assert unchecked.source == "header-unchecked"
+    assert unchecked.matched_stars == 0
+    assert unchecked.false_match_probability == 1.0
+    with pytest.raises(seiza.SolveError):
+        seiza.solve_with_prior(junk, catalog, WIDTH, HEIGHT, {})
+    with pytest.raises(ValueError, match="seiza.Wcs"):
+        seiza.solve_with_prior(stars, catalog, WIDTH, HEIGHT, {"wcs": "not a wcs"})
+    # Plain solves say nothing of a source.
+    assert seiza.solve(
+        stars, catalog, WIDTH, HEIGHT, ra=CENTER[0], dec=CENTER[1], scale_arcsec_px=SCALE
+    ).source is None
+
+
+def test_read_solve_prior_reads_fits_headers(tmp_path):
+    fits = pytest.importorskip("astropy.io.fits")
+    path = tmp_path / "light.fits"
+    header = fits.Header()
+    header["OBJCTRA"] = "05 35 17.3"
+    header["OBJCTDEC"] = "-05 23 28"
+    header["XPIXSZ"] = 3.76
+    header["FOCALLEN"] = 530.0
+    fits.writeto(path, np.zeros((4, 4), dtype=np.float32), header)
+    prior = seiza.read_solve_prior(path)
+    assert prior["wcs"] is None
+    assert math.isclose(prior["center"][0], 83.822, abs_tol=1e-3)
+    assert math.isclose(prior["scale_arcsec_px"], 1.4633, abs_tol=1e-3)
+
+
 def test_solve_failure_raises():
     catalog = seiza.StarCatalog.from_stars([(10.0, 10.0, 5.0)])
     assert issubclass(seiza.SolveError, RuntimeError)

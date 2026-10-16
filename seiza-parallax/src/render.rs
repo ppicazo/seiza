@@ -76,6 +76,23 @@ pub enum Start {
     Whole,
 }
 
+/// How the widest view meets an image whose shape is not the frame's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Framing {
+    /// The widest view fills the frame and stays inside the image, so an
+    /// image of another shape loses the ends of its longer side: a 4:3
+    /// image in a 16:9 frame shows its whole width and three quarters of
+    /// its height.
+    #[default]
+    Fill,
+    /// The widest view shows the whole image, with black beside it where
+    /// the shapes differ. The picture ends where any layer whose edge
+    /// would show ends, and is black beyond: at the first frame that is
+    /// the photo's edge, and as the camera flies in, the far stars, which
+    /// grow less than the nebula, set it. No view zooms in to hide an edge.
+    Fit,
+}
+
 /// A stop on a tour: where the camera looks, how near it has come, and
 /// how long it takes to come here and stays.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -149,6 +166,8 @@ pub struct Shot {
     pub truck: (f64, f64),
     /// What the first frame shows, and so where the camera's aim starts.
     pub start: Start,
+    /// How the widest view meets an image of another shape.
+    pub framing: Framing,
     /// How far the first frame zooms in: 1 shows the widest view the start
     /// allows that stays inside the image, 2 half as wide.
     pub zoom: f64,
@@ -211,6 +230,7 @@ impl Default for Shot {
             dolly: 0.5,
             truck: (0.05, 0.0),
             start: Start::Focus,
+            framing: Framing::Fill,
             zoom: 1.0,
             zoom_end: 1.0,
             lead: 1.0,
@@ -339,11 +359,27 @@ impl View {
 
 impl Shot {
     /// The widest footprint (image pixels per output pixel) of a frame
-    /// centred on `(x, y)` that stays inside a `width` × `height` image.
+    /// centred on `(x, y)` of a `width` × `height` image: the widest that
+    /// stays inside the image, or with [`Framing::Fit`] the narrowest that
+    /// shows all of it.
     fn widest_footprint(&self, (x, y): (f64, f64), width: usize, height: usize) -> f64 {
-        let half_x = x.min(width as f64 - 1.0 - x).max(1.0);
-        let half_y = y.min(height as f64 - 1.0 - y).max(1.0);
-        (2.0 * half_x / self.width as f64).min(2.0 * half_y / self.height as f64)
+        let (right, bottom) = (width as f64 - 1.0 - x, height as f64 - 1.0 - y);
+        let across = |half_x: f64, half_y: f64| {
+            (
+                2.0 * half_x.max(1.0) / self.width as f64,
+                2.0 * half_y.max(1.0) / self.height as f64,
+            )
+        };
+        match self.framing {
+            Framing::Fill => {
+                let (x, y) = across(x.min(right), y.min(bottom));
+                x.min(y)
+            }
+            Framing::Fit => {
+                let (x, y) = across(x.max(right), y.max(bottom));
+                x.max(y)
+            }
+        }
     }
 
     /// The first frame's centre on the background plane and its footprint.
@@ -381,12 +417,17 @@ impl Shot {
     /// The depths whose edges must stay out of view: the background, the
     /// leftover star light and the far sprites, and the depth planes that
     /// reach the image's edges, on those edges.
+    ///
+    /// With [`Framing::Fit`] the edges show, black beyond them, and
+    /// [`Self::picture_edges`] takes the background's with these.
     fn guarded_depths(&self, scene: &Scene) -> Vec<Guard> {
         let mut guards = vec![
-            Guard::whole(scene.background_distance_pc),
             Guard::whole(scene.leftover_distance_pc),
             Guard::whole(scene.far_distance_pc),
         ];
+        if self.framing == Framing::Fill {
+            guards.insert(0, Guard::whole(scene.background_distance_pc));
+        }
         for plane in scene.planes.iter() {
             let edges = plane.cut_edges(scene.width(), scene.height());
             if edges.contains(&true) {
@@ -418,8 +459,14 @@ impl Shot {
     /// image at `depths`, but for a plane gone from view. A whole-image
     /// start puts the corners on the image's edges, so rounding a millionth
     /// of a pixel past them still counts as inside.
+    ///
+    /// With [`Framing::Fit`] every view counts as inside: the picture ends
+    /// where the first guarded edge would show, black beyond.
     fn inside(&self, scene: &Scene, view: &View, depths: &[Guard]) -> bool {
         const SLACK: f64 = 1e-6;
+        if self.framing == Framing::Fit {
+            return true;
+        }
         let (width, height) = (
             scene.width() as f64 - 1.0 + SLACK,
             scene.height() as f64 - 1.0 + SLACK,
@@ -1130,7 +1177,69 @@ impl Shot {
             );
         }
         draw_sprites(&mut out, scene, &view, self, &absorbers);
+        if self.framing == Framing::Fit {
+            clip_to_picture(&mut out, self.picture_edges(scene, &view).as_deref());
+        }
         out
+    }
+
+    /// With [`Framing::Fit`], the picture's edges in `view`'s frame: those
+    /// of the background and of every layer [`Self::guarded_depths`] keeps
+    /// from showing, but for a plane gone from view, each as a line it
+    /// lies inside of, by side (left, top, right, bottom). `None` when the
+    /// background is behind the camera.
+    fn picture_edges(&self, scene: &Scene, view: &View) -> Option<Vec<(usize, Edge)>> {
+        let (right, bottom) = (scene.width() as f64 - 1.0, scene.height() as f64 - 1.0);
+        // The image's corners clockwise from the top left; edge `index`
+        // runs from corner `index` to the next, and is that side.
+        let corners = [(0.0, 0.0), (right, 0.0), (right, bottom), (0.0, bottom)];
+        const SIDES: [usize; 4] = [1, 2, 3, 0];
+        let mut guards = vec![Guard::whole(scene.background_distance_pc)];
+        guards.extend(self.guarded_depths(scene));
+        let mut edges = Vec::new();
+        for (index, guard) in guards.iter().enumerate() {
+            if guard.fades && self.plane_fade(view, guard.distance) <= 0.0 {
+                continue;
+            }
+            let quad: Option<Vec<(f64, f64)>> = corners
+                .iter()
+                .map(|&(x, y)| view.project(x, y, guard.distance).map(|(u, v, _)| (u, v)))
+                .collect();
+            let Some(quad) = quad else {
+                if index == 0 {
+                    return None;
+                }
+                continue;
+            };
+            // Clockwise or not once projected, as the frame may be mirrored.
+            let turning = (0..4)
+                .map(|at| {
+                    let (a, b) = (quad[at], quad[(at + 1) % 4]);
+                    a.0 * b.1 - b.0 * a.1
+                })
+                .sum::<f64>()
+                .signum();
+            for at in 0..4 {
+                let side = SIDES[at];
+                if !guard.edges[side] {
+                    continue;
+                }
+                let (a, b) = (quad[at], quad[(at + 1) % 4]);
+                let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+                let length = dx.hypot(dy);
+                if length > 0.0 {
+                    let normal = (-dy * turning / length, dx * turning / length);
+                    edges.push((
+                        side,
+                        Edge {
+                            normal,
+                            offset: normal.0 * a.0 + normal.1 * a.1,
+                        },
+                    ));
+                }
+            }
+        }
+        Some(edges)
     }
 
     /// The planes of `scene` that block light, as `view` sees them.
@@ -1154,6 +1263,48 @@ impl Shot {
             })
             .collect()
     }
+}
+
+/// A line in the frame that a picture lies inside of: its unit normal,
+/// pointing inward, and its offset, so a point lies `normal · point -
+/// offset` pixels inside.
+#[derive(Clone, Copy, Debug)]
+struct Edge {
+    normal: (f64, f64),
+    offset: f64,
+}
+
+/// Black beyond the picture's `edges`, each by its side, as
+/// [`Shot::picture_edges`] gives them, or all black for `None`. An edge's
+/// pixels are partly covered, so the photo meets the black cleanly however
+/// it turns; where several layers' edges nearly meet on one side, the
+/// innermost covers.
+fn clip_to_picture(out: &mut LightImage, edges: Option<&[(usize, Edge)]>) {
+    let Some(edges) = edges else {
+        out.pixels.fill([0.0; 3]);
+        return;
+    };
+    let width = out.width;
+    out.pixels
+        .par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(row, line)| {
+            for (column, pixel) in line.iter_mut().enumerate() {
+                let point = (column as f64, row as f64);
+                let mut sides = [1.0_f64; 4];
+                for &(side, edge) in edges {
+                    let inside = edge.normal.0 * point.0 + edge.normal.1 * point.1 - edge.offset;
+                    sides[side] = sides[side].min((inside + 0.5).clamp(0.0, 1.0));
+                }
+                let cover = sides.iter().product::<f64>();
+                if cover < 1.0 {
+                    let cover = cover as f32;
+                    for channel in pixel.iter_mut() {
+                        *channel *= cover;
+                    }
+                }
+            }
+        });
 }
 
 /// A plane that blocks light, as a frame sees it: which of its points each
@@ -2872,6 +3023,114 @@ mod tests {
             ..shot.clone()
         };
         assert_eq!(still.fitted(&scene).0.zoom, 1.0);
+    }
+
+    #[test]
+    fn a_fit_frame_shows_the_whole_image_with_black_beside_it() {
+        // A 4:3 image in a 16:9 frame.
+        let scene = scene_with(&[]);
+        let shot = |framing| Shot {
+            focus: (199.5, 149.5),
+            dolly: 0.3,
+            truck: (0.05, 0.0),
+            start: Start::Whole,
+            framing,
+            width: 320,
+            height: 180,
+            frames: 12,
+            ..Shot::default()
+        };
+        let pixel = |image: &LightImage, (x, y): (usize, usize)| image.pixels[y * image.width + x];
+
+        // Fill: no black, but the top and bottom of the image are cut. The
+        // green channel is the image row over its height.
+        let filled = shot(Framing::Fill).render(&scene, 0);
+        assert!(pixel(&filled, (2, 90))[2] > 0.1);
+        assert!(
+            pixel(&filled, (160, 0))[1] > 0.1,
+            "{:?}",
+            pixel(&filled, (160, 0))
+        );
+
+        // Fit: the whole height shows, with black either side of the
+        // 240-pixel-wide image, and an edge that is partly covered.
+        let fit = shot(Framing::Fit);
+        let fitted = fit.render(&scene, 0);
+        assert_eq!(pixel(&fitted, (2, 90)), [0.0; 3]);
+        assert_eq!(pixel(&fitted, (317, 90)), [0.0; 3]);
+        assert!(
+            pixel(&fitted, (160, 0))[1] < 0.02,
+            "{:?}",
+            pixel(&fitted, (160, 0))
+        );
+        assert!(pixel(&fitted, (160, 179))[1] > 0.95);
+        assert!(pixel(&fitted, (160, 90))[2] > 0.1);
+        let edge = (0..320)
+            .find(|&x| pixel(&fitted, (x, 90))[2] > 0.0)
+            .unwrap();
+        assert!((39..=41).contains(&edge), "{edge}");
+
+        // As the camera moves, every layer still covers the photo, and the
+        // view keeps its first width rather than zooming in to hide the
+        // background's edge.
+        assert!(fit.stays_inside(&scene));
+        let view = |shot: &Shot| shot.view(&scene, 0);
+        let width_shown = |shot: &Shot| {
+            let view = view(shot);
+            view.unproject(319.0, 90.0, 400.0).0 - view.unproject(0.0, 90.0, 400.0).0
+        };
+        assert!(width_shown(&fit) > 1.3 * width_shown(&shot(Framing::Fill)));
+    }
+
+    #[test]
+    fn a_fit_picture_ends_where_the_far_stars_do_rather_than_zooming_in() {
+        // The leftover star light four times as far as the nebula grows less as
+        // the camera flies in, so its edge comes inside the nebula's.
+        let scene_at = |leftover: f64| {
+            let base = scene_with(&[]);
+            let (width, height) = (base.width(), base.height());
+            let mut starless = LightImage::new(width, height);
+            for pixel in starless.pixels.iter_mut() {
+                *pixel = [0.5; 3];
+            }
+            Scene::new(
+                &starless,
+                &LightImage::new(width, height),
+                &[],
+                400.0,
+                leftover,
+                2000.0,
+                &CutOptions::default(),
+            )
+        };
+        let shot = Shot {
+            focus: (199.5, 149.5),
+            dolly: 0.5,
+            truck: (0.0, 0.0),
+            start: Start::Whole,
+            framing: Framing::Fit,
+            width: 320,
+            height: 180,
+            frames: 6,
+            ..Shot::default()
+        };
+        let (near, far) = (scene_at(400.0), scene_at(1600.0));
+        // Nothing zooms in to hide an edge.
+        assert_eq!(shot.fitted(&far).0.zoom, 1.0);
+        let left_edge = |scene: &Scene, frame: usize| {
+            let image = shot.render(scene, frame);
+            (0..320)
+                .find(|&x| image.pixels[90 * image.width + x][0] > 0.25)
+                .unwrap()
+        };
+        // At the first frame both show the whole image, 240 pixels wide.
+        assert!((39..=41).contains(&left_edge(&near, 0)));
+        assert!((39..=41).contains(&left_edge(&far, 0)));
+        // At the last, the nebula has grown past the frame's sides, but the
+        // farther star light has not: the picture ends where it does.
+        assert_eq!(left_edge(&near, 5), 0);
+        let far_edge = left_edge(&far, 5);
+        assert!((10..40).contains(&far_edge), "{far_edge}");
     }
 
     #[test]

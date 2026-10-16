@@ -169,14 +169,41 @@ exposes the **superset** of what both apps need.
   and reports every written file, StarXTerminator's stars sidecar included.
   Include the schema's `cliVersion`/`mlVersion` in any cache key: a tool
   upgrade changes the output for identical inputs.
-- **Plate solving** — `seiza_solve_image_json`.
+- **Plate solving** — `seiza_solve_image_json`, and
+  `seiza_solve_image_with_limits_json`. Both start from what the file says
+  about itself: a FITS or XISF image's own WCS (FITS cards, or a PixInsight
+  solution in either `AstrometricSolution` namespace) is checked with a
+  quick hinted solve; else a hinted solve searches around its `RA`/`DEC` or
+  `OBJCTRA`/`OBJCTDEC` at a scale from its WCS, `PIXSCALE`, or `XPIXSZ`
+  over `FOCALLEN`; else a blind solve runs, near that scale first (a
+  raster's EXIF focal length gives one too). FITS and XISF stars are
+  detected on an MTF stretch first, then on linear samples. When nothing
+  solves but the file holds a WCS, that WCS is returned unchecked.
+  `solvedFrom` says which: `header-checked`, `header-hint`, `blind`, or
+  `header-unchecked`, which comes with `matchedStars` 0 and
+  `falseMatchProbability` 1. The limits call gives up after a time limit in
+  seconds or when a `SeizaCancelSignal` is cancelled, setting `error_out` to
+  `solve stopped at its time limit` or `cancelled by the caller`. The JSON's
+  `falseMatchProbability` is the chance that a wrong field would match as
+  well, counting every candidate the search tried: a true field scores far
+  below one in a billion, and a solve that scores above that is refused.
+  The returned `wcs` counts pixels from 0, with each pixel's center on a
+  whole number, and says so with `"pixelOrigin": 0`; add 1 to `crpix` for a
+  FITS header, whose pixels count from 1. The image's middle is
+  `((width - 1) / 2, (height - 1) / 2)`, and `centerRaDegrees` is the sky
+  there. A WCS passed back in, as to `seiza_parallax_prepare_json`, may give
+  `"pixelOrigin": 1` for FITS-style values.
 - **Parallax videos** — `seiza_parallax_prepare_json` makes what `seiza
   parallax-video` makes from a JSON request: an image for StarXTerminator to
   split (through `rc-astro`) or its starless and stars files, an optional WCS
   (as `seiza_solve_image_json` returns it; without one the image is
   blind-solved), and the command's options in camelCase, with frame sizes
-  such as `"1080p"`, `"4k"` or `"1080p-portrait"`. An unknown field is an
-  error. It returns an opaque `SeizaParallax`, released with
+  such as `"1080p"`, `"4k"`, `"1080p-portrait"` or `"4k-image"` (the
+  image's own shape at that longer side). `framing` `"fit"` shows all of an
+  image whose shape differs from the frame's, with black beside it, where
+  `"fill"`, the default, cuts its longer side; `crop` (`[x, y, width,
+  height]`) films part of the image, every other image point counting in
+  it. An unknown field is an error. It returns an opaque `SeizaParallax`, released with
   `seiza_parallax_free`, and reports each step as JSON to a
   `SeizaParallaxEventCallback`. `distanceFocus` is where the nebula's
   distance is measured; `focus` only aims the camera, so a new destination

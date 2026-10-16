@@ -108,6 +108,36 @@ solution = seiza.solve_blind(stars, catalog, index, width, height,
                              min_scale_arcsec_px=0.5, max_scale_arcsec_px=15.0)
 ```
 
+An image that already knows where it points can say so.
+`read_solve_prior(path)` reads a FITS or XISF file's own WCS (including a
+PixInsight solution), its RA/DEC or OBJCTRA/OBJCTDEC, and its pixel scale
+from PIXSCALE or pixel size over focal length, without decoding the pixels.
+`solve_with_prior` then checks that WCS, else searches around the position,
+else solves blind (given an `index`), and when nothing solves returns the
+file's own WCS with `source == "header-unchecked"`:
+
+```python
+prior = seiza.read_solve_prior("processed.xisf")
+solution = seiza.solve_with_prior(stars, catalog, width, height, prior, index=index)
+print(solution.source)   # header-checked, header-hint, blind or header-unchecked
+```
+
+A field that will not solve can search for a minute or more. Both `solve` and
+`solve_blind` take `time_limit=` in seconds, which raises `TimeoutError`, and
+`cancel=`, a callable that returns true to stop (asked about every 50 ms),
+which raises `SolveError`. Ctrl-C stops a solve either way, and an exception
+from `cancel` reaches you as itself:
+
+```python
+solution = seiza.solve_blind(stars, catalog, index, width, height,
+                             time_limit=30.0, cancel=stop_requested)
+```
+
+`solution.false_match_probability` is the chance that a wrong field would
+match as well, counting every candidate the search tried. A true field scores
+far below one in a billion; a blind solve above that is refused, and a hinted
+one above one in a thousand.
+
 For faint fields, the optional `stars-deep-gaia20.bin` catalog reaches Gaia
 G≤20 (about 9 GB). It is intentionally not included in `fetch_catalogs("all")`,
 so request it explicitly with the same G≤16 blind index:
@@ -690,10 +720,24 @@ wide = video.reconfigure(size="4k", quality="high", rotate_deg=(0, -360))
 print(wide.summary["fit"]["zoom"])      # (asked, used)
 ```
 
+An image of another shape than the frame is cut to fill it by default.
+`framing="fit"` shows all of it at the widest, with black beside it, and a
+size ending `-image` takes the image's own shape: `"4k-image"` films a 4:3
+image at 3840x2880, all of it. `crop=(x, y, width, height)` films part of
+the image, and every other image point, such as `focus` and tour stops,
+counts in the cropped image; pass the same `crop` to `plan_parallax_tour`:
+
+```python
+video = seiza.ParallaxVideo(starless, stars, solution.wcs,
+                            crop=(800, 400, 6000, 4000), size="4k-image")
+square = video.reconfigure(size=(1080, 1080), framing="fit", start="whole")
+```
+
 Images may be paths (PNG, JPEG, TIFF, FITS or XISF) or arrays, float32 from
 0 to 1 or uint8; 16-bit or float files make the best videos, as 8 bits flatten bright star
 cores and band smooth nebula. Options are the command's, in snake case,
-with frame sizes such as `"720p"`, `"1080p"`, `"4k"` or `"1080p-portrait"`.
+with frame sizes such as `"720p"`, `"1080p"`, `"4k"`, `"1080p-portrait"` or
+`"4k-image"`.
 Distances come from the star distance file when installed, or the archives
 unless `online=False`. `render` stops when its callback returns `False`;
 Ctrl-C or `cancel` stop preparing, `reconfigure`, `render` and `write`.

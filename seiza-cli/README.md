@@ -29,15 +29,24 @@ cargo install seiza-cli
 ## Solving
 
 ```
-# Hinted: approximate center (or FITS RA/DEC headers) plus pixel scale.
-# --data takes a catalog file or a directory of catalogs; after
+# Hinted: approximate center plus pixel scale. A FITS or XISF file's own
+# headers supply either when the flags are missing: RA/DEC or
+# OBJCTRA/OBJCTDEC, and a scale from its WCS, PIXSCALE, or XPIXSZ over
+# FOCALLEN. --data takes a catalog file or a directory of catalogs; after
 # `seiza setup` it can be omitted entirely.
 seiza solve image.jpg --data data --ra 324.8 --dec 57.5 --scale 2.8
 seiza solve light.fits --scale 1.45
+seiza solve light.fits
 
 # Blind: no position, just a plausible scale range. A directory supplies
-# the deepest catalog and the blind index automatically.
+# the deepest catalog and the blind index automatically. A FITS or XISF
+# file's own WCS (FITS cards or a PixInsight solution) is checked first,
+# then its position and scale searched around; if nothing solves, its own
+# WCS is used unchecked, with a warning.
 seiza solve-blind image.jpg --data data --min-scale 0.5 --max-scale 15
+
+# Give up after 30 seconds of solving (detection not counted)
+seiza solve-blind image.jpg --data data --time-limit 30
 
 # JPEG: inspect EXIF and solve a wide field without a pointing hint.
 seiza image-info phone.jpg
@@ -140,7 +149,13 @@ Blind-solved in 2.02s:
   center     : 03h 19m 42.05s +70° 56′ 13.5″  (49.92521°, 70.93708°)
   pixel scale: 72.0169"/px
   quality    : 106 stars matched, RMS 116.265"
+  by chance  : 4.8e-90 (false-match probability)
 ```
+
+`by chance` is the chance that a wrong field would match as well, counting
+every candidate the search tried. A true field scores far below one in a
+billion; `solve-blind` refuses a field above that, and `solve` one above one
+in a thousand.
 
 ![Cropped phone photo solved after the wide retry](../docs/images/phone/phone-crop-solve.jpg)
 
@@ -441,7 +456,15 @@ one `--stop` a line, each target's titled with its name, and a `focus
 X,Y` line for the distance focus, and stops; remove, move or change lines,
 then render it with `--tour-file FILE`. `--seconds`, `--fps` and `--size` set the
 video (`--size` takes `720p`, `1080p`, the default, `1440p` or `4k`, any of
-them with `-portrait` for vertical video, or `WIDTHxHEIGHT`), and `--quality high` draws each frame at twice the size and averages it
+them with `-portrait` for vertical video or with `-image` for the image's own
+shape, so `4k-image` films a 4:3 image at 3840x2880, all of it; or
+`WIDTHxHEIGHT`). When the image and the frame differ in shape, the widest
+view fills the frame and cuts the ends of the image's longer side;
+`--framing fit` shows all of it instead, with black beside it. The picture
+ends where the far stars end, and they grow little as the camera flies in,
+so the bars stay nearly fixed, as in a letterboxed film. `--crop X,Y,WIDTH,HEIGHT` films part of the
+image; every other image point, such as `--focus`, the stops and a planned
+tour's, counts in the cropped image. `--quality high` draws each frame at twice the size and averages it
 down, blending levels of detail so fine detail neither shimmers nor steps in
 sharpness as the camera moves, for about four times the rendering time. A deep image holds so many faint stars that, each moving on its own,
 they crowd the view: `--max-stars N` lets only the N brightest fly, and
