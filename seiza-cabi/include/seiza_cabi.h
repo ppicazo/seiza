@@ -2710,9 +2710,17 @@ char *seiza_calibration_measure_dark_json(const char *request_json, char **error
  `height`, `fullScale`, `level`, `channelLevels`, `clippedFraction`,
  `noise`, `detectionDepth`, `illumination` (`columns`, `rows` and a
  row-major `response` of cell medians, 1 for a typical cell),
- `featureCount` and the deepest `features` (`x`, `y`, `left`, `top`,
- `right`, `bottom`, `pixels`, `depth`). Keep it and pass it back to a
- screen whenever the set changes. Free it with [`seiza_string_free`].
+ `featureCount`, the `features` — large disks, donuts and patches first,
+ then compact and irregular dips, each with `x`, `y`, `left`, `top`,
+ `right`, `bottom`, `pixels`, `depth`, `shape` (`compact`, `irregular`,
+ `disk`, `donut` or `patch`), `radius`, and when known `hole`,
+ `distanceMm` and `seenIn` — and `vignetting` (`edge`, `x`, `y`, `area`,
+ `depth`). Optional `largeFeatures` (default true) turns the search for
+ large ones off. Optional `focalRatio` and `pixelSizeUm`, given together,
+ with an optional `obstruction`, describe the light cone, so each disk gets
+ a distance from the sensor; any of them without both of the first two is
+ refused. Keep the response and pass it back to a screen whenever the set
+ changes. Free it with [`seiza_string_free`].
 
  # Safety
  As [`seiza_calibration_measure_dark_json`].

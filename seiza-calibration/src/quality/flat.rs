@@ -7,8 +7,11 @@
 //! shot does not: no single flat matches the lights, and a master combined
 //! with a median keeps whatever most of its frames showed.
 //!
-//! [`measure_flat`] finds compact dips — small patches that pass less light
-//! than the response around them — and records where they are. Across a set,
+//! [`measure_flat`] finds the flat's dust as [`crate::dust`] defines it:
+//! compact dips at full resolution — small patches that pass less light than
+//! the response around them — and, on the frame binned to about 1,024
+//! pixels, the large out-of-focus disks and donuts of dust further up the
+//! train, which are too wide and too shallow to see pixel by pixel. Across a set,
 //! [`screen_flats`] matches the dips by the area they cover and sorts them into
 //! steady ones, present in nearly every frame at nearly the same depth, and
 //! changing ones. Steady dips are counted and left alone. Changing dips mark
@@ -20,9 +23,11 @@
 //! filter pattern and keeps features a few pixels wide.
 
 use super::{
-    FRAME_QUALITY_ALGORITHM_VERSION, Finding, FindingCode, FrameVerdict, Limits, MIN_PEERS,
-    frame_quality_algorithm_version, median_of,
+    FLAT_QUALITY_ALGORITHM_VERSION, Finding, FindingCode, FrameVerdict, Limits, MIN_PEERS,
+    first_flat_quality_algorithm_version, median_of,
 };
+use crate::dust::{self, DustOptions, DustShape, Optics, Vignetting};
+use crate::flat_response::metric;
 use crate::{Error, LinearImageRef, Result};
 use rayon::prelude::*;
 use seiza_stats::{median_in_place, robust_sigma_in_place};
@@ -61,6 +66,9 @@ const CLIP_TOLERANCE: f32 = 0.001;
 const LEVEL_STRIDE: usize = 16;
 /// Smallest plane, in pixels along each side, that can be measured.
 const MIN_PLANE_SIDE: usize = 32;
+/// A pixel-pass dip and a large feature on one centre whose radii are within
+/// this factor are one shadow.
+const SAME_SHADOW_SIZE: f32 = 1.5;
 
 /// Settings for [`measure_flat`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -73,8 +81,17 @@ pub struct FlatMeasureOptions {
     /// around it.
     pub feature_depth: f32,
     /// A dip must also reach this many times the noise of the smoothed
-    /// response, so a noisy flat does not count its own noise.
+    /// response, so a noisy flat does not count its own noise. A dip of
+    /// four plane pixels or fewer must also clear the threshold that keeps
+    /// the number of noise dips in a frame near
+    /// [`DustOptions::false_dips`]: a 26-megapixel frame holds a handful of
+    /// lone pixels beyond 5σ by chance.
     pub feature_sigma: f32,
+    /// Look for large disks, donuts and vignetting on the binned frame too.
+    pub large_features: bool,
+    /// The light cone, when known: sizes each disk's distance from the
+    /// sensor and says whether a donut can occur.
+    pub optics: Option<Optics>,
 }
 
 impl Default for FlatMeasureOptions {
@@ -83,6 +100,8 @@ impl Default for FlatMeasureOptions {
             full_scale: 65535.0,
             feature_depth: 0.02,
             feature_sigma: 5.0,
+            large_features: true,
+            optics: None,
         }
     }
 }
@@ -103,31 +122,19 @@ impl FlatMeasureOptions {
         if !self.feature_sigma.is_finite() || self.feature_sigma < 0.0 {
             return Err(refused("feature_sigma must be finite and not negative"));
         }
+        if self.optics.is_some_and(|optics| !optics.is_usable()) {
+            return Err(refused(
+                "optics needs a positive focal ratio and pixel size and an obstruction below 1",
+            ));
+        }
         Ok(())
     }
 }
 
-/// One compact dip in a flat.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-pub struct FlatFeature {
-    /// Centroid column, in image pixels.
-    pub x: f32,
-    /// Centroid row, in image pixels.
-    pub y: f32,
-    /// First column the dip covers, in image pixels.
-    pub left: u32,
-    /// First row the dip covers.
-    pub top: u32,
-    /// Last column the dip covers.
-    pub right: u32,
-    /// Last row the dip covers.
-    pub bottom: u32,
-    /// Image pixels the dip covers below the detection depth.
-    pub pixels: u32,
-    /// The deepest point, as a fraction of the response around it: 0.1 means
-    /// a tenth less light.
-    pub depth: f32,
-}
+/// One dust feature of a flat: a compact or irregular dip, or a large disk,
+/// donut or patch. The definition is [`crate::dust::DustFeature`]'s, so a
+/// flat's spots and a comparison's agree.
+pub type FlatFeature = dust::DustFeature;
 
 /// A coarse map of how light falls across a flat: vignetting, gradients, and
 /// broad shadows.
@@ -145,8 +152,9 @@ pub struct IlluminationProfile {
 /// What [`measure_flat`] found in one flat frame.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FlatMeasurement {
-    /// [`FRAME_QUALITY_ALGORITHM_VERSION`] when this was measured.
-    #[serde(default = "frame_quality_algorithm_version")]
+    /// [`FLAT_QUALITY_ALGORITHM_VERSION`] when this was measured; 1 when
+    /// stored without one.
+    #[serde(default = "first_flat_quality_algorithm_version")]
     pub algorithm_version: u32,
     /// Image width in pixels.
     pub width: usize,
@@ -173,8 +181,13 @@ pub struct FlatMeasurement {
     pub illumination: IlluminationProfile,
     /// Features found, including any beyond the kept list.
     pub feature_count: usize,
-    /// The deepest features, at most 100,000, deepest first.
+    /// Large features (disks, donuts, patches) first, deepest first, then
+    /// compact and irregular dips, deepest first; at most 100,000.
     pub features: Vec<FlatFeature>,
+    /// Shadows hanging from the border that are not the image circle's own
+    /// fall-off: an off-axis guider's prism, a filter holder.
+    #[serde(default)]
+    pub vignetting: Vec<Vignetting>,
 }
 
 /// Measure one flat frame.
@@ -219,12 +232,63 @@ pub fn measure_flat(
         .max(options.feature_sigma * smoothed_noise);
     let runs = dip_runs(&plane, &background, detection_depth);
     let mut features = features_from_runs(&runs, plane.scale);
-    let feature_count = features.len();
+    // Lone pixels a little past the threshold are what noise leaves over
+    // many megapixels, and the border's outermost pixels are the median's
+    // edge: neither is dust.
+    let dust_options = DustOptions {
+        optics: options.optics,
+        ..DustOptions::default()
+    };
+    let lone_floor = dust::lone_dip_floor(
+        plane.width * plane.height,
+        smoothed_noise,
+        dust_options.false_dips,
+    );
+    let scale = plane.scale as u32;
+    let (edge_right, edge_bottom) = (
+        (plane.width as u32 * scale).saturating_sub(1 + 2 * scale),
+        (plane.height as u32 * scale).saturating_sub(1 + 2 * scale),
+    );
+    features.retain(|feature| {
+        let plane_pixels = feature.pixels / (scale * scale).max(1);
+        let on_edge = feature.left < 2 * scale
+            || feature.top < 2 * scale
+            || feature.right > edge_right
+            || feature.bottom > edge_bottom;
+        !on_edge && (plane_pixels > 4 || feature.depth >= lone_floor)
+    });
     features.sort_by(|a, b| b.depth.total_cmp(&a.depth));
+    let mut vignetting = Vec::new();
+    if options.large_features
+        && let Some(map) = large_dust(image, cfa, &dust_options)
+    {
+        // Compact and irregular dips are found pixel by pixel above; the
+        // binned plane adds what only it can see.
+        let mut large: Vec<FlatFeature> = map
+            .features
+            .into_iter()
+            .filter(|feature| feature.shape.is_large())
+            .collect();
+        large.sort_by(|a, b| b.depth.total_cmp(&a.depth));
+        // A round shadow deep enough for the pixel pass is found by both:
+        // the dip on a large feature's centre and of about its size is that
+        // feature again. Clearly smaller dips on it are dust of their own.
+        features.retain(|dip| {
+            !large.iter().any(|shadow| {
+                (dip.x - shadow.x).hypot(dip.y - shadow.y) <= 0.5 * shadow.radius
+                    && dip.radius * SAME_SHADOW_SIZE >= shadow.radius
+                    && dip.radius <= SAME_SHADOW_SIZE * shadow.radius
+            })
+        });
+        large.extend(features);
+        features = large;
+        vignetting = map.vignetting;
+    }
+    let feature_count = features.len();
     features.truncate(MAX_FEATURES);
 
     Ok(FlatMeasurement {
-        algorithm_version: FRAME_QUALITY_ALGORITHM_VERSION,
+        algorithm_version: FLAT_QUALITY_ALGORITHM_VERSION,
         width: image.width(),
         height: image.height(),
         full_scale: options.full_scale,
@@ -236,7 +300,23 @@ pub fn measure_flat(
         illumination,
         feature_count,
         features,
+        vignetting,
     })
+}
+
+/// The large features of one flat: the frame binned to about 1,024 pixels
+/// and searched as [`crate::dust::find_dust`] does.
+fn large_dust(
+    image: LinearImageRef<'_>,
+    cfa: bool,
+    options: &DustOptions,
+) -> Option<dust::DustMap> {
+    let (width, height) = (image.width(), image.height());
+    let bin = metric::bin_factor(width, height, cfa);
+    let plane = metric::bin_frame(image.data(), width, height, image.channels(), bin);
+    let mut map = dust::find_dust(&plane, bin, options)?;
+    map.frames = 1;
+    Some(map)
 }
 
 /// Limits for [`screen_flats`]. Each [`Limits`] says where a frame turns
@@ -258,6 +338,7 @@ pub struct FlatScreening {
     /// moved panel, or a rotated camera changes the pattern.
     pub illumination: Limits,
     /// Clear compact features in one frame, steady or not; higher is worse.
+    /// Disks and donuts are not counted: they are the light path's.
     /// A feature is clear when it is at least twice the frame's detection
     /// depth. Dust rarely comes near these counts, while a frame covered in
     /// droplets passes them. This catches droplets that do not change while
@@ -394,6 +475,7 @@ pub fn screen_flats(
             let clear = frame
                 .features
                 .iter()
+                .filter(|feature| !feature.shape.is_large())
                 .filter(|feature| {
                     f64::from(feature.depth) >= CLEAR_DEPTH * f64::from(frame.detection_depth)
                 })
@@ -1042,6 +1124,13 @@ fn features_from_runs(runs: &[Run], scale: usize) -> Vec<FlatFeature> {
     sums.into_values()
         .map(|sum| {
             let centre = |total: f64| ((total / sum.pixels as f64 + 0.5) * scale_f - 0.5) as f32;
+            let pixels = u32::try_from(sum.pixels * (scale * scale) as u64).unwrap_or(u32::MAX);
+            // Window dust is often not round: a dip filling less than half
+            // its box, or three times as long as it is wide, is irregular.
+            let (box_w, box_h) = (sum.right - sum.left + 1, sum.bottom - sum.top + 1);
+            let fill = sum.pixels as f64 / (box_w * box_h) as f64;
+            let aspect = box_w.max(box_h) as f64 / box_w.min(box_h) as f64;
+            let irregular = sum.pixels >= 6 && (fill < 0.5 || aspect >= 3.0);
             FlatFeature {
                 x: centre(sum.x),
                 y: centre(sum.y),
@@ -1049,8 +1138,17 @@ fn features_from_runs(runs: &[Run], scale: usize) -> Vec<FlatFeature> {
                 top: first(sum.top),
                 right: last(sum.right),
                 bottom: last(sum.bottom),
-                pixels: u32::try_from(sum.pixels * (scale * scale) as u64).unwrap_or(u32::MAX),
+                pixels,
                 depth: -sum.lowest,
+                shape: if irregular {
+                    DustShape::Irregular
+                } else {
+                    DustShape::Compact
+                },
+                radius: (pixels as f32 / std::f32::consts::PI).sqrt(),
+                hole: None,
+                distance_mm: None,
+                seen_in: None,
             }
         })
         .collect()
@@ -1110,6 +1208,7 @@ fn tally_features(frames: &[FlatMeasurement], screening: &FlatScreening) -> Feat
             measurement
                 .features
                 .iter()
+                .filter(|feature| !feature.shape.is_large())
                 .map(move |feature| (frame, *feature))
         })
         .collect();
@@ -1324,6 +1423,73 @@ mod tests {
     }
 
     #[test]
+    fn an_irregular_dip_is_reported_once() {
+        // Window dust 60 x 5 pixels, 10% deep: found pixel by pixel, and on
+        // the binned plane as an irregular dip too.
+        let mut data = flat(4);
+        for y in 120..125 {
+            for x in 150..210 {
+                data[y * WIDTH + x] *= 0.9;
+            }
+        }
+        let measurement = measure(&data);
+        let near: Vec<_> = measurement
+            .features
+            .iter()
+            .filter(|f| (f.x - 180.0).abs() < 10.0 && (f.y - 122.0).abs() < 10.0)
+            .collect();
+        assert_eq!(near.len(), 1, "{near:?}");
+        assert_eq!(measurement.feature_count, 1, "{:?}", measurement.features);
+    }
+
+    #[test]
+    fn a_deep_round_shadow_is_reported_once() {
+        // A round shadow deep enough for the pixel pass (8%, 24 px across)
+        // is also a disk on the binned plane.
+        let mut data = flat(4);
+        dip(&mut data, 150.0, 120.0, 12.0, 0.08);
+        let measurement = measure(&data);
+        let near: Vec<_> = measurement
+            .features
+            .iter()
+            .filter(|f| (f.x - 150.0).abs() < 12.0 && (f.y - 120.0).abs() < 12.0)
+            .collect();
+        assert_eq!(near.len(), 1, "{near:?}");
+    }
+
+    #[test]
+    fn a_wide_shallow_disk_is_reported_before_the_compact_dips() {
+        // Filter dust: 0.5% deep and 80 pixels across, far below the 2%
+        // compact threshold, beside a droplet.
+        let mut data = flat(4);
+        dip(&mut data, 150.0, 120.0, 40.0, 0.005);
+        dip(&mut data, 320.0, 60.0, 3.5, 0.5);
+        let measurement = measure(&data);
+        assert_eq!(measurement.feature_count, 2, "{:?}", measurement.features);
+        let disk = measurement.features[0];
+        assert!(disk.shape.is_large(), "{disk:?}");
+        assert!(
+            (disk.x - 150.0).abs() < 3.0 && (disk.radius - 40.0).abs() < 4.0,
+            "{:?}",
+            measurement.features
+        );
+        assert!(!measurement.features[1].shape.is_large());
+        // Screening counts only the droplet.
+        let report = screen_flats(&[measurement], &FlatScreening::default()).unwrap();
+        assert_eq!(report.frames[0].grade, Grade::Ok);
+        let compact_only = measure_flat(
+            LinearImageRef::new(&data, WIDTH, HEIGHT, 1).unwrap(),
+            false,
+            &FlatMeasureOptions {
+                large_features: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(compact_only.feature_count, 1);
+    }
+
+    #[test]
     fn a_cfa_frame_is_measured_on_its_2x2_sums() {
         // A Bayer flat: red and blue sites at half the green response.
         let mut data = flat(3);
@@ -1498,7 +1664,17 @@ mod tests {
             report.frames
         );
         assert_eq!(report.master.grade, Grade::Ok);
-        assert!(report.steady_features >= 3, "{report:?}");
+        // The wide round shadows are disks and donuts, reported once as large
+        // dust, which the light path holds and screening leaves alone; the
+        // speck is a steady dip.
+        assert!(
+            frames
+                .iter()
+                .all(|frame| frame.features.iter().filter(|f| f.shape.is_large()).count() >= 2),
+            "{:?}",
+            frames[0].features
+        );
+        assert!(report.steady_features >= 1, "{report:?}");
         assert_eq!(report.changing_features, 0);
     }
 

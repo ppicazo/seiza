@@ -151,7 +151,8 @@ impl PyIlluminationProfile {
     }
 }
 
-/// One compact dip in a flat, in image pixels.
+/// One dust feature of a flat, in image pixels: a compact or irregular dip,
+/// or an out-of-focus disk, donut or patch.
 #[pyclass(skip_from_py_object, frozen, name = "FlatFeature", module = "seiza")]
 pub(crate) struct PyFlatFeature {
     inner: FlatFeature,
@@ -192,13 +193,78 @@ impl PyFlatFeature {
     fn depth(&self) -> f32 {
         self.inner.depth
     }
+    /// ``"compact"``, ``"irregular"``, ``"disk"``, ``"donut"`` or ``"patch"``.
+    #[getter]
+    fn shape(&self) -> &'static str {
+        shape_name(self.inner.shape)
+    }
+    /// A disk's or donut's rim radius; a compact dip's, of a disc of the
+    /// same area.
+    #[getter]
+    fn radius(&self) -> f32 {
+        self.inner.radius
+    }
+    /// A donut's hole as a fraction of :attr:`radius`.
+    #[getter]
+    fn hole(&self) -> Option<f32> {
+        self.inner.hole
+    }
+    /// How far in front of the sensor the dust sits, in millimetres, when
+    /// the optics were given.
+    #[getter]
+    fn distance_mm(&self) -> Option<f32> {
+        self.inner.distance_mm
+    }
+    /// In how many of a session's flats it shows, and of how many, as
+    /// ``(frames, of)``: only for dust found on a session's stack.
+    #[getter]
+    fn seen_in(&self) -> Option<(u32, u32)> {
+        self.inner.seen_in.map(|seen| (seen.frames, seen.of))
+    }
 
     fn __repr__(&self) -> String {
         format!(
-            "FlatFeature(x={}, y={}, depth={})",
-            self.inner.x, self.inner.y, self.inner.depth
+            "FlatFeature(x={}, y={}, depth={}, shape={})",
+            self.inner.x,
+            self.inner.y,
+            self.inner.depth,
+            shape_name(self.inner.shape)
         )
     }
+}
+
+fn shape_name(shape: seiza_calibration::dust::DustShape) -> &'static str {
+    use seiza_calibration::dust::DustShape;
+    match shape {
+        DustShape::Compact => "compact",
+        DustShape::Irregular => "irregular",
+        DustShape::Disk => "disk",
+        DustShape::Donut => "donut",
+        DustShape::Patch => "patch",
+        _ => "unknown",
+    }
+}
+
+fn edge_name(edge: seiza_calibration::dust::Edge) -> &'static str {
+    use seiza_calibration::dust::Edge;
+    match edge {
+        Edge::Top => "top",
+        Edge::Bottom => "bottom",
+        Edge::Left => "left",
+        Edge::Right => "right",
+        Edge::TopLeft => "top_left",
+        Edge::TopRight => "top_right",
+        Edge::BottomLeft => "bottom_left",
+        Edge::BottomRight => "bottom_right",
+        _ => "unknown",
+    }
+}
+
+/// A value in a vignetting dict: the edge's name or a number.
+#[derive(IntoPyObject)]
+pub(crate) enum PyVignettingValue {
+    Text(&'static str),
+    Number(f32),
 }
 
 /// What :func:`measure_flat` found in one flat frame.
@@ -265,13 +331,31 @@ impl PyFlatMeasurement {
     fn feature_count(&self) -> usize {
         self.inner.feature_count
     }
-    /// The deepest features, deepest first.
+    /// Large features first, then compact dips; deepest first within each.
     #[getter]
     fn features(&self) -> Vec<PyFlatFeature> {
         self.inner
             .features
             .iter()
             .map(|&inner| PyFlatFeature { inner })
+            .collect()
+    }
+    /// Shadows hanging from the border, each a dict with ``edge``, ``x``,
+    /// ``y``, ``area`` and ``depth``.
+    #[getter]
+    fn vignetting(&self) -> Vec<std::collections::HashMap<&'static str, PyVignettingValue>> {
+        self.inner
+            .vignetting
+            .iter()
+            .map(|v| {
+                std::collections::HashMap::from([
+                    ("edge", PyVignettingValue::Text(edge_name(v.edge))),
+                    ("x", PyVignettingValue::Number(v.x)),
+                    ("y", PyVignettingValue::Number(v.y)),
+                    ("area", PyVignettingValue::Number(v.area)),
+                    ("depth", PyVignettingValue::Number(v.depth)),
+                ])
+            })
             .collect()
     }
 
@@ -439,8 +523,24 @@ fn measure_dark(
 }
 
 /// Measure one raw flat frame from a FITS or XISF file.
+///
+/// ``focal_ratio`` and ``pixel_size_um`` together, with an optional
+/// ``obstruction``, describe the light cone; any of them without both of the
+/// first two raises ``ValueError``.
 #[pyfunction]
-#[pyo3(signature = (path, *, cfa=None, full_scale=None, feature_depth=None, feature_sigma=None))]
+#[pyo3(signature = (
+    path,
+    *,
+    cfa=None,
+    full_scale=None,
+    feature_depth=None,
+    feature_sigma=None,
+    large_features=None,
+    focal_ratio=None,
+    pixel_size_um=None,
+    obstruction=None,
+))]
+#[allow(clippy::too_many_arguments)]
 fn measure_flat(
     py: Python<'_>,
     path: PathBuf,
@@ -448,6 +548,10 @@ fn measure_flat(
     full_scale: Option<f32>,
     feature_depth: Option<f32>,
     feature_sigma: Option<f32>,
+    large_features: Option<bool>,
+    focal_ratio: Option<f32>,
+    pixel_size_um: Option<f32>,
+    obstruction: Option<f32>,
 ) -> PyResult<PyFlatMeasurement> {
     let mut options = FlatMeasureOptions::default();
     if let Some(value) = full_scale {
@@ -459,6 +563,12 @@ fn measure_flat(
     if let Some(value) = feature_sigma {
         options.feature_sigma = value;
     }
+    if let Some(value) = large_features {
+        options.large_features = value;
+    }
+    options.optics =
+        seiza_calibration::dust::Optics::from_parts(focal_ratio, pixel_size_um, obstruction)
+            .map_err(value_error)?;
     let frame = open_frame(py, path)?;
     let cfa = cfa.unwrap_or(frame.bayer.is_some());
     let image = view(&frame)?;
