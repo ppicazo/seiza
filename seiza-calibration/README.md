@@ -131,6 +131,16 @@ window dust in front of a filter's disk is still seen.
   noise does not. `dust::frame_dust` splits one flat's view into the
   session's features it shows and transients (dew drying, a passing
   particle) that are not the light path's.
+- `dust::session_dust_from_lists` does the same without the flats: from a
+  stack the host kept and each flat's own features (as `measure_flat`
+  stored them), paired with `dust::match_features`. It keeps features by
+  the same rule as `find_session_dust`, and gives each flat's view, so a
+  host that keeps those reads no flat again for its session's dust. The
+  lists are in sensor pixels, found at any binning; `bin` is the stack's
+  alone. It needs two lists or more. Leave out a flat whose features are
+  unknown: an empty list is a flat that was looked at and holds no dust.
+  Its transients also leave out a flat's features that recur in 60% of the
+  other flats, which `frame_dust`, seeing one flat, cannot.
 - `dust::find_changes` compares two sessions: new, gone and moved dust,
   with dust that moved no further than focus travel explains
   (`DustOptions::move_tolerance`) marked as within tolerance rather than
