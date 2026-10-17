@@ -492,6 +492,10 @@ star detection, catalog access, solving, and result output are all included:
 - Compact u8 detection cut peak detector memory from **1.08 GiB to 543 MiB**
   on a 94 MP JPEG, and from **590 MiB to 179 MiB** on a 61 MP FITS frame.
 
+The [automated scientific corpus](regression/README.md) gates known-truth
+astrometry and calibrated stacking, checks pinned camera images, and records
+repeatable runtime and peak-memory measurements.
+
 ### Compared with ASTAP
 
 [ASTAP](https://www.hnsky.org/astap.htm) is a mature, highly regarded plate

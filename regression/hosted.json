@@ -1,0 +1,268 @@
+{
+  "schemaVersion": 1,
+  "assets": [
+    {
+      "path": "data/stars-lite-tycho2.bin",
+      "sha256": "9fdf3ce736cf6602ad676d3b50a673a25c0843358241c07ad617fcd05a6f1b1b",
+      "bytes": 25473888
+    },
+    {
+      "path": "testdata/m31-composite.jpg",
+      "sha256": "fd61662309be7a107bd67bbe9fd5f0b2fe29328fc2af20b734f7d073bca8cbbb",
+      "bytes": 6200055
+    },
+    {
+      "path": "testdata/wr134.jpg",
+      "sha256": "ef4310a9ba9d82dac1acaf0c37a0b3e73b38449e745102c2e857d3822d4cc11c",
+      "bytes": 13140920
+    },
+    {
+      "path": "testdata/sh2-101-tulip.jpg",
+      "sha256": "a9a763ef49ae63c6015a0d81e8c8c9b021cd5ede9dcef23a2b85600cceae45e1",
+      "bytes": 10565624
+    },
+    {
+      "path": "testdata/ic5070-ha-61mp-mono.fit",
+      "sha256": "ad0d45a4fb27d5e26abb1ccc2977b43f49b00d6b69fd6bf056f5a3151176b02f",
+      "bytes": 122351040
+    },
+    {
+      "path": "testdata/m31-asi585mc-rggb-osc.fits",
+      "sha256": "5d79850bfc6ae0c99fc43d85dcd3884285783180a5e090de9844d5a1e2624114",
+      "bytes": 16594560
+    }
+  ],
+  "cases": [
+    {
+      "id": "m31-composite.jpg-hinted",
+      "kind": "solve",
+      "catalog": "stars-lite-tycho2.bin",
+      "image": "m31-composite.jpg",
+      "params": {
+        "mode": "hinted",
+        "hint": {
+          "centerRaDeg": 10.61678,
+          "centerDecDeg": 41.29111,
+          "radiusDeg": 2.0,
+          "scaleArcsecPerPixel": 2.5818,
+          "scaleTolerance": 0.2
+        }
+      },
+      "expected": {
+        "center": [
+          10.61678,
+          41.29111
+        ],
+        "scale": 2.5818,
+        "maxCenterArcsec": 72.0,
+        "maxScaleRelativeError": 0.005,
+        "minMatches": 10,
+        "maxRmsArcsec": 5.0
+      }
+    },
+    {
+      "id": "m31-composite.jpg-blind",
+      "kind": "solve",
+      "catalog": "stars-lite-tycho2.bin",
+      "image": "m31-composite.jpg",
+      "params": {
+        "mode": "blind",
+        "blind": {
+          "minScaleArcsecPerPixel": 0.3,
+          "maxScaleArcsecPerPixel": 20.0
+        }
+      },
+      "expected": {
+        "center": [
+          10.61678,
+          41.29111
+        ],
+        "scale": 2.5818,
+        "maxCenterArcsec": 72.0,
+        "maxScaleRelativeError": 0.005,
+        "minMatches": 10,
+        "maxRmsArcsec": 5.0
+      }
+    },
+    {
+      "id": "wr134.jpg-hinted",
+      "kind": "solve",
+      "catalog": "stars-lite-tycho2.bin",
+      "image": "wr134.jpg",
+      "params": {
+        "mode": "hinted",
+        "hint": {
+          "centerRaDeg": 302.81594,
+          "centerDecDeg": 35.83233,
+          "radiusDeg": 2.0,
+          "scaleArcsecPerPixel": 2.5796,
+          "scaleTolerance": 0.2
+        }
+      },
+      "expected": {
+        "center": [
+          302.81594,
+          35.83233
+        ],
+        "scale": 2.5796,
+        "maxCenterArcsec": 72.0,
+        "maxScaleRelativeError": 0.005,
+        "minMatches": 10,
+        "maxRmsArcsec": 5.0
+      }
+    },
+    {
+      "id": "wr134.jpg-blind",
+      "kind": "solve",
+      "catalog": "stars-lite-tycho2.bin",
+      "image": "wr134.jpg",
+      "params": {
+        "mode": "blind",
+        "blind": {
+          "minScaleArcsecPerPixel": 0.3,
+          "maxScaleArcsecPerPixel": 20.0
+        }
+      },
+      "expected": {
+        "center": [
+          302.81594,
+          35.83233
+        ],
+        "scale": 2.5796,
+        "maxCenterArcsec": 72.0,
+        "maxScaleRelativeError": 0.005,
+        "minMatches": 10,
+        "maxRmsArcsec": 5.0
+      }
+    },
+    {
+      "id": "sh2-101-tulip.jpg-hinted",
+      "kind": "solve",
+      "catalog": "stars-lite-tycho2.bin",
+      "image": "sh2-101-tulip.jpg",
+      "params": {
+        "mode": "hinted",
+        "hint": {
+          "centerRaDeg": 300.06815,
+          "centerDecDeg": 35.45363,
+          "radiusDeg": 2.0,
+          "scaleArcsecPerPixel": 1.0288,
+          "scaleTolerance": 0.2
+        }
+      },
+      "expected": {
+        "center": [
+          300.06815,
+          35.45363
+        ],
+        "scale": 1.0288,
+        "maxCenterArcsec": 72.0,
+        "maxScaleRelativeError": 0.005,
+        "minMatches": 10,
+        "maxRmsArcsec": 5.0
+      }
+    },
+    {
+      "id": "sh2-101-tulip.jpg-blind",
+      "kind": "solve",
+      "catalog": "stars-lite-tycho2.bin",
+      "image": "sh2-101-tulip.jpg",
+      "params": {
+        "mode": "blind",
+        "blind": {
+          "minScaleArcsecPerPixel": 0.3,
+          "maxScaleArcsecPerPixel": 20.0
+        }
+      },
+      "expected": {
+        "center": [
+          300.06815,
+          35.45363
+        ],
+        "scale": 1.0288,
+        "maxCenterArcsec": 72.0,
+        "maxScaleRelativeError": 0.005,
+        "minMatches": 10,
+        "maxRmsArcsec": 5.0
+      }
+    },
+    {
+      "id": "ic5070-ha-61mp-mono.fit-hinted",
+      "kind": "solve",
+      "catalog": "stars-lite-tycho2.bin",
+      "image": "ic5070-ha-61mp-mono.fit",
+      "params": {
+        "mode": "hinted",
+        "hint": {
+          "centerRaDeg": 313.10989,
+          "centerDecDeg": 43.91495,
+          "radiusDeg": 2.0,
+          "scaleArcsecPerPixel": 1.2585,
+          "scaleTolerance": 0.2
+        }
+      },
+      "expected": {
+        "center": [
+          313.10989,
+          43.91495
+        ],
+        "scale": 1.2585,
+        "maxCenterArcsec": 72.0,
+        "maxScaleRelativeError": 0.005,
+        "minMatches": 10,
+        "maxRmsArcsec": 5.0
+      }
+    },
+    {
+      "id": "ic5070-ha-61mp-mono.fit-blind",
+      "kind": "solve",
+      "catalog": "stars-lite-tycho2.bin",
+      "image": "ic5070-ha-61mp-mono.fit",
+      "params": {
+        "mode": "blind",
+        "blind": {
+          "minScaleArcsecPerPixel": 0.3,
+          "maxScaleArcsecPerPixel": 20.0
+        }
+      },
+      "expected": {
+        "center": [
+          313.10989,
+          43.91495
+        ],
+        "scale": 1.2585,
+        "maxCenterArcsec": 72.0,
+        "maxScaleRelativeError": 0.005,
+        "minMatches": 10,
+        "maxRmsArcsec": 5.0
+      }
+    },
+    {
+      "id": "m31-asi585mc-rggb-osc.fits-hinted",
+      "kind": "solve",
+      "catalog": "stars-lite-tycho2.bin",
+      "image": "m31-asi585mc-rggb-osc.fits",
+      "params": {
+        "mode": "hinted",
+        "hint": {
+          "centerRaDeg": 10.66661,
+          "centerDecDeg": 41.26876,
+          "radiusDeg": 2.0,
+          "scaleArcsecPerPixel": 1.3581,
+          "scaleTolerance": 0.2
+        }
+      },
+      "expected": {
+        "center": [
+          10.66661,
+          41.26876
+        ],
+        "scale": 1.3581,
+        "maxCenterArcsec": 72.0,
+        "maxScaleRelativeError": 0.005,
+        "minMatches": 10,
+        "maxRmsArcsec": 5.0
+      }
+    }
+  ]
+}

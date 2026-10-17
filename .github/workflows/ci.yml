@@ -22,6 +22,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.2
       - run: cargo test --workspace --all-features
       - run: cargo build --workspace --release --all-features
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Test scientific regression gates
+        run: python -m unittest discover -s regression -p "test_*.py" -v
+      - name: Build regression fixture helper
+        run: cargo build -p seiza-cli --release --example regression_fixtures --locked
+      - name: Run offline scientific corpus
+        run: python regression/run.py --repeats 3 --output target/regression/offline.json
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: scientific-regression-${{ matrix.os }}
+          path: target/regression/offline.json
       - name: Verify Windows CRT is statically linked
         if: runner.os == 'Windows'
         shell: pwsh
@@ -117,3 +131,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.1
       - uses: Swatinem/rust-cache@v2.9.2
       - run: cargo test -p seiza-cli --release --test hosted_integration -- --ignored
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v5
+        with:
+          path: target/regression/hosted
+          key: scientific-corpus-v1-${{ hashFiles('regression/hosted.json') }}
+      - name: Build regression fixture helper
+        run: cargo build -p seiza-cli --release --example regression_fixtures --locked
+      - name: Run pinned camera-image corpus
+        run: python regression/run.py --hosted --download --repeats 3 --output target/regression/hosted.json
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: scientific-regression-hosted
+          path: target/regression/hosted.json
