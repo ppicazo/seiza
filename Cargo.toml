@@ -95,7 +95,16 @@ satkit = { version = "0.24.1", default-features = false }
 font8x8 = "0.3"
 
 # Tests run the image code over whole planes; unoptimised, seiza-calibration's
-# took 33 minutes of a CI runner's 4 cores, and 4 at this level. Debug info,
-# debug assertions and overflow checks stay on.
+# took 33 minutes of a CI runner's 4 cores, and 4 at this level. Debug
+# assertions and overflow checks stay on.
+#
+# Debug info is cut to line tables, and dependencies carry none: panics and
+# backtraces keep file and line, a debugger loses local variables. A full
+# debug build of the workspace was about 30 GB, and seiza-stacking's tests
+# 7.3 GB; with these settings they are 3.8 GB and build in 141 s, not 180 s.
 [profile.dev]
 opt-level = 1
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
