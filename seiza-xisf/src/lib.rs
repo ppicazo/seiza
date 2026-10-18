@@ -1,6 +1,6 @@
 //! Practical XISF 1.0 image reading and writing for Seiza.
 //!
-//! The reader follows XISF 1.0, Revision 1: monolithic files and local
+//! The reader follows XISF 1.0, Revision 2: monolithic files and local
 //! distributed units, attached, inline, embedded or external pixel blocks,
 //! planar or normal storage, and every standard codec, subblocks included.
 //! An image it cannot decode is unavailable on its own and leaves the rest of
@@ -153,9 +153,9 @@ pub struct CompressionInfo {
     pub codec: CompressionCodec,
     pub uncompressed_bytes: usize,
     pub shuffled_item_bytes: Option<usize>,
-    /// `(compressed, uncompressed)` byte lengths of each independently
-    /// compressed subblock, in storage order. Empty when the block was
-    /// compressed whole.
+    /// `(compressed, uncompressed)` byte lengths of each subblock, in
+    /// storage order. A subblock whose lengths are equal is stored
+    /// uncompressed. Empty when the block was compressed whole.
     pub subblocks: Vec<(u64, u64)>,
 }
 
@@ -2083,10 +2083,10 @@ fn decompress(
             ));
         }
         let decoded = decompress_subblock(compression.codec, &bytes, uncompressed);
-        // PixInsight stores a subblock as it is when compressing it would not
-        // shrink it, so a subblock exactly as long as its uncompressed data
-        // that does not decode is raw. Codec output of that length from
-        // another encoder still decodes first.
+        // Under Revision 2, a subblock as long as its data is stored
+        // uncompressed. Earlier encoders could write codec output of that
+        // length, so such a subblock is read decoded if it decodes to
+        // exactly its length, and copied as it is otherwise.
         match decoded {
             Ok(decoded) => raw.extend_from_slice(&decoded),
             Err(_) if compressed == uncompressed => raw.extend_from_slice(&bytes),
@@ -4165,6 +4165,233 @@ mod tests {
         );
         let image = from_bytes(&monolithic(xml, &[&stored])).unwrap();
         assert!(matches!(image.pixels, Pixels::U16(ref actual) if actual == &values));
+    }
+
+    /// Pseudo-random bytes, which no codec can shrink.
+    fn noise(bytes: usize, mut state: u32) -> Vec<u8> {
+        (0..bytes)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect()
+    }
+
+    fn compress_with(codec: CompressionCodec, bytes: &[u8]) -> Vec<u8> {
+        match codec {
+            CompressionCodec::Zlib => {
+                let mut encoder =
+                    flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+                encoder.write_all(bytes).unwrap();
+                encoder.finish().unwrap()
+            }
+            CompressionCodec::Lz4 | CompressionCodec::Lz4Hc => lz4_flex::block::compress(bytes),
+            CompressionCodec::Zstd => zstd::bulk::compress(bytes, 3).unwrap(),
+        }
+    }
+
+    const CODECS: [(CompressionCodec, &str); 3] = [
+        (CompressionCodec::Zlib, "zlib"),
+        (CompressionCodec::Lz4, "lz4"),
+        (CompressionCodec::Zstd, "zstd"),
+    ];
+
+    #[test]
+    fn a_compressed_subblock_longer_than_its_data_decodes() {
+        // Encoders that predate Revision 2 can compress data that does not
+        // shrink, and a decoder shall still decompress it.
+        let raw = noise(128, 0x9e37_79b9);
+        for (codec, name) in CODECS {
+            let first = compress_with(codec, &raw[..96]);
+            let second = compress_with(codec, &raw[96..]);
+            assert!(first.len() > 96 && second.len() > 32, "{name}");
+            let stored = [first.as_slice(), second.as_slice()].concat();
+            let xml = image_element(
+                0,
+                "16:8:1",
+                "UInt8",
+                stored.len(),
+                &format!(
+                    "compression=\"{name}:128\" subblocks=\"{},96:{},32\"",
+                    first.len(),
+                    second.len()
+                ),
+                "",
+            );
+            let image = from_bytes(&monolithic(xml, &[&stored])).unwrap();
+            assert!(
+                matches!(image.pixels, Pixels::U8(ref actual) if actual == &raw),
+                "{name}"
+            );
+
+            // A block without a subblocks attribute is one subblock.
+            let whole = compress_with(codec, &raw);
+            assert!(whole.len() > raw.len(), "{name}");
+            let xml = image_element(
+                0,
+                "16:8:1",
+                "UInt8",
+                whole.len(),
+                &format!("compression=\"{name}:128\""),
+                "",
+            );
+            let image = from_bytes(&monolithic(xml, &[&whole])).unwrap();
+            assert!(
+                matches!(image.pixels, Pixels::U8(ref actual) if actual == &raw),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_equal_length_subblock_of_codec_output_decodes() {
+        // Encoders that predate Revision 2 can write a compressed subblock
+        // exactly as long as its data. It decodes to that length, so it is
+        // read decoded, not copied.
+        for (codec, name) in CODECS {
+            let (raw, compressed) = (0..64)
+                .flat_map(|zeros| (1..64).map(move |noisy| (zeros, noisy)))
+                .map(|(zeros, noisy)| [vec![0_u8; zeros], noise(noisy, 0x2545_f491)].concat())
+                .map(|raw| {
+                    let compressed = compress_with(codec, &raw);
+                    (raw, compressed)
+                })
+                .find(|(raw, compressed)| raw.len() == compressed.len())
+                .unwrap_or_else(|| panic!("no {name} output as long as its input"));
+            assert_ne!(raw, compressed);
+            let tail = vec![7_u8; 64];
+            let tail_compressed = compress_with(codec, &tail);
+            let stored = [compressed.as_slice(), tail_compressed.as_slice()].concat();
+            let length = raw.len() + tail.len();
+            let xml = image_element(
+                0,
+                &format!("{length}:1:1"),
+                "UInt8",
+                stored.len(),
+                &format!(
+                    "compression=\"{name}:{length}\" subblocks=\"{0},{0}:{1},64\"",
+                    raw.len(),
+                    tail_compressed.len()
+                ),
+                "",
+            );
+            let image = from_bytes(&monolithic(xml, &[&stored])).unwrap();
+            let expected = [raw, tail].concat();
+            assert!(
+                matches!(image.pixels, Pixels::U8(ref actual) if actual == &expected),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_uncompressed_subblock_holds_shuffled_bytes_under_the_checksum() {
+        // Noisy low bytes and constant high bytes, as in a noisy image. The
+        // shuffle spans the whole block, so the first subblock holds every
+        // low byte, which the encoder stores uncompressed.
+        let low = noise(64, 0x1234_5678);
+        let values = low
+            .iter()
+            .map(|&byte| 0x0300 | u16::from(byte))
+            .collect::<Vec<_>>();
+        let raw = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let shuffled = shuffled(&raw, 2);
+        assert_eq!(&shuffled[..64], low.as_slice());
+        assert!(zstd::bulk::compress(&shuffled[..64], 3).unwrap().len() >= 64);
+        let high = zstd::bulk::compress(&shuffled[64..], 3).unwrap();
+        assert!(high.len() < 64);
+        let stored = [&shuffled[..64], high.as_slice()].concat();
+        // The checksum covers the data as stored, uncompressed subblock
+        // included.
+        let digest = lowercase_hex(<Sha1 as sha1::Digest>::digest(&stored).as_ref());
+        let element = |stored: &[u8]| {
+            image_element(
+                0,
+                "8:8:1",
+                "UInt16",
+                stored.len(),
+                &format!(
+                    "compression=\"zstd+sh:128:2\" subblocks=\"64,64:{},64\" checksum=\"sha1:{digest}\"",
+                    high.len()
+                ),
+                "",
+            )
+        };
+        let image = from_bytes(&monolithic(element(&stored), &[&stored])).unwrap();
+        assert!(matches!(image.pixels, Pixels::U16(ref actual) if actual == &values));
+
+        let mut corrupt = stored.clone();
+        corrupt[10] ^= 0x55;
+        assert!(matches!(
+            from_bytes(&monolithic(element(&corrupt), &[&corrupt])),
+            Err(XisfError::Malformed(message)) if message.contains("checksum mismatch")
+        ));
+    }
+
+    #[test]
+    fn a_block_stored_whole_at_its_uncompressed_length_is_raw() {
+        // Without a subblocks attribute the block is one subblock, which the
+        // encoder stores uncompressed, still shuffled.
+        let raw = noise(128, 0x0bad_cafe);
+        let values = raw
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        let stored = shuffled(&raw, 2);
+        for (_, name) in CODECS {
+            let xml = image_element(
+                0,
+                "8:8:1",
+                "UInt16",
+                stored.len(),
+                &format!("compression=\"{name}+sh:128:2\""),
+                "",
+            );
+            let image = from_bytes(&monolithic(xml, &[&stored])).unwrap();
+            assert!(
+                matches!(image.pixels, Pixels::U16(ref actual) if actual == &values),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_compressed_subblock_of_the_wrong_length_is_invalid() {
+        // Each subblock declares 50 and 78 bytes, so the totals agree, but
+        // the first decodes to one byte more or less than it declares.
+        let raw = (0..128_u8).map(|value| value / 8).collect::<Vec<_>>();
+        for (codec, name) in CODECS {
+            for split in [49, 51] {
+                let first = compress_with(codec, &raw[..split]);
+                let second = compress_with(codec, &raw[split..]);
+                assert_ne!(first.len(), 50, "{name}");
+                let stored = [first.as_slice(), second.as_slice()].concat();
+                let xml = image_element(
+                    0,
+                    "16:8:1",
+                    "UInt8",
+                    stored.len(),
+                    &format!(
+                        "compression=\"{name}:128\" subblocks=\"{},50:{},78\"",
+                        first.len(),
+                        second.len()
+                    ),
+                    "",
+                );
+                assert!(
+                    matches!(
+                        from_bytes(&monolithic(xml, &[&stored])),
+                        Err(XisfError::Malformed(_))
+                    ),
+                    "{name}, {split} bytes"
+                );
+            }
+        }
     }
 
     #[test]
