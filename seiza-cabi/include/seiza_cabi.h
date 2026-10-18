@@ -950,6 +950,50 @@ char *seiza_stack_choose_reference_json(const char *paths_json,
                                         char **error_out);
 
 /*
+ Learn a sensor's hot and dead pixels from its lights, as the CLI's
+ `--defects` does, for lights with no master dark to subtract them.
+
+ `paths_json` is a JSON array of FITS or XISF light paths. Up to
+ `maximum_frames` of them, evenly spaced, are read and calibrated with the
+ optional bias, dark and flat masters (`dark_exposure_seconds` as for
+ [`seiza_live_stacker_open_fits`]). A pixel is a defect when it stands out
+ from its same-colour neighbours, the same way, in most of those lights,
+ and its neighbours do not rise as a star's do; the lights must have
+ moved on the sensor, by dithering or drift, for a star to be told from a
+ defect. Pass null or empty `options_json` for the defaults; its fields
+ are `seiza_stacking::DefectDetectionOptions`'s: `"sigma"` (5),
+ `"persistence"` (0.6, the fraction of lights) and `"maximum_frames"` (16,
+ at least 3). A light that cannot be read or calibrated, or of another
+ size than the first, is passed over.
+
+ Returns owned schema-1 JSON whose `defects` holds `width`, `height`,
+ `frames` (the lights examined) and `pixels`, ascending raw-frame indices
+ `y * width + x`, and, when any pixel is a steady hot pixel, `excess`: one
+ value per pixel, its excess over its neighbours at `exposure_seconds`
+ (present when every light had an exposure), subtracted from each light
+ scaled to its own exposure, as a dark would subtract it, or zero where the
+ neighbours' median replaces the pixel. The map is empty when fewer than
+ three lights were examined.
+ Put it as it is under `"defects"` in the `options_json` of
+ [`seiza_live_stacker_open_fits`] or any other open, and every light the
+ stack calibrates has those pixels repaired from their same-colour
+ neighbours before debayering, registration and integration. Free the
+ JSON, or an `error_out` string on failure, with [`seiza_string_free`].
+
+ # Safety
+ `paths_json` must be a valid NUL-terminated string. Optional paths and
+ `options_json` may be null; when non-null they must be NUL-terminated.
+ When non-null, `error_out` must point to writable storage for one pointer.
+ */
+char *seiza_stack_detect_defects_json(const char *paths_json,
+                                      const char *bias_path,
+                                      const char *dark_path,
+                                      const char *flat_path,
+                                      double dark_exposure_seconds,
+                                      const char *options_json,
+                                      char **error_out);
+
+/*
  Opens a FITS or XISF reference and optional integrated bias, dark, and flat
  masters. A positive `dark_exposure_seconds` overrides the dark metadata; zero
  uses the metadata. Pass null or empty `options_json` for defaults; its

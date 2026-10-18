@@ -178,8 +178,96 @@ fn generate(dir: &Path) -> Result<()> {
         cases.push(json!({"id": if reintegrate {"calibrated-reintegrated"} else {"calibrated-stack"}, "kind": "stack",
             "args": ["stack", "light-0.fits", "light-1.fits", "light-2.fits", "--dark", "dark.fits", "--flat", "flat.fits",
                 "--reference", "first", "--normalization", "none", "--rejection", "none", "--weighting", "equal"],
-            "reintegrate": reintegrate, "expected": {"maxPixelRmse": 0.002, "maxFluxRelativeError": 0.01}}));
+            "reintegrate": reintegrate, "expected": {"acceptedFrames": 3, "maxPixelRmse": 0.002, "maxFluxRelativeError": 0.01}}));
     }
+    // Dithered lights with no dark to subtract the sensor's hot and dead
+    // pixels, which the stack must learn from the lights and repair. Drawn
+    // after everything above, so the other fixtures keep their bytes.
+    let shifts: [(i32, i32); 12] = [
+        (0, 0),
+        (3, -2),
+        (-4, 5),
+        (6, 1),
+        (-5, -3),
+        (2, 6),
+        (-1, -6),
+        (5, -5),
+        (-6, 2),
+        (4, 4),
+        (-3, -4),
+        (1, 3),
+    ];
+    // Each defect lands, frame by frame, at its sensor pixel less that
+    // frame's shift on the reference grid; keep every landing clear of the
+    // stars and the border, so the residual there measures repair alone.
+    let landings = |x: i32, y: i32| shifts.map(|(dx, dy)| (x - dx, y - dy));
+    let mut defects = Vec::new();
+    while defects.len() < 20 {
+        let (x, y) = (
+            (20.0 + random() * 344.0) as i32,
+            (20.0 + random() * 344.0) as i32,
+        );
+        let clear = landings(x, y).iter().all(|&(lx, ly)| {
+            (20..SIZE as i32 - 20).contains(&lx)
+                && (20..SIZE as i32 - 20).contains(&ly)
+                && stars
+                    .iter()
+                    .all(|&(sx, sy, _)| (f64::from(lx) - sx).hypot(f64::from(ly) - sy) > 10.0)
+        });
+        let apart = defects
+            .iter()
+            .all(|&(dx, dy, _): &(i32, i32, f32)| (dx - x).abs() > 3 || (dy - y).abs() > 3);
+        if clear && apart {
+            // Saturating, bright and moderate hot pixels, and a dead one.
+            let amplitude = [1.0, 0.3, 0.1, 0.05, -1.0][defects.len() % 5];
+            defects.push((x, y, amplitude));
+        }
+    }
+    let mut normal = || {
+        let (u, v) = (random().max(f64::MIN_POSITIVE), random());
+        (-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * v).cos()
+    };
+    let mut lights = Vec::new();
+    for (index, &(dx, dy)) in shifts.iter().enumerate() {
+        let mut light: Vec<_> = field(f64::from(dx), f64::from(dy))
+            .iter()
+            .map(|value| value + (0.001 * normal()) as f32)
+            .collect();
+        for &(x, y, amplitude) in &defects {
+            let pixel = &mut light[y as usize * SIZE + x as usize];
+            *pixel = if amplitude < 0.0 {
+                0.0
+            } else {
+                *pixel + amplitude
+            };
+        }
+        let name = format!("dithered-{index:02}.fits");
+        write(&dir.join(&name), &light, &[])?;
+        lights.push(name);
+    }
+    let probes: Vec<_> = defects
+        .iter()
+        .flat_map(|&(x, y, _)| landings(x, y))
+        .map(|(x, y)| json!([x, y]))
+        .collect();
+    std::fs::write(dir.join("defect-probes.json"), serde_json::to_vec(&probes)?)?;
+    let mut args = vec![json!("stack")];
+    args.extend(lights.iter().map(|name| json!(name)));
+    for flag in [
+        "--reference",
+        "first",
+        "--normalization",
+        "none",
+        "--rejection",
+        "none",
+        "--weighting",
+        "equal",
+    ] {
+        args.push(json!(flag));
+    }
+    cases.push(json!({"id": "dithered-no-dark", "kind": "stack", "args": args, "probes": "defect-probes.json",
+        "expected": {"acceptedFrames": shifts.len(), "maxPixelRmse": 0.002, "maxFluxRelativeError": 0.01,
+            "maxDefectResidual": 0.003}}));
     std::fs::write(
         dir.join("cases.json"),
         serde_json::to_vec_pretty(&json!({"schemaVersion": 1, "cases": cases}))?,
@@ -187,7 +275,10 @@ fn generate(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn check_stack(dir: &Path, output: &Path) -> Result<Value> {
+/// Compare a stack with the truth; with `probes`, a JSON array of `[x, y]`
+/// reference pixels, also report the largest difference within one pixel
+/// of any of them.
+fn check_stack(dir: &Path, output: &Path, probes: Option<&Path>) -> Result<Value> {
     let truth = seiza_image_io::open(&dir.join("truth.fits"))?;
     let actual = seiza_image_io::open(output)?;
     ensure!(
@@ -211,19 +302,42 @@ fn check_stack(dir: &Path, output: &Path) -> Result<Value> {
             actual_flux += a - 0.01;
         }
     }
-    Ok(
-        json!({"pixelRmse": (squared / f64::from(count)).sqrt(), "fluxRelativeError": (actual_flux / truth_flux - 1.0).abs()}),
-    )
+    let mut metrics = json!({"pixelRmse": (squared / f64::from(count)).sqrt(), "fluxRelativeError": (actual_flux / truth_flux - 1.0).abs()});
+    if let Some(probes) = probes {
+        let probes: Vec<(usize, usize)> = serde_json::from_slice(&std::fs::read(probes)?)?;
+        ensure!(!probes.is_empty(), "no defect probes");
+        let mut residual = 0.0_f64;
+        for (x, y) in probes {
+            ensure!(
+                (1..SIZE - 1).contains(&x) && (1..SIZE - 1).contains(&y),
+                "probe off the grid"
+            );
+            for py in y - 1..=y + 1 {
+                for px in x - 1..=x + 1 {
+                    let i = py * SIZE + px;
+                    let difference = f64::from(actual.samples[i]) - f64::from(truth.samples[i]);
+                    ensure!(difference.is_finite(), "nonfinite output pixel at a probe");
+                    residual = residual.max(difference.abs());
+                }
+            }
+        }
+        metrics["defectResidual"] = json!(residual);
+    }
+    Ok(metrics)
 }
 
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("generate") if args.len() == 3 => generate(Path::new(&args[2])),
-        Some("check-stack") if args.len() == 4 => {
-            println!("{}", check_stack(Path::new(&args[2]), Path::new(&args[3]))?);
+        Some("check-stack") if (4..=5).contains(&args.len()) => {
+            let probes = args.get(4).map(Path::new);
+            println!(
+                "{}",
+                check_stack(Path::new(&args[2]), Path::new(&args[3]), probes)?
+            );
             Ok(())
         }
-        _ => bail!("usage: regression_fixtures generate DIR | check-stack DIR OUTPUT"),
+        _ => bail!("usage: regression_fixtures generate DIR | check-stack DIR OUTPUT [PROBES]"),
     }
 }

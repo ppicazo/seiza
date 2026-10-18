@@ -45,6 +45,7 @@ spread across the frame.
 | Blank image and deterministic noise | Must return solve failure, not a match or timeout |
 | Shifted calibrated stack | Pixel RMSE <= 0.002 and background-subtracted flux error <= 1% |
 | Reintegrated calibrated stack | Same pixel and flux limits |
+| Dithered lights without a dark | Same pixel and flux limits, and within one pixel of every place a sensor defect landed, the stack within 0.003 of truth |
 
 The stack inputs contain a known additive dark and a spatially varying flat.
 Three lights have integer shifts and gains 0.9, 1.0 and 1.1 (mean 1.0); all three
@@ -53,6 +54,16 @@ weights are equal so neither can conceal a calibration or flux error. The pixel
 comparison excludes 12 boundary pixels to avoid intentionally uncovered samples;
 it checks dimensions, channel count and finite pixels as well. The thresholds
 are scientific acceptance limits, not exact floating-point output snapshots.
+
+The dithered case stacks twelve lights shifted by up to six pixels, with noise
+of 0.001 on a 0.01 sky and no dark, through the default `--defects auto`. The
+same 20 hot and dead pixels sit on the sensor in every light: saturating (+1.0),
+bright (+0.3, +0.1), moderate (+0.05) and dead. Each lands on the reference grid
+at its sensor pixel less its light's shift, clear of every star and the border;
+`defect-probes.json` lists those 240 places, and the gate takes the largest
+difference from the truth within one pixel of any. Rejection stays disabled, so
+only repair can keep a defect out: with `--defects off` the residual is about
+0.08, and the RMSE and flux gates fail too. All twelve lights must be admitted.
 
 The synthetic corpus is small and does not replace the real camera workload.
 It covers mono calibration/integration; it does not yet provide independent

@@ -166,6 +166,14 @@ pub struct StackOptions {
     /// master to subtract their hot pixels; `None` (the default) leaves
     /// frames untouched.
     pub cosmetic: Option<crate::cosmetic::ImpulseFilterOptions>,
+    /// Sensor defects repaired in each light after calibration and before
+    /// the cosmetic filter and debayering: what [`crate::detect_defects`]
+    /// learns from dithered lights whose calibration has no master dark to
+    /// subtract their hot pixels. A light of another size is left as it is.
+    /// The default, `None`, is not serialized, so existing options,
+    /// fingerprints and contexts keep their exact bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defects: Option<crate::DefectMap>,
     /// How much each admitted frame counts toward the mean. The default,
     /// [`FrameWeighting::Equal`], is not serialized, so existing options,
     /// fingerprints and contexts keep their exact bytes.
@@ -274,6 +282,9 @@ impl StackOptions {
                 "cosmetic filter sigmas must be positive finite numbers".into(),
             ));
         }
+        if let Some(defects) = &self.defects {
+            defects.validate()?;
+        }
         let acceptance = self.acceptance;
         if !acceptance.maximum_registration_rms_pixels.is_finite()
             || acceptance.maximum_registration_rms_pixels <= 0.0
@@ -293,6 +304,18 @@ impl StackOptions {
             return Err(Error::Stack("invalid frame acceptance criteria".into()));
         }
         crate::calibration::check_tolerances(&self.match_tolerances)?;
+        Ok(())
+    }
+
+    /// Repair a calibrated light's sensor defects, then filter its
+    /// impulses, as every light is before debayering.
+    pub(crate) fn repair(&self, frame: &mut FitsFrame) -> Result<()> {
+        if let Some(defects) = &self.defects {
+            defects.repair(&mut frame.image, frame.bayer, frame.exposure_seconds)?;
+        }
+        if let Some(filter) = &self.cosmetic {
+            crate::cosmetic::suppress_impulses(&mut frame.image, frame.bayer, filter)?;
+        }
         Ok(())
     }
 }
@@ -1389,10 +1412,7 @@ impl LiveStacker {
             };
             return Ok(self.reject(FrameRejectionReason::Calibration(message)));
         }
-        if let Some(filter) = &self.options.cosmetic
-            && let Err(error) =
-                crate::cosmetic::suppress_impulses(&mut frame.image, frame.bayer, filter)
-        {
+        if let Err(error) = self.options.repair(&mut frame) {
             return Ok(self.reject(FrameRejectionReason::Calibration(error.to_string())));
         }
         let (frame, cfa) = match frame.into_prepared_with_layout(self.options.demosaic) {
@@ -1784,9 +1804,7 @@ pub(crate) fn prepare_reference(
         reference.exposure_seconds,
         reference.bayer,
     )?;
-    if let Some(filter) = &options.cosmetic {
-        crate::cosmetic::suppress_impulses(&mut reference.image, reference.bayer, filter)?;
-    }
+    options.repair(&mut reference)?;
     reference.into_prepared_with_layout(options.demosaic)
 }
 
@@ -3957,6 +3975,130 @@ mod tests {
             snapshot.image.data[hot] < 200.0,
             "the defect must be gone from the integration: {}",
             snapshot.image.data[hot]
+        );
+    }
+
+    /// Dithered Bayer lights with no dark to subtract their hot photosites,
+    /// each brighter than any star: demosaiced, they look like stars that
+    /// never move. The learned map keeps them out of registration, which
+    /// then follows the stars, and out of the stack, the reference's
+    /// included, which online rejection never judges.
+    #[test]
+    fn a_defect_map_keeps_hot_photosites_out_of_registration_and_the_stack() {
+        let (width, height) = (160, 128);
+        let hot = [
+            (30, 40),
+            (95, 21),
+            (131, 77),
+            (48, 100),
+            (110, 111),
+            (70, 60),
+            (17, 90),
+            (140, 30),
+        ];
+        let shifts = [
+            (0.0, 0.0),
+            (4.0, -3.0),
+            (-3.0, 5.0),
+            (6.0, 2.0),
+            (-5.0, -4.0),
+            (2.0, 6.0),
+        ];
+        let directory = tempfile::tempdir().unwrap();
+        let bayer = [("BAYERPAT".to_string(), HeaderValue::String("RGGB".into()))];
+        let paths = shifts
+            .iter()
+            .enumerate()
+            .map(|(frame, &(dx, dy))| {
+                let mut image = bayer_star_field(width, height, dx, dy);
+                for (index, value) in image.data.iter_mut().enumerate() {
+                    let noise = (index as u64 * 2_654_435_761 + frame as u64 * 40_503) % 997;
+                    *value += noise as f32 / 997.0 * 8.0 - 4.0;
+                }
+                for &(x, y) in &hot {
+                    image.data[y * width + x] += 30_000.0;
+                }
+                let path = directory.path().join(format!("light-{frame}.fits"));
+                crate::write_processed_image_fits_f32(&path, &image, &bayer, &[]).unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        let map = crate::detect_defects(
+            &paths,
+            &CalibrationMasters::default(),
+            &crate::DefectDetectionOptions::default(),
+        )
+        .unwrap();
+        let mut expected = hot.map(|(x, y)| (y * width + x) as u32);
+        expected.sort_unstable();
+        assert_eq!(map.pixels(), expected);
+
+        let options = StackOptions {
+            defects: Some(map),
+            ..StackOptions::default()
+        };
+        let mut stacker =
+            LiveStacker::open_fits(&paths[0], None, None, None, None, options).unwrap();
+        for (path, &(dx, dy)) in paths[1..].iter().zip(&shifts[1..]) {
+            let FrameDisposition::Accepted(diagnostics) = stacker.push_fits(path).unwrap() else {
+                panic!("{} must be admitted", path.display());
+            };
+            let dither = f64::from(f32::hypot(dx, dy));
+            assert!(
+                (diagnostics.registration_drift_pixels - dither).abs() < 0.5,
+                "registered {} px off a {dither} px dither",
+                diagnostics.registration_drift_pixels
+            );
+        }
+        let snapshot = stacker.snapshot().unwrap();
+        for &(x, y) in &hot {
+            for channel in 0..3 {
+                let value = snapshot.image.data[(y * width + x) * 3 + channel];
+                assert!(value < 1_000.0, "({x}, {y}) channel {channel}: {value}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_defect_map_travels_in_the_options_and_the_context() {
+        let plain = serde_json::to_value(StackOptions::default()).unwrap();
+        assert!(plain.get("defects").is_none());
+        let map = crate::DefectMap::new(160, 128, vec![90 * 160 + 60]).unwrap();
+        let options = StackOptions {
+            defects: Some(map.clone()),
+            ..StackOptions::default()
+        };
+        let json = serde_json::to_string(&options).unwrap();
+        let parsed: StackOptions = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.defects.as_ref(), Some(&map));
+        let unordered = StackOptions {
+            defects: serde_json::from_str(r#"{"width":4,"height":4,"pixels":[3,1]}"#).unwrap(),
+            ..StackOptions::default()
+        };
+        assert!(unordered.validate().is_err());
+
+        let fingerprint = |options: StackOptions| {
+            stack_configuration_fingerprint(
+                &options,
+                &CalibrationMasters::default(),
+                FrameInputMode::CalibrateAndPrepare,
+            )
+            .unwrap()
+        };
+        assert_ne!(
+            fingerprint(options.clone()),
+            fingerprint(StackOptions::default())
+        );
+
+        let stacker = LiveStacker::from_linear(stacking_star_field(160, 128), options).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("defects.seiza-stack");
+        stacker.save_context(&path).unwrap();
+        let restored = LiveStacker::open_context(&path).unwrap();
+        assert_eq!(restored.options.defects, Some(map));
+        assert_eq!(
+            restored.configuration_fingerprint(),
+            stacker.configuration_fingerprint()
         );
     }
 

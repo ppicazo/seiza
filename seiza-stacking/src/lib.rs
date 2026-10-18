@@ -48,6 +48,7 @@ mod color_calibration;
 mod context;
 mod cosmetic;
 mod crop;
+mod defects;
 mod drizzle;
 mod expand;
 mod external;
@@ -92,6 +93,7 @@ pub use cosmetic::{ImpulseFilterOptions, suppress_impulses};
 pub use crop::{
     ChannelCoverage, ChannelSamples, ColorCrop, CropReport, covered_region, crop_report,
 };
+pub use defects::{DefectDetectionOptions, DefectMap, detect_defects};
 pub use drizzle::{DrizzleOptions, DrizzleResult};
 pub use external::{
     ExternalParameterKind, ExternalParameterValue, ExternalToolParameter, ExternalToolRequest,

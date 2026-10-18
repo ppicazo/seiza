@@ -538,6 +538,64 @@ small ones, or `Demosaic::Bilinear`, the fastest. The CLI takes
 `--demosaic vng|mhc|bilinear`, Python `StackOptions(demosaic=...)`, and the C
 API's options JSON `"demosaic": "vng" | "mhc" | "bilinear"`.
 
+## Sensor defects without a master dark
+
+A master dark subtracts a sensor's hot pixels. Without one, every light keeps
+them, and they do more harm than a few bright dots. Online rejection never
+judges a pixel's first few samples, so the reference's and the first frames'
+hot pixels reach the stack at their dithered positions; and demosaicing turns
+each hot photosite into a small coloured blob that star detection takes for a
+star. On a synthetic set of 20 dithered Bayer lights with 630 defects, those
+blobs pulled registration onto the sensor's fixed pattern (frames registered
+at 0.0px drift, half of them then refused at normalization).
+
+Dithering tells a defect from the sky: the sky moves across the sensor between
+frames, and a defect does not. `detect_defects` reads up to 16 of the lights,
+evenly spaced, calibrates them with the masters there are, and flags a pixel
+when it stands five sigma from the median of its same-colour neighbours, the
+same way, in 60% of them (`DefectDetectionOptions`), standing above all its
+neighbours but at most one, a partner in a pair. A star's core lands on any one
+pixel only in the frames the dither puts it there. A pixel whose surroundings
+rise above their own background in most of the frames that flagged it, as a
+star's do, is never flagged, even when the star sat still: on a raw colour
+frame, judged by the adjacent photosites of the other colours, which a tight
+star still lights where its own colour's neighbours, two pixels away, have
+faded. Fewer than three lights give an empty map.
+
+`StackOptions::defects` carries the `DefectMap`, raw-frame pixel indices; every
+light the stack calibrates, the reference and replayed frames included, has
+them repaired after calibration and before the cosmetic filter, debayering
+and registration. A steady hot pixel is repaired as a dark would repair it:
+the map holds its excess over its neighbours, the median across the lights
+that found it hot, at their median exposure, and each light has that,
+scaled to its own exposure, subtracted. A star the dither carries onto the
+pixel then keeps its core, where its neighbours' median would cut it (on ten
+180s O-III lights of an ASI2600MM, a star that sat on a warm pixel in three
+of them lost a fifth of its peak). A dead pixel, one whose excess wanders by
+more than its noise and a tenth, a light the subtraction would leave far
+below its neighbours, and every pixel of a map given as bare pixels take the
+median of their healthy same-colour neighbours instead. A light of another
+size is left as it is. The map is serialized in the options,
+so contexts keep it and it enters the configuration fingerprint; options
+without one keep their exact bytes. The CLI's `--defects auto` (the default)
+learns a map whenever no `--dark` is given, Python's `stack_fits` does the
+same, and `detect_defects` and the C API's `seiza_stack_detect_defects_json`
+give it on its own.
+
+On the 20-light synthetic sets, the pixels a defect left more than 0.02 off
+the defect-free stack fell from 807 to 6 (mono) and from 2 356 to 1 (Bayer),
+with every Bayer light registered; defect-free lights stacked bit for bit as
+before, and so did stars that never moved, down to mono stars 1.4px across and
+Bayer stars 2.2px. Only stars 1px across that never moved lost a little (14
+pixels moved by more than 0.002 of the sky, none by more than 0.02). On ten
+180s H-alpha lights from an ASI1600MM the map held 416 pixels and removed
+every isolated spike of 11 000 to 20 000 ADU over a 2 000 ADU sky that both
+the uncalibrated stack and the stack calibrated with a 180s master dark still
+held, reintegrated or not: the session dithered every third light, so three
+samples of each hot pixel coincided, too many for rejection to single out. On
+sixteen 300s lights of a 61 MP sensor the map held 86 000 pixels and took 4 s
+of the stack's 16 s.
+
 ## Normalization and frame-edge seams
 
 Global normalization gives each frame one gain and one offset per channel. A

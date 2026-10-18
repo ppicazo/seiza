@@ -55,6 +55,15 @@ enum DemosaicArg {
     Bilinear,
 }
 
+#[derive(Clone, Copy, PartialEq, ValueEnum)]
+enum DefectsArg {
+    /// Only without --dark, whose master subtracts them
+    Auto,
+    /// Also with --dark, for the defects its master leaves
+    On,
+    Off,
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum InterpolationArg {
     Bilinear,
@@ -104,6 +113,12 @@ pub(crate) struct StackArgs {
     /// Override master-dark exposure time in seconds
     #[arg(long, requires = "dark")]
     dark_exposure_seconds: Option<f64>,
+    /// Learn the sensor's hot and dead pixels from up to 16 of the lights
+    /// and repair them in every light before debayering and registration.
+    /// A defect stays on its pixel while the sky moves, so the lights must
+    /// be dithered or have drifted
+    #[arg(long, value_enum, default_value = "auto")]
+    defects: DefectsArg,
     /// Background normalization applied after registration
     #[arg(long, value_enum, default_value = "local-background")]
     normalization: NormalizationArg,
@@ -217,6 +232,12 @@ struct CalibrationReport {
 
 #[derive(Serialize)]
 struct ConfigurationReport {
+    /// Sensor defects learned from the lights and repaired in each, and the
+    /// lights they were learned from; present only when --defects looked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    defect_pixels: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    defect_frames: Option<u32>,
     /// Present only for --reference expand, so other reports are unchanged.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     expanded_canvas: bool,
@@ -540,6 +561,25 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
         }
         ordered.insert(0, chosen);
     }
+    // Without a master dark the lights keep their hot pixels: learn them
+    // from the lights themselves, beneath which the sky moves.
+    let mut defect_report = None;
+    if options.defects == DefectsArg::On
+        || (options.defects == DefectsArg::Auto && !calibration.has_dark())
+    {
+        let map = seiza_stacking::detect_defects(
+            &ordered,
+            &calibration,
+            &seiza_stacking::DefectDetectionOptions::default(),
+        )?;
+        println!(
+            "defects    {} sensor pixel(s) from {} light(s)",
+            map.len(),
+            map.frames()
+        );
+        defect_report = Some((map.len(), map.frames()));
+        stack_options.defects = (!map.is_empty()).then_some(map);
+    }
     let reference_path = options
         .reference_image
         .clone()
@@ -554,6 +594,8 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
         .effective_maximum_drift_pixels(reference.image.width, reference.image.height);
 
     let mut configuration_report = ConfigurationReport {
+        defect_pixels: defect_report.map(|(pixels, _)| pixels),
+        defect_frames: defect_report.map(|(_, frames)| frames),
         expanded_canvas: expand,
         maximum_canvas_samples: expand.then_some(maximum_samples),
         expanded_lens: None,

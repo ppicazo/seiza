@@ -161,6 +161,15 @@ exposes the **superset** of what both apps need.
   The options also set the colour range of the stars the fits use, their
   outlier rejection, the fewest stars a fit accepts and the faintest
   calibrator, and the result lists every star it measured.
+- **Sensor defects without a dark** — `seiza_stack_detect_defects_json`
+  learns a sensor's hot and dead pixels from a JSON array of dithered light
+  paths, calibrated with optional bias, dark and flat masters, as the CLI's
+  `--defects` does. Its schema-1 JSON holds `defects` (`width`, `height`,
+  `frames`, `pixels`) in the form the stack options take: put it under
+  `"defects"` in any open's `options_json`, and every light has those pixels
+  repaired from their same-colour neighbours before debayering and
+  registration. Options JSON (`sigma`, `persistence`, `maximum_frames`) is
+  optional.
 - **Automatic stack reference** — `seiza_stack_choose_reference_json` scores
   an ordered JSON array of FITS/XISF paths using the native stacking algorithm.
   It chooses the flattest background among frames with nearly the best star
