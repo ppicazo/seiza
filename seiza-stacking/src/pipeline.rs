@@ -1454,7 +1454,10 @@ mod tests {
             result
         }
         #[cfg(not(unix))]
-        work()
+        {
+            let _ = paths;
+            work()
+        }
     }
 
     pub(super) fn assert_same_stack(

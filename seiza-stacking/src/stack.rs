@@ -5062,10 +5062,12 @@ mod tests {
 mod weighting_tests {
     use super::*;
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     fn digest(values: &[f32]) -> String {
         let mut hasher = Sha256::new();
         for value in values {
