@@ -1,6 +1,8 @@
 # Binned stacking
 
-Status: proposed, for review. Nothing is implemented.
+Status: designed, decisions taken (see [Decisions](#decisions)). Nothing is
+implemented; implementation waits on two branches in flight (see
+[Sequencing](#sequencing)).
 
 ## Summary
 
@@ -584,30 +586,65 @@ registration's serial portion.
 3. **Phase 2**: superpixel with per-channel offsets in the resampler; native
    canvas refinement for mosaics (3.4).
 
-## Open questions
+### Sequencing
 
-1. **Ledger representation (§2.6)**: working grid plus factor, as
-   recommended, or native as the brief stated?
-2. **Promotion output**: only a `BatchStackResult`, or a new native
-   `LiveStacker` that can keep taking frames? The second needs a native
-   integrated reference and accumulator built from the replay.
-3. **Mosaic promotion**: are converted transforms with no refine acceptable
-   for phase 1? The measured worst case at b=4 on a canvas was 0.09 native
-   px on clean stars.
-4. **Lens fit at b=4**: should the lens pass run on the native anchor and
-   panel-start frames even when the canvas is binned? There are only a
-   handful of frames, and `MINIMUM_IMPROVEMENT_PIXELS ÷ 4` nears the
-   centroid noise.
-5. **Detection on undersampled stars**: is lowering `min_area` with `b`
-   enough, or should detection's elongation and area filters be bypassed
-   for b ≥ 3? This needs real data at FWHM ≈ 2 px.
-6. **C JSON naming**: `"bin_factor"`, matching `StackOptions`' serde, or a
-   camelCase alias per AGENTS.md?
-7. **Factor 3**: worth allowing? It is exact for mono and demosaic-then-bin,
-   and impossible for superpixel.
-8. **Expose `LinearImage::binned` to hosts** for their previews, or keep it
-   core-only with a `none` parity entry?
-9. **Self-describing mappings**: hosts keep each frame's mapping JSON from
-   its diagnostics (`seiza-cabi/src/lib.rs:627-629`). Should that JSON carry
-   an optional `bin_factor`, human-readable formats only as with `warp`, so
-   a mapping kept outside its stack still says which grid it is on?
+Two branches in flight touch the same code. Start after both land:
+
+- `claude/learned-defect-maps` changes all four preparation paths
+  (`pipeline.rs:902`, `replay.rs:2221`, `stack.rs:1415`, `stack.rs:1807` on that branch):
+  it replaces the cosmetic call with `StackOptions::repair`, and it adds
+  fields to `StackOptions`. Phase 0 done first would force that PR to
+  rebase onto a refactor of exactly its lines. Done after it, phase 0's
+  `prepare_light` becomes validate → `apply` → `repair` → debayer, and
+  phase 1 adds `bin` at the end.
+- The canvas-footprint work (`claude/canvas-footprint-integration-225ad0`)
+  bounds `prepare_frame`'s resample to each frame's footprint. Phase 1
+  changes the same function's gates and geometry. Its lossless saving
+  (205 → about 112 ms per frame on the measured canvas) also changes
+  binning's case for mosaics. After it lands, binning's per-frame gain on
+  a canvas is about 2×; the b² memory saving is unchanged.
+
+## Decisions
+
+Taken on the recommendations above; reopen any of them in review.
+
+1. **Ledger representation**: keep the working grid. `RegisteredFrameMapping`
+   stays on one grid, the stack records `bin_factor` in its options, and
+   `RegisteredFrameMapping::rebinned` derives native transforms (§2.6). The
+   brief's purpose, a full-resolution replay without searching for
+   transforms again, holds without a context format change.
+2. **Promotion output**: `reintegrate_full_resolution` returns a
+   `BatchStackResult`, as `reintegrate` does. A native `LiveStacker` that
+   keeps taking frames would need a native reference and accumulator built
+   from the replay. Leave it until someone asks.
+3. **Mosaic promotion in phase 1**: converted transforms, no refine. The
+   result reports the expected error, the binned stack's median
+   registration RMS × b, so a host can warn. The measured worst case was
+   0.09 native px at b=4 on clean stars. Native canvas refinement is
+   phase 2.
+4. **Lens fit**: whenever `b > 1`, the lens pass measures stars on the
+   native anchor and panel-start frames. There are only a handful of them
+   (about 90 ms each), and its thresholds then keep their native meaning.
+   The fitted distortion converts to the working grid by the inverse of
+   §2.3. This keeps `MINIMUM_IMPROVEMENT_PIXELS` out of centroid noise at
+   b=4.
+5. **C JSON naming**: `"bin_factor"`, as `StackOptions`' own serde spells
+   it beside `"match_tolerances"` and `"cfa_integration"`. No camelCase
+   alias: one spelling per key.
+6. **Factor 3**: allowed, range 1..=4. It costs nothing for mono or for
+   demosaic-then-bin. Superpixel, when it comes, accepts even factors only.
+7. **`LinearImage::binned` for hosts**: core-only in phase 1, with a `none`
+   parity entry. Hosts' previews already downsample in the C ABI
+   (`seiza-cabi/src/resample.rs:58,100`).
+8. **Self-describing mappings**: yes. The human-readable mapping JSON
+   carries an optional `bin_factor`, omitted at 1, as `warp` is omitted
+   when absent. Compact binary encodings keep their layout, and the stack's
+   options carry the factor there.
+
+## Still open
+
+1. **Detection on undersampled stars**: is lowering `min_area` with `b`
+   (§4) enough, or should detection's elongation and area filters be
+   bypassed for b ≥ 3? Settle it with real frames at FWHM ≈ 2 px before
+   phase 1 fixes the rule. The synthetic b=4 case lost a quarter of its
+   matches.
