@@ -161,15 +161,30 @@ exposes the **superset** of what both apps need.
   The options also set the colour range of the stars the fits use, their
   outlier rejection, the fewest stars a fit accepts and the faintest
   calibrator, and the result lists every star it measured.
+  `seiza_color_calibrate_image_json` places the Gaia stars itself, from rows
+  or the local catalog, through the image's WCS JSON, and applies the gains
+  in place; `seiza_color_calibrate_and_stretch_json` then display-stretches
+  the buffer with a stretch configuration. Neither fails when calibration
+  cannot run: the JSON outcome gives `status` `skipped` with a `reason`
+  (`no_solution`, `no_catalog`, `no_stars`, `too_few_stars`, `not_rgb`,
+  `invalid_options`, `fit_failed`) and leaves the pixels uncalibrated. Once
+  calibration has run, an `unlinked` stretch stage is linked instead and
+  listed in `linkedStages`. `gaia_json` overrides `catalog_path`.
+  `seiza_wcs_transform_json` carries a solved frame's WCS through a pixel
+  mapping (registration, a turn, drizzle or binning, a crop) to the image
+  made from it; the mapping counts pixels from 0 with centres on whole
+  numbers.
 - **Sensor defects without a dark** — `seiza_stack_detect_defects_json`
   learns a sensor's hot and dead pixels from a JSON array of dithered light
   paths, calibrated with optional bias, dark and flat masters, as the CLI's
   `--defects` does. Its schema-1 JSON holds `defects` (`width`, `height`,
-  `frames`, `pixels`) in the form the stack options take: put it under
+  `frames`, `pixels`, and for steady hot pixels `excess` at
+  `exposure_seconds`) in the form the stack options take: put it under
   `"defects"` in any open's `options_json`, and every light has those pixels
-  repaired from their same-colour neighbours before debayering and
-  registration. Options JSON (`sigma`, `persistence`, `maximum_frames`) is
-  optional.
+  repaired before debayering and registration, a steady hot pixel by
+  subtracting its excess scaled to the light's exposure, as a dark would,
+  and the rest from their same-colour neighbours' median. Options JSON
+  (`sigma`, `persistence`, `maximum_frames`) is optional.
 - **Automatic stack reference** — `seiza_stack_choose_reference_json` scores
   an ordered JSON array of FITS/XISF paths using the native stacking algorithm.
   It chooses the flattest background among frames with nearly the best star
