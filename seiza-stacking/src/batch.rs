@@ -1293,6 +1293,104 @@ mod tests {
         }
     }
 
+    /// [`MemoryBands`] whose frames each cover one region, and say so.
+    struct PlacedBands<'a> {
+        frames: &'a [LinearImage],
+        regions: Vec<Option<crate::ReferenceRegion>>,
+    }
+
+    impl BandSource for PlacedBands<'_> {
+        fn read(&self, index: usize, top: usize, band: &mut [f32]) -> Result<()> {
+            MemoryBands(self.frames).read(index, top, band)
+        }
+
+        fn region(&self, index: usize) -> Option<crate::ReferenceRegion> {
+            self.regions[index]
+        }
+    }
+
+    /// Frames that cover only part of the grid, as on an expanded canvas, and
+    /// say which part, integrate band by band as they do when every frame is
+    /// read whole: bands they do not reach are not read, and tiles they do
+    /// not reach, within one row or across several, leave them out, to the
+    /// bit, fates and all.
+    #[test]
+    fn band_passes_leave_out_frames_beyond_their_regions_to_the_bit() {
+        for (frames, options) in reference_cases() {
+            let image = &frames[0];
+            let (width, height, channels) = (image.width, image.height, image.channels);
+            // Regions of every shape, some a single row or column, one frame
+            // whole; samples beyond each are `NaN`.
+            let regions = (0..frames.len())
+                .map(|index| {
+                    (index % 4 != 3).then(|| {
+                        let x = (index * 7) % width;
+                        let y = (index * 3) % height;
+                        crate::ReferenceRegion {
+                            x,
+                            y,
+                            width: (1 + index * 11 % width).min(width - x),
+                            height: (1 + index * 5 % height).min(height - y),
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            let placed = frames
+                .iter()
+                .zip(&regions)
+                .map(|(frame, region)| {
+                    let mut frame = frame.clone();
+                    if let Some(region) = region {
+                        for (pixel, samples) in frame.data.chunks_exact_mut(channels).enumerate() {
+                            let (x, y) = (pixel % width, pixel / width);
+                            if !(region.x..region.x + region.width).contains(&x)
+                                || !(region.y..region.y + region.height).contains(&y)
+                            {
+                                samples.fill(f32::NAN);
+                            }
+                        }
+                    }
+                    frame
+                })
+                .collect::<Vec<_>>();
+            for rows in [1, 2, 7, height] {
+                let options = BatchStackOptions {
+                    band_memory_bytes: band_memory(&placed, rows),
+                    ..options.clone()
+                };
+                let (expected, expected_fates) = integrate_bands(
+                    (width, height, channels),
+                    placed.len(),
+                    &options,
+                    &MemoryBands(&placed),
+                    true,
+                    &mut |_, _| {},
+                )
+                .unwrap();
+                let (actual, fates) = integrate_bands(
+                    (width, height, channels),
+                    placed.len(),
+                    &options,
+                    &PlacedBands {
+                        frames: &placed,
+                        regions: regions.clone(),
+                    },
+                    true,
+                    &mut |_, _| {},
+                )
+                .unwrap();
+                let unpack = |fates: Option<Vec<PackedFates>>| {
+                    fates
+                        .unwrap()
+                        .iter()
+                        .map(PackedFates::to_vec)
+                        .collect::<Vec<_>>()
+                };
+                assert_same_result(&actual, &unpack(fates), &expected, &unpack(expected_fates));
+            }
+        }
+    }
+
     /// The bytes of band memory that give bands of `rows` rows.
     fn band_memory(frames: &[LinearImage], rows: usize) -> usize {
         let image = &frames[0];

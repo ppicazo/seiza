@@ -82,7 +82,19 @@ check. A lens-corrected
 canvas drops the original WCS, including SIP: plate-solve its output to obtain
 astrometry for the undistorted grid. Without lens correction, the anchor WCS
 is retained with its reference pixel shifted. Bayer drizzle and
-drizzled reintegration are refused. Saved contexts keep the panels, each
+drizzled reintegration are refused. Each frame is resampled, normalized and
+integrated over the bounding box of its own footprint on the canvas, not the
+whole canvas, which gives the same stack to the bit, so a frame costs about
+the same however many panels the canvas holds. (Only a lens distortion
+strong enough to fold back onto the frame far beyond it, where it was never
+measured, could have sampled the frame a second time there.) On a canvas of nine
+2048x1536 mono panels a frame took 23ms rather than 51, or 34 rather than 78
+normalized by local background; of nine 1536x1024 colour panels, 30 rather
+than 79, or 67 rather than 141. Reintegration likewise keeps, reads and
+integrates each frame over its footprint: on the nine mono panels, 14ms a
+frame from the frames kept rather than 31, and 25 rather than 79 from the
+sources (23 rather than 39, and 42 rather than 119, normalized by local
+background). Saved contexts keep the panels, each
 with the stars planning matched it by, and the lens, so a frame added after
 reopening registers exactly as it would have before saving; older readers
 reject them. A context saved before panels kept their stars still opens,

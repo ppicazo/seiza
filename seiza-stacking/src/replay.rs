@@ -17,6 +17,7 @@ use crate::CancelSignal;
 use crate::batch::PackedFates;
 use crate::calibration::LightGate;
 use crate::drizzle::{DrizzleAccumulator, DrizzleFrame, DrizzleOptions, DrizzleResult};
+use crate::image::{Placed, PlacedImage};
 use crate::normalization::{BackgroundSamples, RowCoefficients, RowNormalizer};
 use crate::{
     BatchStackOptions, BatchStackPass, BatchStackResult, CalibrationMasters, Error, FitsFrame,
@@ -446,12 +447,12 @@ impl Renormalizer {
         &self,
         admitted: &AdmittedFrame,
         index: usize,
-        interpolated: &LinearImage,
+        interpolated: Placed<'_>,
     ) -> Result<crate::NormalizationMap> {
         if let Some(map) = self.fitted(index) {
             return Ok(map);
         }
-        self.map_from_samples(admitted, index, &self.layout.of(interpolated)?)
+        self.map_from_samples(admitted, index, &self.layout.of_placed(interpolated)?)
     }
 
     /// [`Self::map_for`] from the frame's background samples alone.
@@ -481,6 +482,32 @@ impl Renormalizer {
             .unwrap_or_else(|poison| poison.into_inner())[index]
             .clone()
     }
+}
+
+/// Add each finite sample of `image` to its sample of `sum`, counting it in
+/// `count`, both of the grid `image` is placed on; only the region's rows
+/// are visited.
+fn accumulate(sum: &mut [f32], count: &mut [u16], image: Placed<'_>) {
+    let channels = image.channels();
+    let row = image.width * channels;
+    let (start, run) = (image.region.x * channels, image.region.width * channels);
+    let rows = image.region.y * row..(image.region.y + image.region.height) * row;
+    sum[rows.clone()]
+        .par_chunks_mut(row)
+        .zip(count[rows].par_chunks_mut(row))
+        .zip(image.image.data.par_chunks(run))
+        .for_each(|((sum, count), window)| {
+            for ((sum, count), &value) in sum[start..start + run]
+                .iter_mut()
+                .zip(&mut count[start..start + run])
+                .zip(window)
+            {
+                if value.is_finite() {
+                    *sum += value;
+                    *count += 1;
+                }
+            }
+        });
 }
 
 /// Each sample's mean from its sum and count, `NaN` where nothing counted.
@@ -577,7 +604,9 @@ pub(crate) fn keeps_zeros(options: &crate::StackOptions, cfa: Option<crate::Baye
 /// Each admitted frame's prepared image, registered but not normalized,
 /// kept in a scratch file so replay's passes and its integrated reference
 /// read it back instead of reading, calibrating, demosaicing and resampling
-/// the source again.
+/// the source again. On an expanded canvas a file holds only the region the
+/// frame's footprint reaches, and a band of rows it does not reach is not
+/// read.
 ///
 /// A replay makes one for itself and fills it as it first prepares each
 /// frame. A stack told to [`LiveStacker::retain_frames_for_reintegration`]
@@ -608,10 +637,11 @@ pub(crate) struct CacheFiles {
 #[derive(Clone, Copy, PartialEq)]
 enum CacheSlot {
     Empty,
-    /// The frame's image is kept, and its background samples when
-    /// `samples` says so.
+    /// The frame's image is kept over `region` of the reference grid, and
+    /// its background samples when `samples` says so.
     Stored {
         samples: bool,
+        region: ReferenceRegion,
     },
     Unavailable,
 }
@@ -622,6 +652,8 @@ enum CacheSlot {
 pub(crate) struct StagedFrame {
     path: Option<PathBuf>,
     samples: Option<PathBuf>,
+    /// The region of the reference grid the image holds.
+    region: ReferenceRegion,
 }
 
 impl StagedFrame {
@@ -641,7 +673,10 @@ impl StagedFrame {
             }
             kept
         });
-        CacheSlot::Stored { samples }
+        CacheSlot::Stored {
+            samples,
+            region: self.region,
+        }
     }
 }
 
@@ -668,8 +703,8 @@ impl CacheFiles {
     /// The samples of `fitted`, a frame's registered, unnormalized and
     /// interpolated image, that a background fit reads, when the stack
     /// keeps them.
-    pub(crate) fn background_samples(&self, fitted: &LinearImage) -> Option<Vec<f32>> {
-        self.background.as_ref()?.of(fitted).ok()
+    pub(crate) fn background_samples(&self, fitted: Placed<'_>) -> Option<Vec<f32>> {
+        self.background.as_ref()?.of_placed(fitted).ok()
     }
 
     /// Write a frame's registered, unnormalized image before its admission
@@ -678,7 +713,7 @@ impl CacheFiles {
     /// as they are (see [`keeps_zeros`]).
     pub(crate) fn stage(
         &self,
-        image: &LinearImage,
+        image: Placed<'_>,
         samples: Option<Vec<f32>>,
         keep_zeros: bool,
     ) -> Option<StagedFrame> {
@@ -694,8 +729,9 @@ impl CacheFiles {
         let mut frame = StagedFrame {
             path: Some(staged("f32")),
             samples: None,
+            region: image.region,
         };
-        FrameCache::write_image(frame.path.as_deref()?, image, keep_zeros).ok()?;
+        FrameCache::write_placed(frame.path.as_deref()?, image, keep_zeros).ok()?;
         if let Some(samples) = samples {
             let path = staged("samples");
             if FrameCache::write_samples(&path, &samples).is_ok() {
@@ -769,7 +805,16 @@ impl FrameCache {
 
     /// Whether frame `index`'s background samples are kept.
     fn sampled(&self, index: usize) -> bool {
-        self.slot(index) == CacheSlot::Stored { samples: true }
+        matches!(self.slot(index), CacheSlot::Stored { samples: true, .. })
+    }
+
+    /// The region of the reference grid frame `index`'s kept image holds,
+    /// if it is kept.
+    pub(crate) fn region(&self, index: usize) -> Option<ReferenceRegion> {
+        match self.slot(index) {
+            CacheSlot::Stored { region, .. } => Some(region),
+            _ => None,
+        }
     }
 
     /// Frame `index`'s background samples, read back, or `None` when they
@@ -817,8 +862,8 @@ impl FrameCache {
         &self,
         index: usize,
         buffer: Vec<f32>,
-        prepare: impl FnOnce() -> Result<LinearImage>,
-    ) -> Result<LinearImage> {
+        prepare: impl FnOnce() -> Result<PlacedImage>,
+    ) -> Result<PlacedImage> {
         {
             let mut slot = self.slots[index]
                 .lock()
@@ -835,18 +880,21 @@ impl FrameCache {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         if *slot == CacheSlot::Empty {
-            *slot = if Self::write(&self.path(index), &image).is_ok() {
+            *slot = if Self::write_placed(&self.path(index), image.view(), false).is_ok() {
                 let samples = self.files.background.as_ref().is_some_and(|layout| {
                     let path = self.files.samples_path(index);
                     let written = layout
-                        .of(&image)
+                        .of_placed(image.view())
                         .is_ok_and(|samples| Self::write_samples(&path, &samples).is_ok());
                     if !written {
                         let _ = std::fs::remove_file(path);
                     }
                     written
                 });
-                CacheSlot::Stored { samples }
+                CacheSlot::Stored {
+                    samples,
+                    region: image.region,
+                }
             } else {
                 let _ = std::fs::remove_file(self.path(index));
                 CacheSlot::Unavailable
@@ -863,15 +911,20 @@ impl FrameCache {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let stored = match *slot {
-            CacheSlot::Stored { samples: true } | CacheSlot::Unavailable => return,
-            CacheSlot::Stored { samples: false } => true,
-            CacheSlot::Empty => Self::write_image(&self.path(index), image, keep_zeros).is_ok(),
+            CacheSlot::Stored { samples: true, .. } | CacheSlot::Unavailable => return,
+            CacheSlot::Stored {
+                samples: false,
+                region,
+            } => Some(region),
+            CacheSlot::Empty => Self::write_image(&self.path(index), image, keep_zeros)
+                .is_ok()
+                .then(|| Placed::whole(image).region),
         };
-        if !stored {
+        let Some(region) = stored else {
             let _ = std::fs::remove_file(self.path(index));
             *slot = CacheSlot::Unavailable;
             return;
-        }
+        };
         let samples = samples.is_some_and(|samples| {
             let path = self.files.samples_path(index);
             let written = Self::write_samples(&path, samples).is_ok();
@@ -880,41 +933,53 @@ impl FrameCache {
             }
             written
         });
-        *slot = CacheSlot::Stored { samples };
+        *slot = CacheSlot::Stored { samples, region };
     }
 
-    /// Write `image` as replay keeps it: registered, and passed through the
-    /// identity normalization, which leaves every sample as it is except a
-    /// negative zero, which `mul_add(1, 0)` turns positive. The live pass
+    /// Write `image` as replay keeps it: the reference grid's width, height
+    /// and channels, the region of it the image holds (its origin and size),
+    /// and the region's samples, every sample beyond it being `NaN`. They are
+    /// registered, and passed through the identity normalization, which
+    /// leaves every sample as it is except a negative zero, which
+    /// `mul_add(1, 0)` turns positive, unless `keep_zeros`. The live pass
     /// writes its registered image before any normalization, so making the
     /// same change here keeps its files bit-identical to a replay's own.
-    fn write(path: &Path, image: &LinearImage) -> std::io::Result<()> {
-        Self::write_image(path, image, false)
-    }
-
-    /// [`Self::write`], or with every sample as it is when `keep_zeros`.
-    fn write_image(path: &Path, image: &LinearImage, keep_zeros: bool) -> std::io::Result<()> {
+    fn write_placed(path: &Path, image: Placed<'_>, keep_zeros: bool) -> std::io::Result<()> {
+        let region = image.region;
         Self::write_values(
             path,
-            &[image.width, image.height, image.channels],
-            &image.data,
+            &[
+                image.width,
+                image.height,
+                image.channels(),
+                region.x,
+                region.y,
+                region.width,
+                region.height,
+            ],
+            [image.image.data.as_slice()],
             keep_zeros,
         )
     }
 
-    /// Write a frame's background samples, changed as [`Self::write`]
+    /// [`Self::write_placed`] for an image of the whole grid.
+    fn write_image(path: &Path, image: &LinearImage, keep_zeros: bool) -> std::io::Result<()> {
+        Self::write_placed(path, Placed::whole(image), keep_zeros)
+    }
+
+    /// Write a frame's background samples, changed as [`Self::write_placed`]
     /// changes an image, since the fit reads them through the identity
     /// normalization.
     fn write_samples(path: &Path, samples: &[f32]) -> std::io::Result<()> {
-        Self::write_values(path, &[samples.len()], samples, false)
+        Self::write_values(path, &[samples.len()], [samples], false)
     }
 
-    /// Write `header`, then `values`, with negative zeros made positive
-    /// unless `keep_zeros`.
-    fn write_values(
+    /// Write `header`, then the samples of each of `runs` in turn, with
+    /// negative zeros made positive unless `keep_zeros`.
+    fn write_values<'a>(
         path: &Path,
         header: &[usize],
-        values: &[f32],
+        runs: impl IntoIterator<Item = &'a [f32]>,
         keep_zeros: bool,
     ) -> std::io::Result<()> {
         use std::io::Write;
@@ -923,36 +988,36 @@ impl FrameCache {
             file.write_all(&(dimension as u64).to_le_bytes())?;
         }
         let mut bytes = vec![0_u8; 1 << 20];
-        for chunk in values.chunks(bytes.len() / 4) {
-            for (&sample, out) in chunk.iter().zip(bytes.chunks_exact_mut(4)) {
-                let sample = if sample == 0.0 && !keep_zeros {
-                    0.0_f32
-                } else {
-                    sample
-                };
-                out.copy_from_slice(&sample.to_le_bytes());
+        for values in runs {
+            for chunk in values.chunks(bytes.len() / 4) {
+                for (&sample, out) in chunk.iter().zip(bytes.chunks_exact_mut(4)) {
+                    let sample = if sample == 0.0 && !keep_zeros {
+                        0.0_f32
+                    } else {
+                        sample
+                    };
+                    out.copy_from_slice(&sample.to_le_bytes());
+                }
+                file.write_all(&bytes[..chunk.len() * 4])?;
             }
-            file.write_all(&bytes[..chunk.len() * 4])?;
         }
         file.into_inner().map_err(|error| error.into_error())?;
         Ok(())
     }
 
-    /// Read an image [`Self::write`] wrote, a megabyte at a time, so reading
-    /// holds no second copy of it, into `buffer`: one of the same size is
-    /// reused as it is, saving the cost of mapping fresh memory.
-    fn read(path: &Path, buffer: Vec<f32>) -> Option<LinearImage> {
+    /// Read an image [`Self::write_placed`] wrote, a megabyte at a time, so
+    /// reading holds no second copy of it, into `buffer`: one of the same
+    /// size is reused as it is, saving the cost of mapping fresh memory.
+    fn read(path: &Path, buffer: Vec<f32>) -> Option<PlacedImage> {
         use std::io::Read;
         let mut file = std::fs::File::open(path).ok()?;
-        let mut header = [0_u8; 24];
+        let mut header = [0_u8; KEPT_HEADER_BYTES];
         file.read_exact(&mut header).ok()?;
-        let dimension = |at: usize| -> Option<usize> {
-            u64::from_le_bytes(header[at..at + 8].try_into().ok()?)
-                .try_into()
-                .ok()
-        };
-        let (width, height, channels) = (dimension(0)?, dimension(8)?, dimension(16)?);
-        let samples = width.checked_mul(height)?.checked_mul(channels)?;
+        let (width, height, channels, region) = kept_header(&header)?;
+        let samples = region
+            .width
+            .checked_mul(region.height)?
+            .checked_mul(channels)?;
         let length = u64::try_from(samples.checked_mul(4)?.checked_add(header.len())?).ok()?;
         if file.metadata().ok()?.len() != length {
             return None;
@@ -967,7 +1032,12 @@ impl FrameCache {
                 *sample = f32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
             }
         }
-        LinearImage::new(width, height, channels, data).ok()
+        Some(PlacedImage {
+            image: LinearImage::new(region.width, region.height, channels, data).ok()?,
+            region,
+            width,
+            height,
+        })
     }
 
     /// Read `count` samples [`Self::write_samples`] wrote.
@@ -991,15 +1061,16 @@ impl FrameCache {
     }
 
     /// Fill `band`, whole rows of an image of `shape`, with rows `top..`
-    /// of frame `index`'s file, normalizing them with `normalizer` as each
-    /// megabyte arrives, while it is still in the processor's cache.
+    /// of frame `index`'s file, normalizing them with `map` as each
+    /// megabyte arrives, while it is still in the processor's cache. Only
+    /// the region the file holds is read; the rest of the band is `NaN`.
     fn read_band(
         &self,
         index: usize,
         shape: (usize, usize, usize),
         top: usize,
         band: &mut [f32],
-        normalizer: &RowNormalizer<'_>,
+        map: &crate::NormalizationMap,
     ) -> Result<()> {
         use std::io::{Read, Seek};
         let path = self.path(index);
@@ -1012,43 +1083,95 @@ impl FrameCache {
         };
         let (width, height, channels) = shape;
         let row_samples = width * channels;
-        let row_bytes = row_samples * 4;
         let mut file = std::fs::File::open(&path).map_err(|error| failed(error.to_string()))?;
-        let mut header = [0_u8; 24];
+        let mut header = [0_u8; KEPT_HEADER_BYTES];
         file.read_exact(&mut header)
             .map_err(|error| failed(error.to_string()))?;
-        let dimension =
-            |at: usize| u64::from_le_bytes(header[at..at + 8].try_into().expect("eight bytes"));
         let length = file
             .metadata()
             .map_err(|error| failed(error.to_string()))?
             .len();
-        if [dimension(0), dimension(8), dimension(16)]
-            != [width as u64, height as u64, channels as u64]
-            || length != (header.len() + height * row_bytes) as u64
-            || !band.len().is_multiple_of(row_samples)
-            || top + band.len() / row_samples > height
-        {
+        let Some((region, run)) = kept_header(&header)
+            .filter(|&(w, h, c, _)| (w, h, c) == shape)
+            .map(|(_, _, _, region)| (region, region.width * channels))
+            .filter(|&(region, run)| {
+                length == (header.len() + region.height * run * 4) as u64
+                    && band.len().is_multiple_of(row_samples)
+                    && top + band.len() / row_samples <= height
+            })
+        else {
             return Err(failed("it does not match the stack's shape".into()));
+        };
+        let rows = band.len() / row_samples;
+        let (first, last) = (
+            top.max(region.y),
+            (top + rows).min(region.y + region.height),
+        );
+        if first >= last {
+            band.fill(f32::NAN);
+            return Ok(());
+        }
+        band[..(first - top) * row_samples].fill(f32::NAN);
+        band[(last - top) * row_samples..].fill(f32::NAN);
+        let start = region.x * channels;
+        if run < row_samples {
+            for row in band[(first - top) * row_samples..(last - top) * row_samples]
+                .chunks_exact_mut(row_samples)
+            {
+                row[..start].fill(f32::NAN);
+                row[start + run..].fill(f32::NAN);
+            }
         }
         file.seek(std::io::SeekFrom::Start(
-            (header.len() + top * row_bytes) as u64,
+            (header.len() + (first - region.y) * run * 4) as u64,
         ))
         .map_err(|error| failed(error.to_string()))?;
-        let rows_per_read = ((1 << 20) / row_bytes).max(1);
-        let mut bytes = vec![0_u8; rows_per_read * row_bytes];
+        let normalizer = RowNormalizer::new(map, region.x, region.width);
+        let rows_per_read = ((1 << 20) / (run * 4)).max(1);
+        let mut bytes = vec![0_u8; rows_per_read * run * 4];
         let mut coefficients = RowCoefficients::default();
-        for (read, rows) in band.chunks_mut(rows_per_read * row_samples).enumerate() {
-            let raw = &mut bytes[..rows.len() * 4];
+        for first_read in (first..last).step_by(rows_per_read) {
+            let count = rows_per_read.min(last - first_read);
+            let raw = &mut bytes[..count * run * 4];
             file.read_exact(raw)
                 .map_err(|error| failed(error.to_string()))?;
-            for (sample, raw) in rows.iter_mut().zip(raw.chunks_exact(4)) {
-                *sample = f32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+            for (offset, raw) in raw.chunks_exact(run * 4).enumerate() {
+                let row = first_read + offset;
+                let at = (row - top) * row_samples + start;
+                let samples = &mut band[at..at + run];
+                for (sample, raw) in samples.iter_mut().zip(raw.chunks_exact(4)) {
+                    *sample = f32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+                }
+                normalizer.apply(&mut coefficients, samples, row);
             }
-            normalizer.apply(&mut coefficients, rows, top + read * rows_per_read);
         }
         Ok(())
     }
+}
+
+/// The bytes of [`FrameCache::write_placed`]'s header: seven `u64`s.
+const KEPT_HEADER_BYTES: usize = 56;
+
+/// The grid's width, height and channels and the region a kept image's
+/// header gives, when the region lies on the grid.
+fn kept_header(header: &[u8; KEPT_HEADER_BYTES]) -> Option<(usize, usize, usize, ReferenceRegion)> {
+    let value = |at: usize| -> Option<usize> {
+        u64::from_le_bytes(header[at * 8..at * 8 + 8].try_into().ok()?)
+            .try_into()
+            .ok()
+    };
+    let (width, height, channels) = (value(0)?, value(1)?, value(2)?);
+    let region = ReferenceRegion {
+        x: value(3)?,
+        y: value(4)?,
+        width: value(5)?,
+        height: value(6)?,
+    };
+    (region.width > 0
+        && region.height > 0
+        && region.x.checked_add(region.width)? <= width
+        && region.y.checked_add(region.height)? <= height)
+        .then_some((width, height, channels, region))
 }
 
 /// What one reintegration shares between its steps.
@@ -1057,6 +1180,9 @@ struct Replay<'a> {
     options: &'a BatchStackOptions,
     masters: &'a MastersCache,
     renormalizer: Option<&'a Renormalizer>,
+    /// Whether frames prepared from their sources are resampled over their
+    /// footprints on an expanded canvas.
+    footprints: bool,
 }
 
 /// Each frame's band of rows from its scratch file, normalized as it is
@@ -1066,18 +1192,20 @@ struct CacheBands<'a> {
     shape: (usize, usize, usize),
     /// The admitted frame each band source index reads.
     frames: Vec<usize>,
-    normalizers: Vec<RowNormalizer<'a>>,
+    maps: &'a [crate::NormalizationMap],
 }
 
 impl crate::batch::BandSource for CacheBands<'_> {
     fn read(&self, index: usize, top: usize, band: &mut [f32]) -> Result<()> {
-        self.cache.read_band(
-            self.frames[index],
-            self.shape,
-            top,
-            band,
-            &self.normalizers[index],
-        )
+        self.cache
+            .read_band(self.frames[index], self.shape, top, band, &self.maps[index])
+    }
+
+    fn region(&self, index: usize) -> Option<ReferenceRegion> {
+        let (width, height, _) = self.shape;
+        self.cache
+            .region(self.frames[index])
+            .filter(|region| (region.width, region.height) != (width, height))
     }
 }
 
@@ -1168,7 +1296,7 @@ impl Replay<'_> {
                         stacker.source_unchanged(admitted)?;
                         let (kept, interpolated, keep_zeros) =
                             stacker.kept_frame(admitted, &masters)?;
-                        let samples = cache.files.background_samples(&interpolated);
+                        let samples = cache.files.background_samples(Placed::whole(&interpolated));
                         if let (Some(renormalizer), Some(samples)) = (self.renormalizer, &samples) {
                             renormalizer.map_from_samples(admitted, index, samples)?;
                         }
@@ -1180,15 +1308,21 @@ impl Replay<'_> {
                         .unwrap_or_else(|poison| poison.into_inner())
                         .pop()
                         .unwrap_or_default();
-                    let image =
-                        stacker.prepared_into(index, admitted, &masters, Some(cache), buffer)?;
+                    let image = stacker.prepared_into(
+                        index,
+                        admitted,
+                        &masters,
+                        Some(cache),
+                        buffer,
+                        self.footprints,
+                    )?;
                     if let Some(renormalizer) = self.renormalizer {
-                        renormalizer.map_for(admitted, index, &image)?;
+                        renormalizer.map_for(admitted, index, image.view())?;
                     }
                     buffers
                         .lock()
                         .unwrap_or_else(|poison| poison.into_inner())
-                        .push(image.data);
+                        .push(image.image.data);
                     Ok::<_, Error>(())
                 };
                 let mut pending = pending.into_iter();
@@ -1238,10 +1372,7 @@ impl Replay<'_> {
             cache,
             shape: (reference.width, reference.height, reference.channels),
             frames: (0..count).collect(),
-            normalizers: maps
-                .iter()
-                .map(|map| RowNormalizer::new(map, 0, reference.width))
-                .collect(),
+            maps: &maps,
         };
         // The frame indices are spread over the bands, and the drizzle's
         // frames, so that they follow the work done.
@@ -1397,8 +1528,14 @@ impl Replay<'_> {
                 let prepare = |pass: BatchStackPass, index: usize| {
                     let frame = &ledger.frames[index];
                     let masters = masters.get(stacker, frame.calibration)?;
-                    let image =
-                        stacker.replay_frame(frame, &masters, index, renormalizer, cache)?;
+                    let image = stacker.replay_frame(
+                        frame,
+                        &masters,
+                        index,
+                        renormalizer,
+                        cache,
+                        self.footprints,
+                    )?;
                     let source = if drizzle.is_some() && pass == BatchStackPass::Integrate {
                         Some(stacker.read_calibrated(frame, &masters)?)
                     } else {
@@ -1651,7 +1788,12 @@ impl LiveStacker {
         let reference = &self.ledger.frames[0];
         if self.options.cfa_integration != crate::CfaIntegration::BayerDrizzle {
             cache.get_or_prepare(0, Vec::new(), || {
-                self.register_unnormalized(reference, &self.reference, self.options.interpolation)
+                self.register_unnormalized(
+                    reference,
+                    &self.reference,
+                    self.options.interpolation,
+                    false,
+                )
             })?;
         } else if let Some(layout) = self.reference_cfa {
             let (kept, interpolated) =
@@ -1659,7 +1801,10 @@ impl LiveStacker {
             cache.keep(
                 0,
                 &kept,
-                cache.files.background_samples(&interpolated).as_deref(),
+                cache
+                    .files
+                    .background_samples(Placed::whole(&interpolated))
+                    .as_deref(),
                 keeps_zeros(&self.options, Some(layout)),
             );
         }
@@ -1865,9 +2010,13 @@ impl LiveStacker {
             .ok();
             own_cache.as_ref()
         };
+        // A frame prepared again from its source is resampled over its
+        // footprint on an expanded canvas, as the live pass resampled it.
+        let footprints = self.canvas_registrar.is_some() && !crate::stack::resamples_whole_canvas();
         let renormalizer = match self.background_samples() {
             Some(layout) => Some(Renormalizer {
-                reference: self.normalization_reference(&layout, &masters, cache, options)?,
+                reference: self
+                    .normalization_reference(&layout, &masters, cache, options, footprints)?,
                 layout,
                 maps: std::sync::Mutex::new(vec![None; count]),
             }),
@@ -1878,6 +2027,7 @@ impl LiveStacker {
             options,
             masters: &masters,
             renormalizer: renormalizer.as_ref(),
+            footprints,
         };
         let banded_result = match cache.filter(|_| banded) {
             Some(cache) => replay.bands(cache, drizzle, &mut progress)?,
@@ -1916,6 +2066,7 @@ impl LiveStacker {
         masters: &MastersCache,
         cache: Option<&FrameCache>,
         options: &BatchStackOptions,
+        footprints: bool,
     ) -> Result<Vec<f32>> {
         let frames = &self.ledger.frames;
         // Higher is better: the recorded weight, or else the inverse of the
@@ -1936,7 +2087,9 @@ impl LiveStacker {
         {
             return Ok(reference);
         }
-        layout.of(&self.normalization_reference_image(&ranked, masters, cache, options)?)
+        layout
+            .of(&self
+                .normalization_reference_image(&ranked, masters, cache, options, footprints)?)
     }
 
     /// [`Self::normalization_reference`] at the samples of `layout` alone,
@@ -1985,6 +2138,7 @@ impl LiveStacker {
         masters: &MastersCache,
         cache: Option<&FrameCache>,
         options: &BatchStackOptions,
+        footprints: bool,
     ) -> Result<LinearImage> {
         let frames = &self.ledger.frames;
         let ranked = ranked.to_vec();
@@ -2011,10 +2165,7 @@ impl LiveStacker {
                 cache,
                 shape,
                 frames: ranked.clone(),
-                normalizers: maps
-                    .iter()
-                    .map(|map| RowNormalizer::new(map, 0, reference.width))
-                    .collect(),
+                maps: &maps,
             };
             const CHUNK: usize = 1 << 14;
             crate::batch::for_each_band(
@@ -2024,15 +2175,19 @@ impl LiveStacker {
                 &source,
                 options.cancel.as_ref(),
                 |_, top, frames| {
+                    // A frame that does not reach the band is not read.
+                    let Some(len) = frames.iter().map(|frame| frame.len()).max() else {
+                        return Ok(());
+                    };
                     let start = top * reference.width * reference.channels;
-                    let end = start + frames[0].len();
+                    let end = start + len;
                     sum[start..end]
                         .par_chunks_mut(CHUNK)
                         .zip(count[start..end].par_chunks_mut(CHUNK))
                         .enumerate()
                         .for_each(|(chunk, (sum, count))| {
                             let (at, len) = (chunk * CHUNK, sum.len());
-                            for frame in frames {
+                            for frame in frames.iter().filter(|frame| !frame.is_empty()) {
                                 for ((sum, count), &value) in sum
                                     .iter_mut()
                                     .zip(count.iter_mut())
@@ -2058,14 +2213,14 @@ impl LiveStacker {
         let prepare = |index: usize| {
             let admitted = &frames[index];
             let masters = masters.get(self, admitted.calibration)?;
-            let mut image = self.prepared(index, admitted, &masters, cache)?;
+            let mut image = self.prepared(index, admitted, &masters, cache, footprints)?;
             // The frame's recorded gain and mean offset: its background stays
             // its own, while its stars match the reference's.
             admitted
                 .mapping
                 .normalization()
                 .global_equivalent()
-                .apply_global(&mut image)?;
+                .apply_global(&mut image.image)?;
             Ok::<_, Error>(image)
         };
         // The next frames are read, or prepared, on threads of their own
@@ -2090,15 +2245,7 @@ impl LiveStacker {
                         return Ok::<_, Error>(());
                     };
                     let image = ahead.join(handle)?;
-                    sum.par_iter_mut()
-                        .zip(count.par_iter_mut())
-                        .zip(image.data.par_iter())
-                        .for_each(|((sum, count), &value)| {
-                            if value.is_finite() {
-                                *sum += value;
-                                *count += 1;
-                            }
-                        });
+                    accumulate(&mut sum, &mut count, image.view());
                 }
             })
         })?;
@@ -2136,8 +2283,9 @@ impl LiveStacker {
         prepared: &LinearImage,
         cfa: Option<crate::BayerLayout>,
     ) -> Result<(LinearImage, LinearImage)> {
-        let interpolated =
-            self.register_unnormalized(admitted, prepared, self.options.interpolation)?;
+        let interpolated = self
+            .register_unnormalized(admitted, prepared, self.options.interpolation, false)?
+            .image;
         let region = self.full_region(admitted);
         let kept = match cfa {
             Some(layout) => admitted.mapping.resample_region(
@@ -2157,30 +2305,47 @@ impl LiveStacker {
 
     /// Read, calibrate and prepare an admitted frame's source and carry it
     /// onto the reference grid through its recorded registration, without
-    /// any normalization.
+    /// any normalization, over its footprint when `footprints`.
     fn replay_frame_unnormalized(
         &self,
         admitted: &AdmittedFrame,
         masters: &CalibrationMasters,
         interpolation: crate::Interpolation,
-    ) -> Result<LinearImage> {
+        footprints: bool,
+    ) -> Result<PlacedImage> {
         let (frame, _) = self.read_admitted(admitted, masters)?;
-        self.register_unnormalized(admitted, &frame.image, interpolation)
+        self.register_unnormalized(admitted, &frame.image, interpolation, footprints)
     }
 
     /// Carry an admitted frame's prepared source onto the reference grid
     /// through its recorded registration, applying the identity in place of
-    /// its normalization.
+    /// its normalization: over the region its footprint reaches when
+    /// `footprints`, and otherwise over the whole grid. Every sample beyond
+    /// the footprint resamples to `NaN` either way.
     fn register_unnormalized(
         &self,
         admitted: &AdmittedFrame,
         prepared: &LinearImage,
         interpolation: crate::Interpolation,
-    ) -> Result<LinearImage> {
+        footprints: bool,
+    ) -> Result<PlacedImage> {
         let identity = admitted
             .mapping
             .with_normalization(crate::NormalizationMap::identity(&self.reference))?;
-        identity.extract_region_with(prepared, self.full_region(admitted), interpolation)
+        if !footprints {
+            return Ok(PlacedImage::whole(identity.extract_region_with(
+                prepared,
+                self.full_region(admitted),
+                interpolation,
+            )?));
+        }
+        let region = admitted.mapping.footprint(prepared.width, prepared.height);
+        Ok(PlacedImage {
+            image: identity.extract_region_with(prepared, region, interpolation)?,
+            region,
+            width: admitted.mapping.reference_width(),
+            height: admitted.mapping.reference_height(),
+        })
     }
 
     fn full_region(&self, admitted: &AdmittedFrame) -> ReferenceRegion {
@@ -2249,11 +2414,13 @@ impl LiveStacker {
         admitted: &AdmittedFrame,
         masters: &CalibrationMasters,
         cache: Option<&FrameCache>,
-    ) -> Result<LinearImage> {
-        self.prepared_into(index, admitted, masters, cache, Vec::new())
+        footprints: bool,
+    ) -> Result<PlacedImage> {
+        self.prepared_into(index, admitted, masters, cache, Vec::new(), footprints)
     }
 
-    /// [`Self::prepared`], reading a cached frame into `buffer`.
+    /// [`Self::prepared`], reading a cached frame into `buffer`. A frame
+    /// made again is made over its footprint when `footprints`.
     fn prepared_into(
         &self,
         index: usize,
@@ -2261,8 +2428,16 @@ impl LiveStacker {
         masters: &CalibrationMasters,
         cache: Option<&FrameCache>,
         buffer: Vec<f32>,
-    ) -> Result<LinearImage> {
-        let make = || self.replay_frame_unnormalized(admitted, masters, self.options.interpolation);
+        footprints: bool,
+    ) -> Result<PlacedImage> {
+        let make = || {
+            self.replay_frame_unnormalized(
+                admitted,
+                masters,
+                self.options.interpolation,
+                footprints,
+            )
+        };
         match cache {
             Some(cache) => {
                 self.source_unchanged(admitted)?;
@@ -2311,6 +2486,7 @@ impl LiveStacker {
         index: usize,
         renormalizer: Option<&Renormalizer>,
         cache: Option<&FrameCache>,
+        footprints: bool,
     ) -> Result<LinearImage> {
         if self.options.cfa_integration == crate::CfaIntegration::BayerDrizzle {
             if let Some(renormalizer) = renormalizer {
@@ -2331,14 +2507,14 @@ impl LiveStacker {
                 ),
             };
         }
-        let mut image = self.prepared(index, admitted, masters, cache)?;
-        match renormalizer {
-            Some(renormalizer) => renormalizer
-                .map_for(admitted, index, &image)?
-                .apply(&mut image)?,
-            None => admitted.mapping.normalization().apply(&mut image)?,
-        }
-        Ok(image)
+        let mut placed = self.prepared(index, admitted, masters, cache, footprints)?;
+        let map = match renormalizer {
+            Some(renormalizer) => renormalizer.map_for(admitted, index, placed.view())?,
+            None => admitted.mapping.normalization().clone(),
+        };
+        let region = placed.region;
+        map.apply_region(&mut placed.image, region.x, region.y)?;
+        placed.into_grid()
     }
 
     /// [`Self::replay_frame`] with the frame's background offsets fitted
@@ -2359,7 +2535,7 @@ impl LiveStacker {
             .with_normalization(crate::NormalizationMap::identity(&self.reference))?;
         let mut interpolated =
             identity.extract_region_with(&frame.image, region, self.options.interpolation)?;
-        let map = renormalizer.map_for(admitted, index, &interpolated)?;
+        let map = renormalizer.map_for(admitted, index, Placed::whole(&interpolated))?;
         match cfa.filter(|_| self.options.cfa_integration == crate::CfaIntegration::BayerDrizzle) {
             Some(layout) => admitted
                 .mapping
@@ -2411,7 +2587,11 @@ mod tests {
         let (staging, mut admissions) = cache.split();
         let stage = || {
             staging
-                .stage(&image, staging.background_samples(&image), false)
+                .stage(
+                    Placed::whole(&image),
+                    staging.background_samples(Placed::whole(&image)),
+                    false,
+                )
                 .unwrap()
         };
         let turned_away = stage();
@@ -2431,7 +2611,7 @@ mod tests {
         let kept = cache
             .get_or_prepare(0, Vec::new(), || panic!("frame 0 was kept"))
             .unwrap();
-        assert_eq!(bits(&kept), bits(&normalized));
+        assert_eq!(bits(&kept.image), bits(&normalized));
         // The background samples kept are those of the kept image.
         let sample_bits = |samples: Vec<f32>| {
             samples
@@ -2446,14 +2626,14 @@ mod tests {
         assert!(cache.samples(1).is_none());
         // A frame admitted without a file is prepared once, then read back.
         cache
-            .get_or_prepare(1, Vec::new(), || Ok(normalized.clone()))
+            .get_or_prepare(1, Vec::new(), || Ok(PlacedImage::whole(normalized.clone())))
             .unwrap();
         let read = cache
             .get_or_prepare(1, vec![7.0; 4], || {
                 panic!("frame 1 was kept when first prepared")
             })
             .unwrap();
-        assert_eq!(bits(&read), bits(&normalized));
+        assert_eq!(bits(&read.image), bits(&normalized));
         assert_eq!(
             sample_bits(cache.samples(1).unwrap()),
             sample_bits(cache.samples(0).unwrap())
@@ -2473,9 +2653,115 @@ mod tests {
         let kept = cache
             .get_or_prepare(2, Vec::new(), || panic!("frame 2 was kept"))
             .unwrap();
-        assert_eq!(bits(&kept), bits(&image));
+        assert_eq!(bits(&kept.image), bits(&image));
         assert!(cache.samples(2).is_none());
         assert_eq!(files().len(), 5);
+    }
+
+    /// A frame kept over the region its footprint reaches is read back a
+    /// band at a time as the grid-sized image it stands for, `NaN` beyond
+    /// the region, normalized as that image is by a map of tiles; a band it
+    /// does not reach is not read at all.
+    #[test]
+    fn kept_regions_read_back_in_bands_as_the_images_they_stand_for() {
+        let (width, height) = (40, 36);
+        let directory = tempfile::tempdir().unwrap();
+        let mut cache = FrameCache::new(Some(directory.path()), 0, None).unwrap();
+        let (_, mut admissions) = cache.split();
+        admissions.admit(None);
+        admissions.admit(None);
+        let placed = |region: ReferenceRegion, first: f32| PlacedImage {
+            image: LinearImage::new(
+                region.width,
+                region.height,
+                1,
+                (0..region.width * region.height)
+                    .map(|index| first + index as f32 * 0.25)
+                    .collect(),
+            )
+            .unwrap(),
+            region,
+            width,
+            height,
+        };
+        let frames = [
+            placed(
+                ReferenceRegion {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height: 6,
+                },
+                1.0,
+            ),
+            placed(
+                ReferenceRegion {
+                    x: 10,
+                    y: 13,
+                    width: 17,
+                    height: 9,
+                },
+                -50.0,
+            ),
+        ];
+        for (index, frame) in frames.iter().enumerate() {
+            cache
+                .get_or_prepare(index, Vec::new(), || Ok(frame.clone()))
+                .unwrap();
+            assert_eq!(cache.region(index), Some(frame.region));
+        }
+        let map: crate::NormalizationMap = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "width": width,
+            "height": height,
+            "channels": 1,
+            "tile_size": 16,
+            "columns": 3,
+            "rows": 3,
+            "gains": [1.0, 1.5, 0.5, 2.0, 1.25, 0.75, 1.1, 0.9, 3.0],
+            "offsets": [0.0, 1.0, -2.0, 0.5, -0.25, 4.0, 0.125, -1.0, 2.5],
+        }))
+        .unwrap();
+        let maps = [map.clone(), map.clone()];
+        let source = CacheBands {
+            cache: &cache,
+            shape: (width, height, 1),
+            frames: vec![0, 1],
+            maps: &maps,
+        };
+        let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        let mut read = Vec::new();
+        crate::batch::for_each_band((width, height, 1), 2, 4, &source, None, |_, top, bands| {
+            read.push(bands.iter().map(|band| band.len()).collect::<Vec<_>>());
+            for (frame, band) in frames.iter().zip(bands) {
+                if band.is_empty() {
+                    continue;
+                }
+                let mut whole = frame.clone().into_grid().unwrap();
+                map.apply(&mut whole).unwrap();
+                let start = top * width;
+                assert_eq!(bits(band), bits(&whole.data[start..start + band.len()]));
+            }
+            Ok(())
+        })
+        .unwrap();
+        // Bands of four rows: the first frame lies in rows 0 to 5, the
+        // second in rows 13 to 21.
+        let row = width * 4;
+        assert_eq!(
+            read,
+            [
+                [row, 0],
+                [row, 0],
+                [0, 0],
+                [0, row],
+                [0, row],
+                [0, row],
+                [0, 0],
+                [0, 0],
+                [0, 0],
+            ]
+        );
     }
 
     /// A Bayer-drizzled frame's photosites are normalized as resampled in
@@ -2524,13 +2810,7 @@ mod tests {
         let read = |index: usize| {
             let mut band = vec![0.0; image.sample_count()];
             cache
-                .read_band(
-                    index,
-                    (width, height, 3),
-                    0,
-                    &mut band,
-                    &RowNormalizer::new(&map, 0, width),
-                )
+                .read_band(index, (width, height, 3), 0, &mut band, &map)
                 .unwrap();
             band
         };
