@@ -360,6 +360,9 @@ pub(crate) struct CanvasRegistrar {
     height: usize,
     windows: Vec<Window>,
     stars: Vec<(f64, f64)>,
+    /// The canvas's [`crate::normalization::photometric_ceilings`], which
+    /// photometry would otherwise read the whole canvas for, frame by frame.
+    ceilings: Vec<f32>,
     /// The lens the canvas is undistorted from, when planning measured one.
     lens: Option<LensDistortion>,
     summary: Option<crate::ExpandedLens>,
@@ -420,7 +423,7 @@ impl CanvasRegistrar {
             lens.validate()?;
         }
         let summary = lens.map(|lens| crate::ExpandedLens::new(&lens, None));
-        Ok(Self::from_windows(canvas.width, canvas.height, windows, lens).with_summary(summary))
+        Ok(Self::from_windows(canvas, windows, lens).with_summary(summary))
     }
 
     pub(crate) fn planning_notes(&self) -> &[String] {
@@ -442,8 +445,7 @@ impl CanvasRegistrar {
     }
 
     fn from_windows(
-        width: usize,
-        height: usize,
+        canvas: &LinearImage,
         windows: Vec<Window>,
         lens: Option<LensDistortion>,
     ) -> Self {
@@ -460,10 +462,11 @@ impl CanvasRegistrar {
             .filter(|(x, y)| seen.insert((x.round() as i64, y.round() as i64)))
             .collect();
         Self {
-            width,
-            height,
+            width: canvas.width,
+            height: canvas.height,
             windows,
             stars,
+            ceilings: crate::normalization::photometric_ceilings(canvas),
             lens,
             summary: None,
             planning_notes: Vec::new(),
@@ -497,6 +500,11 @@ impl CanvasRegistrar {
     /// Every panel's brightest stars, on the canvas grid.
     pub(crate) fn star_positions(&self) -> Vec<(f64, f64)> {
         self.stars.clone()
+    }
+
+    /// The canvas's [`crate::normalization::photometric_ceilings`].
+    pub(crate) fn photometric_ceilings(&self) -> &[f32] {
+        &self.ceilings
     }
 
     /// The best-matched registration among the panels, warped against that
@@ -1093,7 +1101,7 @@ pub(crate) fn plan(
         check_source(path)?;
     }
     Ok(Expansion {
-        canvas: CanvasRegistrar::from_windows(width, height, plan.windows, plan.lens)
+        canvas: CanvasRegistrar::from_windows(&plan.image, plan.windows, plan.lens)
             .with_summary(summary)
             .with_planning_notes(planning_notes),
         image: plan.image,
@@ -1302,7 +1310,7 @@ impl Plan {
             .find_map(|tolerance| {
                 crate::normalization::photometric_gains_from(
                     existing,
-                    incoming,
+                    crate::image::Placed::whole(incoming),
                     &paired_stars(&panel_stars, landed, tolerance),
                     PANEL_PHOTOMETRY_STARS,
                 )
@@ -1311,7 +1319,7 @@ impl Plan {
         });
         let normalization = NormalizationMap::estimate_with_gains(
             existing,
-            incoming,
+            crate::image::Placed::whole(incoming),
             options.normalization,
             gains.as_deref(),
         )?;

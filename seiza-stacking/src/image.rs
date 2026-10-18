@@ -15,6 +15,103 @@ pub struct LinearImage {
     pub data: Vec<f32>,
 }
 
+/// An image read as one `region` of a larger grid, every sample outside
+/// which is `NaN`: a frame registered onto the part of an expanded canvas its
+/// footprint reaches, read as the canvas-sized image it stands for.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Placed<'a> {
+    /// The samples of `region`, which is as large.
+    pub(crate) image: &'a LinearImage,
+    pub(crate) region: ReferenceRegion,
+    /// The grid's width and height in pixels.
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+}
+
+impl<'a> Placed<'a> {
+    /// `image` as `region` of a grid shaped as `grid`.
+    pub(crate) fn on(image: &'a LinearImage, region: ReferenceRegion, grid: &LinearImage) -> Self {
+        debug_assert_eq!((image.width, image.height), (region.width, region.height));
+        Self {
+            image,
+            region,
+            width: grid.width,
+            height: grid.height,
+        }
+    }
+
+    /// `image` as the whole of its own grid.
+    pub(crate) fn whole(image: &'a LinearImage) -> Self {
+        Self {
+            image,
+            region: ReferenceRegion {
+                x: 0,
+                y: 0,
+                width: image.width,
+                height: image.height,
+            },
+            width: image.width,
+            height: image.height,
+        }
+    }
+
+    pub(crate) fn channels(&self) -> usize {
+        self.image.channels
+    }
+
+    /// Whether the image covers the whole grid.
+    pub(crate) fn is_whole(&self) -> bool {
+        self.region.width == self.width && self.region.height == self.height
+    }
+
+    /// Channel `channel` of pixel `(x, y)` of the grid.
+    #[inline(always)]
+    pub(crate) fn at(&self, x: usize, y: usize, channel: usize) -> f32 {
+        let column = x.wrapping_sub(self.region.x);
+        let row = y.wrapping_sub(self.region.y);
+        if column < self.region.width && row < self.region.height {
+            self.image.data[(row * self.region.width + column) * self.image.channels + channel]
+        } else {
+            f32::NAN
+        }
+    }
+
+    /// Whether the image covers any pixel of the `width` by `height` region
+    /// of the grid at `(x, y)`.
+    pub(crate) fn reaches(&self, x: usize, y: usize, width: usize, height: usize) -> bool {
+        let region = self.region;
+        x < region.x + region.width
+            && region.x < x + width
+            && y < region.y + region.height
+            && region.y < y + height
+    }
+
+    /// Whether `other` is an image of the grid's shape.
+    pub(crate) fn matches(&self, other: &LinearImage) -> bool {
+        self.width == other.width
+            && self.height == other.height
+            && self.channels() == other.channels
+    }
+
+    /// Sample `index` of the grid, counted as in an image of the grid's
+    /// shape.
+    #[inline(always)]
+    pub(crate) fn sample(&self, index: usize) -> f32 {
+        if self.is_whole() {
+            return self.image.data[index];
+        }
+        let channels = self.image.channels;
+        let pixel = index / channels;
+        let column = (pixel % self.width).wrapping_sub(self.region.x);
+        let row = (pixel / self.width).wrapping_sub(self.region.y);
+        if column < self.region.width && row < self.region.height {
+            self.image.data[(row * self.region.width + column) * channels + index % channels]
+        } else {
+            f32::NAN
+        }
+    }
+}
+
 impl LinearImage {
     /// Build an image, checking that the sample count matches the dimensions
     /// and that the channel count is 1 or 3.

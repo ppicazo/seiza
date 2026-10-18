@@ -1379,6 +1379,182 @@ pub(crate) fn resample_region_geometry(
     }
 }
 
+/// The smallest region of a `reference_width` by `reference_height` grid
+/// holding every pixel [`resample_region_geometry`] can give a finite sample
+/// for a `source_width` by `source_height` frame: those whose source position
+/// lies on the frame. Every pixel outside it resamples to `NaN`, so resampling
+/// only the region, and treating the rest as `NaN`, gives the same image.
+///
+/// A similarity carries the frame's corners there directly. A warp maps the
+/// other way, reference to source, so points along the frame's edges are
+/// carried back through it by Newton's method from where `similarity`, the
+/// transform the warp refines, puts them. The region is then checked: when a
+/// pixel just outside it reaches the frame, as only a warp that bends far
+/// from the similarity could make one, or when an edge cannot be carried
+/// back, the whole grid is returned.
+///
+/// The region holds the frame's own footprint. Far beyond the frame, where
+/// it was never measured, a strong lens distortion can fold back onto the
+/// frame, so that the grid would sample the frame a second time there; the
+/// region leaves that out.
+///
+/// A region is never empty: a frame off the grid gets a one-pixel region,
+/// which resamples to `NaN`.
+pub(crate) fn footprint_region(
+    source_width: usize,
+    source_height: usize,
+    reference_width: usize,
+    reference_height: usize,
+    geometry: FrameGeometry<'_>,
+    similarity: SimilarityTransform,
+) -> ReferenceRegion {
+    let whole = ReferenceRegion {
+        x: 0,
+        y: 0,
+        width: reference_width,
+        height: reference_height,
+    };
+    if source_width == 0 || source_height == 0 || reference_width == 0 || reference_height == 0 {
+        return whole;
+    }
+    let (right, bottom) = ((source_width - 1) as f64, (source_height - 1) as f64);
+    let landed = match geometry {
+        FrameGeometry::Similarity(transform) => [(0.0, 0.0), (right, 0.0), (0.0, bottom)]
+            .into_iter()
+            .chain([(right, bottom)])
+            .map(|(x, y)| Some(transform.apply(x, y)))
+            .collect::<Option<Vec<_>>>(),
+        FrameGeometry::Warp(warp) => frame_edge(right, bottom)
+            .map(|(x, y)| invert_warp(warp, (x, y), similarity.apply(x, y)))
+            .collect::<Option<Vec<_>>>(),
+    };
+    let Some(landed) =
+        landed.filter(|points| points.iter().all(|(x, y)| x.is_finite() && y.is_finite()))
+    else {
+        return whole;
+    };
+    let (mut left, mut top, mut far_right, mut far_bottom) = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for &(x, y) in &landed {
+        left = left.min(x);
+        top = top.min(y);
+        far_right = far_right.max(x);
+        far_bottom = far_bottom.max(y);
+    }
+    // Pixels whose centres lie within the frame's edges, and a margin for
+    // the edge to bow between the points carried back.
+    let clamp = |value: f64, limit: usize| value.clamp(0.0, limit as f64) as usize;
+    let x = clamp(left.floor() - FOOTPRINT_MARGIN, reference_width - 1);
+    let y = clamp(top.floor() - FOOTPRINT_MARGIN, reference_height - 1);
+    let region = ReferenceRegion {
+        x,
+        y,
+        width: clamp(far_right.ceil() + 1.0 + FOOTPRINT_MARGIN, reference_width).max(x + 1) - x,
+        height: clamp(far_bottom.ceil() + 1.0 + FOOTPRINT_MARGIN, reference_height).max(y + 1) - y,
+    };
+    let reaches = |inverse: &dyn Fn(f64, f64) -> (f64, f64)| {
+        ring(region, reference_width, reference_height).any(|(x, y)| {
+            let (source_x, source_y) = inverse(x as f64, y as f64);
+            within_source(source_x, source_y, right, bottom)
+        })
+    };
+    let escapes = match geometry {
+        FrameGeometry::Similarity(transform) => reaches(&transform.inverse_map()),
+        FrameGeometry::Warp(warp) => reaches(&|x, y| warp.apply(x, y)),
+    };
+    if escapes { whole } else { region }
+}
+
+/// Pixels a frame's edge may bow outward past the bounds of the points of it
+/// [`footprint_region`] carries onto the reference grid.
+const FOOTPRINT_MARGIN: f64 = 2.0;
+
+/// Points [`FOOTPRINT_EDGE_STEP`] pixels apart along the edge of a frame
+/// whose far corner is `(right, bottom)`, the corners among them.
+fn frame_edge(right: f64, bottom: f64) -> impl Iterator<Item = (f64, f64)> {
+    let steps = |length: f64| ((length / FOOTPRINT_EDGE_STEP).ceil() as usize).max(1);
+    let (across, down) = (steps(right), steps(bottom));
+    let horizontal = (0..=across).flat_map(move |step| {
+        let x = right * step as f64 / across as f64;
+        [(x, 0.0), (x, bottom)]
+    });
+    let vertical = (1..down).flat_map(move |step| {
+        let y = bottom * step as f64 / down as f64;
+        [(0.0, y), (right, y)]
+    });
+    horizontal.chain(vertical)
+}
+
+/// The spacing of [`frame_edge`]'s points: a warp's edge bows far less than
+/// [`FOOTPRINT_MARGIN`] between points this close.
+const FOOTPRINT_EDGE_STEP: f64 = 16.0;
+
+/// The reference pixels on the grid just outside `region`.
+fn ring(
+    region: ReferenceRegion,
+    reference_width: usize,
+    reference_height: usize,
+) -> impl Iterator<Item = (usize, usize)> {
+    let (left, top) = (region.x.checked_sub(1), region.y.checked_sub(1));
+    let right = Some(region.x + region.width).filter(|&x| x < reference_width);
+    let bottom = Some(region.y + region.height).filter(|&y| y < reference_height);
+    let columns = region.x.saturating_sub(1)..(region.x + region.width + 1).min(reference_width);
+    let rows = region.y..region.y + region.height;
+    let across = [top, bottom]
+        .into_iter()
+        .flatten()
+        .flat_map(move |y| columns.clone().map(move |x| (x, y)));
+    let down = [left, right]
+        .into_iter()
+        .flatten()
+        .flat_map(move |x| rows.clone().map(move |y| (x, y)));
+    across.chain(down)
+}
+
+/// The reference position `warp` carries to source position `target`, by
+/// Newton's method from `seed`, or `None` when it does not converge.
+fn invert_warp(warp: &PolynomialWarp, target: (f64, f64), seed: (f64, f64)) -> Option<(f64, f64)> {
+    let (mut x, mut y) = seed;
+    for _ in 0..32 {
+        let (u, v) = warp.apply(x, y);
+        let (error_u, error_v) = (u - target.0, v - target.1);
+        if !(error_u.is_finite() && error_v.is_finite()) {
+            return None;
+        }
+        if error_u.hypot(error_v) < 1.0e-6 {
+            return Some((x, y));
+        }
+        // The Jacobian, by central differences a pixel wide.
+        let (right, left) = (warp.apply(x + 0.5, y), warp.apply(x - 0.5, y));
+        let (below, above) = (warp.apply(x, y + 0.5), warp.apply(x, y - 0.5));
+        let (du_dx, dv_dx) = (right.0 - left.0, right.1 - left.1);
+        let (du_dy, dv_dy) = (below.0 - above.0, below.1 - above.1);
+        let determinant = du_dx * dv_dy - du_dy * dv_dx;
+        if !determinant.is_finite() || determinant.abs() < 1.0e-12 {
+            return None;
+        }
+        x -= (dv_dy * error_u - du_dy * error_v) / determinant;
+        y -= (du_dx * error_v - dv_dx * error_u) / determinant;
+    }
+    None
+}
+
+/// Whether resampling reads a frame whose far corner is
+/// `(maximum_x, maximum_y)` at a source position: one on the frame, give or
+/// take rounding, or one that is not a number.
+#[inline(always)]
+fn within_source(source_x: f64, source_y: f64, maximum_x: f64, maximum_y: f64) -> bool {
+    const COORDINATE_EPSILON: f64 = 1.0e-9;
+    !(source_x < -COORDINATE_EPSILON
+        || source_y < -COORDINATE_EPSILON
+        || source_x > maximum_x + COORDINATE_EPSILON
+        || source_y > maximum_y + COORDINATE_EPSILON)
+}
+
 /// Resample one reference-grid region through a polynomial warp from
 /// [`RegistrationResult::warp`].
 pub fn resample_region_warped(
@@ -1541,18 +1717,13 @@ fn resample_row<F>(
 ) where
     F: Fn(f64, f64) -> (f64, f64),
 {
-    const COORDINATE_EPSILON: f64 = 1.0e-9;
     let channels = source.channels;
     let maximum_source_x = (source.width - 1) as f64;
     let maximum_source_y = (source.height - 1) as f64;
     for (x, output) in output_row.chunks_exact_mut(channels).enumerate() {
         let reference_x = first_x + x;
         let (source_x, source_y) = inverse(reference_x as f64, reference_y as f64);
-        if source_x < -COORDINATE_EPSILON
-            || source_y < -COORDINATE_EPSILON
-            || source_x > maximum_source_x + COORDINATE_EPSILON
-            || source_y > maximum_source_y + COORDINATE_EPSILON
-        {
+        if !within_source(source_x, source_y, maximum_source_x, maximum_source_y) {
             continue;
         }
         // Exact quarter- and half-turns accumulate tiny trigonometric
@@ -2210,6 +2381,181 @@ mod tests {
             peak: 1.0,
             area: 3,
         }
+    }
+
+    /// A 97x61 frame, a lens with `k1` and `k2` for it, and a quadratic
+    /// warp through that lens that bends a few pixels from `transform`.
+    fn lens_frame(
+        transform: SimilarityTransform,
+        k1: f64,
+        k2: f64,
+    ) -> (LinearImage, PolynomialWarp) {
+        let (width, height) = (97, 61);
+        let source = LinearImage::new(
+            width,
+            height,
+            1,
+            (0..width * height)
+                .map(|index| 1.0 + (index % 13) as f32 * 0.25 + (index / width) as f32 * 0.01)
+                .collect(),
+        )
+        .unwrap();
+        let lens: crate::lens::LensDistortion = serde_json::from_value(serde_json::json!({
+            "width": width,
+            "height": height,
+            "center_x": 51.5,
+            "center_y": 27.0,
+            "radius": 0.5 * (width as f64).hypot(height as f64),
+            "k1": k1,
+            "k2": k2,
+        }))
+        .unwrap();
+        let inverse = transform.inverse_map();
+        let pairs = (0..20)
+            .flat_map(|row| (0..20).map(move |column| (column as f64 * 20.0, row as f64 * 15.0)))
+            .map(|(x, y)| {
+                let (u, v) = inverse(x, y);
+                ((x, y), (u + 2.0e-4 * u * v, v - 3.0e-4 * u * u))
+            })
+            .collect::<Vec<_>>();
+        let warp = PolynomialWarp::fit(2, 400, 300, &pairs)
+            .unwrap()
+            .with_distortion(lens);
+        (source, warp)
+    }
+
+    /// Whether resampling `geometry` over `region` alone gives, there, what
+    /// resampling the whole 400x300 grid gives, and `NaN` beyond it; and
+    /// whether the whole grid has finite samples beyond the region.
+    fn compare_footprint(
+        source: &LinearImage,
+        geometry: FrameGeometry<'_>,
+        region: ReferenceRegion,
+        sampling: Sampling,
+    ) -> (bool, bool) {
+        let (width, height) = (400, 300);
+        let whole = resample_region_geometry(
+            source,
+            width,
+            height,
+            ReferenceRegion {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
+            geometry,
+            sampling,
+        )
+        .unwrap();
+        let bounded =
+            resample_region_geometry(source, width, height, region, geometry, sampling).unwrap();
+        let placed = crate::image::Placed::on(&bounded, region, &whole);
+        let (mut same, mut beyond) = (true, false);
+        for (index, &sample) in whole.data.iter().enumerate() {
+            let (x, y) = (index % width, index / width);
+            let inside = placed.reaches(x, y, 1, 1);
+            if inside {
+                same &= sample.to_bits() == placed.sample(index).to_bits();
+            } else {
+                beyond |= sample.is_finite();
+            }
+        }
+        (same, beyond)
+    }
+
+    /// Resampling a frame over its footprint region gives every sample the
+    /// whole grid gives it, by similarity or by a quadratic warp through a
+    /// lens, at any rotation, partly or wholly off the grid.
+    #[test]
+    fn footprint_holds_every_sample_a_frame_gives_the_grid() {
+        let similarity =
+            |rotation_radians: f64, translation_x: f64, translation_y: f64| SimilarityTransform {
+                scale: 1.01,
+                rotation_radians,
+                translation_x,
+                translation_y,
+            };
+        for (transform, on_grid) in [
+            (similarity(0.0, 150.0, 120.0), true),
+            (similarity(0.4, 180.0, 90.0), true),
+            (similarity(std::f64::consts::PI, 260.0, 190.0), true),
+            (similarity(-0.2, -40.0, 270.0), true),
+            (similarity(0.1, 380.0, -30.0), true),
+            (similarity(0.0, -500.0, 100.0), false),
+        ] {
+            let (source, warp) = lens_frame(transform, -0.03, 0.002);
+            for geometry in [
+                FrameGeometry::Similarity(transform),
+                FrameGeometry::Warp(&warp),
+            ] {
+                let region = footprint_region(97, 61, 400, 300, geometry, transform);
+                let small = region.width * region.height;
+                if on_grid {
+                    assert!(small < 400 * 300 / 4, "{transform:?}: {region:?}");
+                } else {
+                    assert_eq!(region.width, 1, "{transform:?}: {region:?}");
+                }
+                for sampling in [Sampling::Bilinear, Sampling::Lanczos3] {
+                    let (same, beyond) = compare_footprint(&source, geometry, region, sampling);
+                    assert!(same && !beyond, "{transform:?}: {region:?}");
+                }
+            }
+        }
+    }
+
+    /// A warp Newton's method cannot carry back, here one that sends every
+    /// pixel to one point of the frame, keeps the whole grid, which is then
+    /// its footprint.
+    #[test]
+    fn footprint_of_a_warp_that_cannot_be_inverted_is_the_whole_grid() {
+        let transform = SimilarityTransform {
+            translation_x: 150.0,
+            translation_y: 120.0,
+            ..SimilarityTransform::IDENTITY
+        };
+        let (source, _) = lens_frame(transform, 0.0, 0.0);
+        let warp = PolynomialWarp {
+            order: 1,
+            center_x: 0.0,
+            center_y: 0.0,
+            scale: 1.0,
+            x: vec![5.0, 0.0, 0.0],
+            y: vec![5.0, 0.0, 0.0],
+            distortion: None,
+        };
+        let geometry = FrameGeometry::Warp(&warp);
+        let region = footprint_region(97, 61, 400, 300, geometry, transform);
+        assert_eq!(
+            (region.x, region.y, region.width, region.height),
+            (0, 0, 400, 300)
+        );
+        assert_eq!(
+            compare_footprint(&source, geometry, region, Sampling::Bilinear),
+            (true, false)
+        );
+    }
+
+    /// Far past the frame, where it was never measured, a strong barrel
+    /// distortion folds back onto the frame, so the whole grid samples the
+    /// frame a second time, in a ring around it. The footprint is the frame
+    /// itself, and leaves the ring out.
+    #[test]
+    fn footprint_leaves_out_where_a_lens_folds_back_far_from_the_frame() {
+        let transform = SimilarityTransform {
+            translation_x: 150.0,
+            translation_y: 120.0,
+            ..SimilarityTransform::IDENTITY
+        };
+        let (source, warp) = lens_frame(transform, -0.1, 0.0);
+        let geometry = FrameGeometry::Warp(&warp);
+        let region = footprint_region(97, 61, 400, 300, geometry, transform);
+        // Wider than the frame, since barrel distortion draws its edges in.
+        assert!(region.width < 130 && region.height < 90, "{region:?}");
+        assert_eq!(
+            compare_footprint(&source, geometry, region, Sampling::Bilinear),
+            (true, true)
+        );
     }
 
     #[test]

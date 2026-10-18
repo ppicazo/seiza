@@ -1,4 +1,4 @@
-use crate::{Error, LinearImage, Result};
+use crate::{Error, LinearImage, Result, image::Placed};
 use rayon::prelude::*;
 use seiza_stats::{median_in_place, robust_sigma_in_place};
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
@@ -69,13 +69,13 @@ impl NormalizationMap {
     /// modes, and a missing measurement, fit as [`Self::estimate`] does.
     pub(crate) fn estimate_with_gains(
         reference: &LinearImage,
-        source: &LinearImage,
+        source: Placed<'_>,
         mode: NormalizationMode,
         gains: Option<&[f32]>,
     ) -> Result<Self> {
         match (mode, gains) {
             (NormalizationMode::LocalBackground { tile_size }, Some(gains))
-                if gains.len() == source.channels && reference.dimensions_match(source) =>
+                if gains.len() == source.channels() && source.matches(reference) =>
             {
                 if tile_size < 16 {
                     return Err(Error::Normalization(
@@ -105,7 +105,7 @@ impl NormalizationMap {
                     .collect::<Result<Vec<_>>>()?;
                 local_background_with_gains(reference, source, tile_size, &globals)
             }
-            _ => Self::estimate(reference, source, mode),
+            _ => Self::estimate_placed(reference, source, mode),
         }
     }
 
@@ -130,7 +130,12 @@ impl NormalizationMap {
                 "normalization channel count does not match".into(),
             ));
         }
-        local_background_with_gains(reference, source, tile_size, &self.background_globals())
+        local_background_with_gains(
+            reference,
+            Placed::whole(source),
+            tile_size,
+            &self.background_globals(),
+        )
     }
 
     /// [`Self::refit_background`] from the samples `layout` says the fit
@@ -257,7 +262,13 @@ impl BackgroundSamples {
 
     /// `image`'s samples, as they are.
     pub(crate) fn of(&self, image: &LinearImage) -> Result<Vec<f32>> {
-        if (image.width, image.height, image.channels) != (self.width, self.height, self.channels) {
+        self.of_placed(Placed::whole(image))
+    }
+
+    /// [`Self::of`] an image placed on a grid of this layout's shape.
+    pub(crate) fn of_placed(&self, image: Placed<'_>) -> Result<Vec<f32>> {
+        if (image.width, image.height, image.channels()) != (self.width, self.height, self.channels)
+        {
             return Err(Error::Normalization(
                 "image does not match its background sample layout".into(),
             ));
@@ -270,7 +281,7 @@ impl BackgroundSamples {
             for channel in 0..self.channels {
                 samples.extend(
                     tile_sample_pixels(self.width, x, y, width, height)
-                        .map(|pixel| image.data[pixel * self.channels + channel]),
+                        .map(|pixel| image.sample(pixel * self.channels + channel)),
                 );
             }
         }
@@ -361,16 +372,22 @@ impl<'de> Deserialize<'de> for NormalizationMap {
 impl NormalizationMap {
     /// A map that leaves an image of the given shape unchanged.
     pub fn identity(image: &LinearImage) -> Self {
+        Self::identity_of(image.width, image.height, image.channels)
+    }
+
+    /// [`Self::identity`] for an image of `width` by `height` pixels of
+    /// `channels` channels.
+    fn identity_of(width: usize, height: usize, channels: usize) -> Self {
         Self {
             schema_version: NORMALIZATION_MAP_SCHEMA_VERSION,
-            width: image.width,
-            height: image.height,
-            channels: image.channels,
-            tile_size: image.width.max(image.height),
+            width,
+            height,
+            channels,
+            tile_size: width.max(height),
             columns: 1,
             rows: 1,
-            gains: vec![1.0; image.channels],
-            offsets: vec![0.0; image.channels],
+            gains: vec![1.0; channels],
+            offsets: vec![0.0; channels],
         }
     }
 
@@ -381,16 +398,30 @@ impl NormalizationMap {
         source: &LinearImage,
         mode: NormalizationMode,
     ) -> Result<Self> {
-        if !reference.dimensions_match(source) {
+        Self::estimate_placed(reference, Placed::whole(source), mode)
+    }
+
+    /// [`Self::estimate`] for a source placed on a grid of the reference's
+    /// shape.
+    pub(crate) fn estimate_placed(
+        reference: &LinearImage,
+        source: Placed<'_>,
+        mode: NormalizationMode,
+    ) -> Result<Self> {
+        if !source.matches(reference) {
             return Err(Error::Normalization(
                 "reference and source dimensions must match".into(),
             ));
         }
         match mode {
-            NormalizationMode::None => Ok(Self::identity(source)),
+            NormalizationMode::None => Ok(Self::identity_of(
+                source.width,
+                source.height,
+                source.channels(),
+            )),
             NormalizationMode::Global => {
-                let mut map = Self::identity(source);
-                for channel in 0..source.channels {
+                let mut map = Self::identity_of(source.width, source.height, source.channels());
+                for channel in 0..source.channels() {
                     let (gain, offset) = affine_for_region(
                         reference,
                         source,
@@ -421,12 +452,12 @@ impl NormalizationMap {
                 }
                 let columns = source.width.div_ceil(tile_size);
                 let rows = source.height.div_ceil(tile_size);
-                let cell_count = columns * rows * source.channels;
+                let cell_count = columns * rows * source.channels();
                 let coefficients = (0..cell_count)
                     .into_par_iter()
                     .map(|index| {
-                        let channel = index % source.channels;
-                        let cell = index / source.channels;
+                        let channel = index % source.channels();
+                        let cell = index / source.channels();
                         let column = cell % columns;
                         let row = cell / columns;
                         let x = column * tile_size;
@@ -441,7 +472,7 @@ impl NormalizationMap {
                     schema_version: NORMALIZATION_MAP_SCHEMA_VERSION,
                     width: source.width,
                     height: source.height,
-                    channels: source.channels,
+                    channels: source.channels(),
                     tile_size,
                     columns,
                     rows,
@@ -895,10 +926,10 @@ fn bilinear(
 /// reference median.
 fn local_background(
     reference: &LinearImage,
-    source: &LinearImage,
+    source: Placed<'_>,
     tile_size: usize,
 ) -> Result<NormalizationMap> {
-    let channels = source.channels;
+    let channels = source.channels();
     let globals = (0..channels)
         .map(|channel| {
             affine_for_region(
@@ -919,16 +950,21 @@ fn local_background(
 /// the global offset used where no tile of that channel can be measured.
 fn local_background_with_gains(
     reference: &LinearImage,
-    source: &LinearImage,
+    source: Placed<'_>,
     tile_size: usize,
     globals: &[(f32, f32)],
 ) -> Result<NormalizationMap> {
     Ok(local_background_from(
-        (source.width, source.height, source.channels),
+        (source.width, source.height, source.channels()),
         tile_size,
         globals,
         |_, channel, (x, y, width, height)| {
-            tile_medians(reference, source, channel, x, y, width, height)
+            // A tile the source does not reach shares no samples with the
+            // reference.
+            source
+                .reaches(x, y, width, height)
+                .then(|| tile_medians(reference, source, channel, x, y, width, height))
+                .flatten()
         },
     ))
 }
@@ -990,7 +1026,7 @@ fn local_background_from(
 /// cover, or `None` when they share too few.
 fn tile_medians(
     reference: &LinearImage,
-    source: &LinearImage,
+    source: Placed<'_>,
     channel: usize,
     x: usize,
     y: usize,
@@ -999,11 +1035,11 @@ fn tile_medians(
 ) -> Option<(f32, f32)> {
     let indices = || {
         tile_sample_pixels(source.width, x, y, width, height)
-            .map(move |pixel| pixel * source.channels + channel)
+            .map(move |pixel| pixel * source.channels() + channel)
     };
     sample_medians(
         indices().map(|index| reference.data[index]),
-        indices().map(|index| source.data[index]),
+        indices().map(|index| source.sample(index)),
     )
 }
 
@@ -1098,22 +1134,66 @@ const PHOTOMETRY_MINIMUM_STARS: usize = 12;
 /// largest weights. Stars near saturation in the reference are skipped.
 /// `None` when fewer than [`PHOTOMETRY_MINIMUM_STARS`] measure cleanly in a
 /// channel.
+///
+/// `ceilings` are the reference's [`photometric_ceilings`], which a stack
+/// measures once rather than for every frame.
 pub(crate) fn photometric_gains(
     reference: &LinearImage,
-    source: &LinearImage,
+    ceilings: &[f32],
+    source: Placed<'_>,
     stars: &[(f64, f64)],
 ) -> Option<Vec<f32>> {
-    photometric_gains_from(reference, source, stars, PHOTOMETRY_MINIMUM_STARS)
+    photometric_gains_with(reference, ceilings, source, stars, PHOTOMETRY_MINIMUM_STARS)
 }
 
 /// [`photometric_gains`] from at least `minimum` cleanly measured stars.
 pub(crate) fn photometric_gains_from(
     reference: &LinearImage,
-    source: &LinearImage,
+    source: Placed<'_>,
     stars: &[(f64, f64)],
     minimum: usize,
 ) -> Option<Vec<f32>> {
-    if !reference.dimensions_match(source) {
+    if !source.matches(reference) {
+        return None;
+    }
+    photometric_gains_with(
+        reference,
+        &photometric_ceilings(reference),
+        source,
+        stars,
+        minimum,
+    )
+}
+
+/// The brightest finite sample of each channel of `reference`, or
+/// `f32::MIN` for a channel with none: photometry skips a star whose
+/// aperture reaches 85% of it.
+pub(crate) fn photometric_ceilings(reference: &LinearImage) -> Vec<f32> {
+    let channels = reference.channels;
+    (0..channels)
+        .map(|channel| {
+            reference
+                .data
+                .par_iter()
+                .skip(channel)
+                .step_by(channels)
+                .copied()
+                .filter(|value| value.is_finite())
+                .reduce(|| f32::MIN, f32::max)
+        })
+        .collect()
+}
+
+/// [`photometric_gains_from`] given the reference's
+/// [`photometric_ceilings`].
+fn photometric_gains_with(
+    reference: &LinearImage,
+    ceilings: &[f32],
+    source: Placed<'_>,
+    stars: &[(f64, f64)],
+    minimum: usize,
+) -> Option<Vec<f32>> {
+    if !source.matches(reference) || ceilings.len() != reference.channels {
         return None;
     }
     let channels = reference.channels;
@@ -1121,14 +1201,7 @@ pub(crate) fn photometric_gains_from(
     let outer = PHOTOMETRY_ANNULUS.1.ceil() as usize + 1;
     (0..channels)
         .map(|channel| {
-            let ceiling = reference
-                .data
-                .par_iter()
-                .skip(channel)
-                .step_by(channels)
-                .copied()
-                .filter(|value| value.is_finite())
-                .reduce(|| f32::MIN, f32::max);
+            let ceiling = ceilings[channel];
             let mut ratios = stars
                 .iter()
                 .filter_map(|&(x, y)| {
@@ -1148,7 +1221,7 @@ pub(crate) fn photometric_gains_from(
                         for px in cx - outer..=cx + outer {
                             let distance = (px as f64 - x).hypot(py as f64 - y);
                             let index = (py * width + px) * channels + channel;
-                            let (r, s) = (reference.data[index], source.data[index]);
+                            let (r, s) = (reference.data[index], source.at(px, py, channel));
                             if !r.is_finite() || !s.is_finite() {
                                 return None;
                             }
@@ -1206,7 +1279,7 @@ fn apply_affine(pixels: &mut [f32], gains: &[f32], offsets: &[f32]) {
 
 fn affine_for_region(
     reference: &LinearImage,
-    source: &LinearImage,
+    source: Placed<'_>,
     channel: usize,
     x: usize,
     y: usize,
@@ -1221,9 +1294,9 @@ fn affine_for_region(
     for sample_index in (0..width * height).step_by(stride) {
         let row = y + sample_index / width;
         let column = x + sample_index % width;
-        let index = (row * source.width + column) * source.channels + channel;
+        let index = (row * source.width + column) * source.channels() + channel;
         let reference_value = reference.data[index];
-        let source_value = source.data[index];
+        let source_value = source.sample(index);
         if reference_value.is_finite() && source_value.is_finite() {
             reference_values.push(reference_value);
             source_values.push(source_value);
@@ -1432,7 +1505,13 @@ mod tests {
         let stars = crate::Registrar::new(&reference, crate::RegistrationOptions::default())
             .unwrap()
             .reference_star_positions();
-        let gains = photometric_gains(&reference, &source, &stars).expect("enough stars");
+        let gains = photometric_gains(
+            &reference,
+            &photometric_ceilings(&reference),
+            Placed::whole(&source),
+            &stars,
+        )
+        .expect("enough stars");
         assert!((gains[0] - 2.0).abs() < 0.05, "{gains:?}");
         let dispersion =
             NormalizationMap::estimate(&reference, &source, NormalizationMode::Global).unwrap();

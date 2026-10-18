@@ -17,6 +17,7 @@ use crate::CancelSignal;
 use crate::batch::PackedFates;
 use crate::calibration::LightGate;
 use crate::drizzle::{DrizzleAccumulator, DrizzleFrame, DrizzleOptions, DrizzleResult};
+use crate::image::Placed;
 use crate::normalization::{BackgroundSamples, RowCoefficients, RowNormalizer};
 use crate::{
     BatchStackOptions, BatchStackPass, BatchStackResult, CalibrationMasters, Error, FitsFrame,
@@ -668,8 +669,8 @@ impl CacheFiles {
     /// The samples of `fitted`, a frame's registered, unnormalized and
     /// interpolated image, that a background fit reads, when the stack
     /// keeps them.
-    pub(crate) fn background_samples(&self, fitted: &LinearImage) -> Option<Vec<f32>> {
-        self.background.as_ref()?.of(fitted).ok()
+    pub(crate) fn background_samples(&self, fitted: Placed<'_>) -> Option<Vec<f32>> {
+        self.background.as_ref()?.of_placed(fitted).ok()
     }
 
     /// Write a frame's registered, unnormalized image before its admission
@@ -678,7 +679,7 @@ impl CacheFiles {
     /// as they are (see [`keeps_zeros`]).
     pub(crate) fn stage(
         &self,
-        image: &LinearImage,
+        image: Placed<'_>,
         samples: Option<Vec<f32>>,
         keep_zeros: bool,
     ) -> Option<StagedFrame> {
@@ -695,7 +696,7 @@ impl CacheFiles {
             path: Some(staged("f32")),
             samples: None,
         };
-        FrameCache::write_image(frame.path.as_deref()?, image, keep_zeros).ok()?;
+        FrameCache::write_placed(frame.path.as_deref()?, image, keep_zeros).ok()?;
         if let Some(samples) = samples {
             let path = staged("samples");
             if FrameCache::write_samples(&path, &samples).is_ok() {
@@ -897,7 +898,36 @@ impl FrameCache {
         Self::write_values(
             path,
             &[image.width, image.height, image.channels],
-            &image.data,
+            [image.data.as_slice()],
+            keep_zeros,
+        )
+    }
+
+    /// [`Self::write_image`] of the grid-sized image `image` stands for,
+    /// without making it: the same bytes.
+    fn write_placed(path: &Path, image: Placed<'_>, keep_zeros: bool) -> std::io::Result<()> {
+        if image.is_whole() {
+            return Self::write_image(path, image.image, keep_zeros);
+        }
+        let channels = image.channels();
+        let region = image.region;
+        let blank = vec![f32::NAN; image.width * channels];
+        let row_samples = region.width * channels;
+        let before = &blank[..region.x * channels];
+        let after = &blank[..(image.width - region.x - region.width) * channels];
+        let runs = (0..image.height).flat_map(|y| {
+            match y.checked_sub(region.y).filter(|row| *row < region.height) {
+                Some(row) => {
+                    let start = row * row_samples;
+                    [before, &image.image.data[start..start + row_samples], after]
+                }
+                None => [blank.as_slice(), &[], &[]],
+            }
+        });
+        Self::write_values(
+            path,
+            &[image.width, image.height, channels],
+            runs,
             keep_zeros,
         )
     }
@@ -906,15 +936,15 @@ impl FrameCache {
     /// changes an image, since the fit reads them through the identity
     /// normalization.
     fn write_samples(path: &Path, samples: &[f32]) -> std::io::Result<()> {
-        Self::write_values(path, &[samples.len()], samples, false)
+        Self::write_values(path, &[samples.len()], [samples], false)
     }
 
-    /// Write `header`, then `values`, with negative zeros made positive
-    /// unless `keep_zeros`.
-    fn write_values(
+    /// Write `header`, then the samples of each of `runs` in turn, with
+    /// negative zeros made positive unless `keep_zeros`.
+    fn write_values<'a>(
         path: &Path,
         header: &[usize],
-        values: &[f32],
+        runs: impl IntoIterator<Item = &'a [f32]>,
         keep_zeros: bool,
     ) -> std::io::Result<()> {
         use std::io::Write;
@@ -923,16 +953,18 @@ impl FrameCache {
             file.write_all(&(dimension as u64).to_le_bytes())?;
         }
         let mut bytes = vec![0_u8; 1 << 20];
-        for chunk in values.chunks(bytes.len() / 4) {
-            for (&sample, out) in chunk.iter().zip(bytes.chunks_exact_mut(4)) {
-                let sample = if sample == 0.0 && !keep_zeros {
-                    0.0_f32
-                } else {
-                    sample
-                };
-                out.copy_from_slice(&sample.to_le_bytes());
+        for values in runs {
+            for chunk in values.chunks(bytes.len() / 4) {
+                for (&sample, out) in chunk.iter().zip(bytes.chunks_exact_mut(4)) {
+                    let sample = if sample == 0.0 && !keep_zeros {
+                        0.0_f32
+                    } else {
+                        sample
+                    };
+                    out.copy_from_slice(&sample.to_le_bytes());
+                }
+                file.write_all(&bytes[..chunk.len() * 4])?;
             }
-            file.write_all(&bytes[..chunk.len() * 4])?;
         }
         file.into_inner().map_err(|error| error.into_error())?;
         Ok(())
@@ -1168,7 +1200,7 @@ impl Replay<'_> {
                         stacker.source_unchanged(admitted)?;
                         let (kept, interpolated, keep_zeros) =
                             stacker.kept_frame(admitted, &masters)?;
-                        let samples = cache.files.background_samples(&interpolated);
+                        let samples = cache.files.background_samples(Placed::whole(&interpolated));
                         if let (Some(renormalizer), Some(samples)) = (self.renormalizer, &samples) {
                             renormalizer.map_from_samples(admitted, index, samples)?;
                         }
@@ -1659,7 +1691,10 @@ impl LiveStacker {
             cache.keep(
                 0,
                 &kept,
-                cache.files.background_samples(&interpolated).as_deref(),
+                cache
+                    .files
+                    .background_samples(Placed::whole(&interpolated))
+                    .as_deref(),
                 keeps_zeros(&self.options, Some(layout)),
             );
         }
@@ -2421,7 +2456,11 @@ mod tests {
         let (staging, mut admissions) = cache.split();
         let stage = || {
             staging
-                .stage(&image, staging.background_samples(&image), false)
+                .stage(
+                    Placed::whole(&image),
+                    staging.background_samples(Placed::whole(&image)),
+                    false,
+                )
                 .unwrap()
         };
         let turned_away = stage();

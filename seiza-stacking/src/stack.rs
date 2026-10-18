@@ -1,3 +1,4 @@
+use crate::image::Placed;
 use crate::{
     BayerLayout, CalibrationMasters, Error, FitsFrame, FrameMetadata, LinearImage,
     NormalizationMap, NormalizationMode, ReferenceRegion, RegisteredFrameMapping, Registrar,
@@ -579,7 +580,7 @@ pub struct LiveStacker {
 enum ReferenceContribution {
     Expanded {
         noise: Vec<f32>,
-        canvas: crate::expand::CanvasRegistrar,
+        canvas: Box<crate::expand::CanvasRegistrar>,
     },
     Integrated(Option<BayerLayout>),
     External {
@@ -772,7 +773,7 @@ impl LiveStacker {
             FrameInputMode::CalibrateAndPrepare,
             ReferenceContribution::Expanded {
                 noise: plan.noise,
-                canvas: plan.canvas,
+                canvas: Box::new(plan.canvas),
             },
         )?;
         stacker.planned_registrations = plan.registrations;
@@ -910,7 +911,7 @@ impl LiveStacker {
         let (registrar, reference_noise, reference_cfa, alignment_reference) = match contribution {
             ReferenceContribution::Expanded { noise, canvas } => {
                 let registrar = canvas.anchor_registrar();
-                canvas_registrar = Some(canvas);
+                canvas_registrar = Some(*canvas);
                 (registrar, noise, None, None)
             }
             ReferenceContribution::Integrated(cfa) => (
@@ -1518,6 +1519,8 @@ impl LiveStacker {
                 ledger: &mut self.ledger,
                 frame_cache: cache_admissions,
                 expanded_canvas: self.canvas_registrar.is_some(),
+                reference_width: self.reference.width,
+                reference_height: self.reference.height,
             },
         )
     }
@@ -1902,7 +1905,10 @@ pub(crate) enum PreparedFrame {
 
 /// A registered, normalized frame and the measurements taken along the way.
 pub(crate) struct ReadyFrame {
+    /// The frame's samples over `region` of the reference grid; every sample
+    /// beyond it is `NaN`. The whole grid except on an expanded canvas.
     registered: LinearImage,
+    region: ReferenceRegion,
     transform: SimilarityTransform,
     matched_stars: usize,
     registration_rms_pixels: f64,
@@ -1961,6 +1967,15 @@ impl FrameRegistration<'_> {
         match self.canvas {
             Some(canvas) => canvas.star_positions(),
             None => self.registrar.reference_star_positions(),
+        }
+    }
+
+    /// The [`crate::normalization::photometric_ceilings`] of `reference`,
+    /// which an expanded canvas measured once.
+    fn reference_ceilings(&self, reference: &LinearImage) -> Vec<f32> {
+        match self.canvas {
+            Some(canvas) if !resamples_whole_canvas() => canvas.photometric_ceilings().to_vec(),
+            _ => crate::normalization::photometric_ceilings(reference),
         }
     }
 }
@@ -2033,17 +2048,31 @@ pub(crate) fn prepare_frame(
     }
     let geometry =
         crate::registration::FrameGeometry::of(registration.transform, registration.warp.as_ref());
-    let full_reference = ReferenceRegion {
-        x: 0,
-        y: 0,
-        width: reference.width,
-        height: reference.height,
+    // A frame reaches only the part of an expanded canvas its footprint
+    // covers, and every sample beyond it would resample to `NaN`, so only
+    // that part is resampled, normalized and integrated. A fixed grid is
+    // resampled whole.
+    let region = match target.canvas {
+        Some(_) if !resamples_whole_canvas() => crate::registration::footprint_region(
+            frame.width,
+            frame.height,
+            reference.width,
+            reference.height,
+            geometry,
+            registration.transform,
+        ),
+        _ => ReferenceRegion {
+            x: 0,
+            y: 0,
+            width: reference.width,
+            height: reference.height,
+        },
     };
     let mut registered = crate::registration::resample_region_geometry(
         &frame,
         reference.width,
         reference.height,
-        full_reference,
+        region,
         geometry,
         options.interpolation.into(),
     )?;
@@ -2071,7 +2100,7 @@ pub(crate) fn prepare_frame(
     }
     let normalization = match NormalizationMap::estimate_with_gains(
         reference,
-        &registered,
+        Placed::on(&registered, region, reference),
         options.normalization,
         matches!(
             options.normalization,
@@ -2080,7 +2109,8 @@ pub(crate) fn prepare_frame(
         .then(|| {
             crate::normalization::photometric_gains(
                 reference,
-                &registered,
+                &target.reference_ceilings(reference),
+                Placed::on(&registered, region, reference),
                 &target.reference_star_positions(),
             )
         })
@@ -2119,19 +2149,25 @@ pub(crate) fn prepare_frame(
     // gate turns the frame away. Under Bayer drizzle the photosites are kept
     // instead, below, with the samples of this image a background fit reads.
     let (mut staged, background) = match (cache, photosites) {
-        (Some(cache), None) => (
-            cache.stage(
-                &registered,
-                cache.background_samples(&registered),
-                crate::replay::keeps_zeros(options, cfa),
-            ),
+        (Some(cache), None) => {
+            let placed = Placed::on(&registered, region, reference);
+            (
+                cache.stage(
+                    placed,
+                    cache.background_samples(placed),
+                    crate::replay::keeps_zeros(options, cfa),
+                ),
+                None,
+            )
+        }
+        (Some(cache), Some(_)) => (
             None,
+            cache.background_samples(Placed::on(&registered, region, reference)),
         ),
-        (Some(cache), Some(_)) => (None, cache.background_samples(&registered)),
         (None, _) => (None, None),
     };
     if !matches!(options.normalization, NormalizationMode::None)
-        && let Err(error) = normalization.apply(&mut registered)
+        && let Err(error) = normalization.apply_region(&mut registered, region.x, region.y)
     {
         let message = match error {
             Error::Normalization(message) => message,
@@ -2146,19 +2182,19 @@ pub(crate) fn prepare_frame(
             &frame,
             reference.width,
             reference.height,
-            full_reference,
+            region,
             geometry,
             crate::registration::Sampling::NearestPhotosite(layout),
         )?;
         staged = cache.and_then(|cache| {
             cache.stage(
-                &registered,
+                Placed::on(&registered, region, reference),
                 background,
                 crate::replay::keeps_zeros(options, cfa),
             )
         });
         if !matches!(options.normalization, NormalizationMode::None) {
-            normalization.apply(&mut registered)?;
+            normalization.apply_region(&mut registered, region.x, region.y)?;
         }
     }
     // Noise is read from the calibrated frame before resampling. Bilinear
@@ -2202,6 +2238,7 @@ pub(crate) fn prepare_frame(
     mapping.set_warp(registration.warp.clone())?;
     Ok(PreparedFrame::Ready(Box::new(ReadyFrame {
         registered,
+        region,
         transform: registration.transform,
         matched_stars: registration.matched_stars,
         registration_rms_pixels: registration.rms_error_pixels,
@@ -2216,6 +2253,27 @@ pub(crate) fn prepare_frame(
         photosites: photosites.is_some(),
         staged,
     })))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set by a test to prepare frames on an expanded canvas as before
+    /// their footprints bounded them, to compare the two: each resampled
+    /// over the whole canvas, which photometry reads for its brightest
+    /// sample.
+    static WHOLE_CANVAS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether [`prepare_frame`] prepares a frame over the whole of an expanded
+/// canvas: only for a test comparing that with its footprint.
+#[cfg(test)]
+fn resamples_whole_canvas() -> bool {
+    WHOLE_CANVAS.get()
+}
+
+#[cfg(not(test))]
+fn resamples_whole_canvas() -> bool {
+    false
 }
 
 /// The immutable half of a stack: everything preparing a frame may read.
@@ -2244,6 +2302,10 @@ pub(crate) struct IntegrationHalf<'a> {
     frame_cache: Option<crate::replay::CacheAdmissions<'a>>,
     /// Integrated fractions count the frame's finite footprint.
     expanded_canvas: bool,
+    /// The reference grid's width and height, which a frame's region lies
+    /// on.
+    reference_width: usize,
+    reference_height: usize,
 }
 
 impl IntegrationHalf<'_> {
@@ -2257,6 +2319,7 @@ impl IntegrationHalf<'_> {
         };
         let ReadyFrame {
             registered,
+            region,
             transform,
             matched_stars,
             registration_rms_pixels,
@@ -2272,10 +2335,16 @@ impl IntegrationHalf<'_> {
             staged,
         } = *ready;
         let weights = (!weight.is_empty()).then_some(weight.as_slice());
+        let placed = Placed {
+            image: &registered,
+            region,
+            width: self.reference_width,
+            height: self.reference_height,
+        };
 
         let (would_accept, _) =
             self.accumulator
-                .classify(&registered.data, self.options.rejection, weights);
+                .classify_placed(placed, self.options.rejection, weights);
         // A photosite frame offers one sample per pixel, not one per channel.
         let offered = if self.expanded_canvas {
             registered.data.iter().filter(|v| v.is_finite()).count()
@@ -2293,7 +2362,7 @@ impl IntegrationHalf<'_> {
         }
         let (accepted_samples, rejected_samples) =
             self.accumulator
-                .integrate(&registered.data, self.options.rejection, weights);
+                .integrate_placed(placed, self.options.rejection, weights);
         *self.accepted_frames += 1;
         self.ledger.admit(
             source,
@@ -2387,36 +2456,9 @@ impl Accumulator {
                 .zip(self.rejected.par_chunks_mut(ACCUMULATE_CHUNK))
                 .zip(samples.par_chunks(ACCUMULATE_CHUNK))
                 .map(|((((means, m2s), counts), rejecteds), samples)| {
-                    let (mut accepted, mut refused) = (0, 0);
-                    for ((((mean, m2), count), rejected), &sample) in means
-                        .iter_mut()
-                        .zip(m2s.iter_mut())
-                        .zip(counts.iter_mut())
-                        .zip(rejecteds.iter_mut())
-                        .zip(samples)
-                    {
-                        if !sample.is_finite() {
-                            continue;
-                        }
-                        if should_reject_sample(*mean, *m2, *count, sample, rejection) {
-                            *rejected = rejected.saturating_add(1);
-                            refused += 1;
-                            continue;
-                        }
-                        let next_count = count.saturating_add(1);
-                        let delta = sample - *mean;
-                        *mean += delta / next_count as f32;
-                        let delta_after = sample - *mean;
-                        *m2 += delta * delta_after;
-                        *count = next_count;
-                        accepted += 1;
-                    }
-                    (accepted, refused)
+                    integrate_run(means, m2s, counts, rejecteds, samples, rejection)
                 })
-                .reduce(
-                    || (0, 0),
-                    |left, right| (left.0 + right.0, left.1 + right.1),
-                );
+                .reduce(|| (0, 0), add_counts);
         };
         let unit = [1.0_f32];
         let weights = weights.unwrap_or(&unit);
@@ -2431,32 +2473,95 @@ impl Accumulator {
             .enumerate()
             .map(
                 |(index, (((((mean, m2), count), rejected), weight_sum), &sample))| {
-                    if !sample.is_finite() {
-                        return (0, 0);
-                    }
-                    let weight = weights[index % channels];
-                    if should_reject_weighted_sample(*mean, *m2, *count, sample, weight, rejection)
-                    {
-                        *rejected = rejected.saturating_add(1);
-                        return (0, 1);
-                    }
-                    // West's weighted update. With weight 1 every operation
-                    // matches the equal-weight update bit for bit.
-                    let next_weight = *weight_sum + weight;
-                    let delta = sample - *mean;
-                    let weighted_delta = delta * weight;
-                    *mean += weighted_delta / next_weight;
-                    let delta_after = sample - *mean;
-                    *m2 += weighted_delta * delta_after;
-                    *weight_sum = next_weight;
-                    *count = count.saturating_add(1);
-                    (1, 0)
+                    integrate_weighted(
+                        (mean, m2, count, rejected, weight_sum),
+                        sample,
+                        weights[index % channels],
+                        rejection,
+                    )
                 },
             )
-            .reduce(
-                || (0, 0),
-                |left, right| (left.0 + right.0, left.1 + right.1),
+            .reduce(|| (0, 0), add_counts)
+    }
+
+    /// [`Self::integrate`] for a frame placed on the reference grid, visiting
+    /// only its region's rows, each as wide as the region. Every sample
+    /// beyond the region is `NaN`, which integration skips, so this is
+    /// [`Self::integrate`] of the grid-sized frame.
+    fn integrate_placed(
+        &mut self,
+        frame: Placed<'_>,
+        rejection: RejectionMode,
+        weights: Option<&[f32]>,
+    ) -> (usize, usize) {
+        if frame.is_whole() {
+            return self.integrate(&frame.image.data, rejection, weights);
+        }
+        let RegionRows {
+            rows,
+            span,
+            grid_row,
+        } = RegionRows::of(frame);
+        let samples = frame.image.data.par_chunks(span.len());
+        let Some(weight_sum) = self.weight_sum.as_mut() else {
+            debug_assert!(weights.is_none(), "equal-weight stack given weights");
+            return self.mean[rows.clone()]
+                .par_chunks_mut(grid_row)
+                .zip(self.m2[rows.clone()].par_chunks_mut(grid_row))
+                .zip(self.count[rows.clone()].par_chunks_mut(grid_row))
+                .zip(self.rejected[rows].par_chunks_mut(grid_row))
+                .zip(samples)
+                .map(|((((means, m2s), counts), rejecteds), samples)| {
+                    integrate_run(
+                        &mut means[span.clone()],
+                        &mut m2s[span.clone()],
+                        &mut counts[span.clone()],
+                        &mut rejecteds[span.clone()],
+                        samples,
+                        rejection,
+                    )
+                })
+                .reduce(|| (0, 0), add_counts);
+        };
+        let unit = [1.0_f32];
+        let weights = weights.unwrap_or(&unit);
+        let channels = weights.len();
+        // A row of the region starts at a pixel, so a sample's channel is
+        // its place in the row's, as it is in the grid's.
+        self.mean[rows.clone()]
+            .par_chunks_mut(grid_row)
+            .zip(self.m2[rows.clone()].par_chunks_mut(grid_row))
+            .zip(self.count[rows.clone()].par_chunks_mut(grid_row))
+            .zip(self.rejected[rows.clone()].par_chunks_mut(grid_row))
+            .zip(weight_sum[rows].par_chunks_mut(grid_row))
+            .zip(samples)
+            .map(
+                |(((((means, m2s), counts), rejecteds), weight_sums), samples)| {
+                    means[span.clone()]
+                    .iter_mut()
+                    .zip(&mut m2s[span.clone()])
+                    .zip(&mut counts[span.clone()])
+                    .zip(&mut rejecteds[span.clone()])
+                    .zip(&mut weight_sums[span.clone()])
+                    .zip(samples)
+                    .enumerate()
+                    .fold(
+                        (0, 0),
+                        |total, (index, (((((mean, m2), count), rejected), weight_sum), &sample))| {
+                            add_counts(
+                                total,
+                                integrate_weighted(
+                                    (mean, m2, count, rejected, weight_sum),
+                                    sample,
+                                    weights[index % channels],
+                                    rejection,
+                                ),
+                            )
+                        },
+                    )
+                },
             )
+            .reduce(|| (0, 0), add_counts)
     }
 
     fn classify(
@@ -2474,23 +2579,9 @@ impl Accumulator {
                 .zip(self.count.par_chunks(ACCUMULATE_CHUNK))
                 .zip(samples.par_chunks(ACCUMULATE_CHUNK))
                 .map(|(((means, m2s), counts), samples)| {
-                    let (mut accepted, mut refused) = (0, 0);
-                    for (((&mean, &m2), &count), &sample) in
-                        means.iter().zip(m2s).zip(counts).zip(samples)
-                    {
-                        if !sample.is_finite() {
-                        } else if should_reject_sample(mean, m2, count, sample, rejection) {
-                            refused += 1;
-                        } else {
-                            accepted += 1;
-                        }
-                    }
-                    (accepted, refused)
+                    classify_run(means, m2s, counts, samples, rejection)
                 })
-                .reduce(
-                    || (0, 0),
-                    |left, right| (left.0 + right.0, left.1 + right.1),
-                );
+                .reduce(|| (0, 0), add_counts);
         }
         let unit = [1.0_f32];
         let weights = weights.unwrap_or(&unit);
@@ -2501,26 +2592,79 @@ impl Accumulator {
             .zip(self.count.par_iter())
             .zip(samples.par_iter())
             .enumerate()
-            .map(|(index, (((mean, m2), count), &sample))| {
-                if !sample.is_finite() {
-                    (0, 0)
-                } else if should_reject_weighted_sample(
-                    *mean,
-                    *m2,
-                    *count,
+            .map(|(index, (((&mean, &m2), &count), &sample))| {
+                classify_weighted(
+                    (mean, m2, count),
                     sample,
                     weights[index % channels],
                     rejection,
-                ) {
-                    (0, 1)
-                } else {
-                    (1, 0)
-                }
+                )
             })
-            .reduce(
-                || (0, 0),
-                |left, right| (left.0 + right.0, left.1 + right.1),
-            )
+            .reduce(|| (0, 0), add_counts)
+    }
+
+    /// [`Self::classify`] for a frame placed on the reference grid, as
+    /// [`Self::integrate_placed`] visits it.
+    fn classify_placed(
+        &self,
+        frame: Placed<'_>,
+        rejection: RejectionMode,
+        weights: Option<&[f32]>,
+    ) -> (usize, usize) {
+        if frame.is_whole() {
+            return self.classify(&frame.image.data, rejection, weights);
+        }
+        let RegionRows {
+            rows,
+            span,
+            grid_row,
+        } = RegionRows::of(frame);
+        let moments = self.mean[rows.clone()]
+            .par_chunks(grid_row)
+            .zip(self.m2[rows.clone()].par_chunks(grid_row))
+            .zip(self.count[rows].par_chunks(grid_row))
+            .zip(frame.image.data.par_chunks(span.len()));
+        if self.weight_sum.is_none() {
+            debug_assert!(weights.is_none(), "equal-weight stack given weights");
+            return moments
+                .map(|(((means, m2s), counts), samples)| {
+                    classify_run(
+                        &means[span.clone()],
+                        &m2s[span.clone()],
+                        &counts[span.clone()],
+                        samples,
+                        rejection,
+                    )
+                })
+                .reduce(|| (0, 0), add_counts);
+        }
+        let unit = [1.0_f32];
+        let weights = weights.unwrap_or(&unit);
+        let channels = weights.len();
+        moments
+            .map(|(((means, m2s), counts), samples)| {
+                means[span.clone()]
+                    .iter()
+                    .zip(&m2s[span.clone()])
+                    .zip(&counts[span.clone()])
+                    .zip(samples)
+                    .enumerate()
+                    .fold(
+                        (0, 0),
+                        |total, (index, (((&mean, &m2), &count), &sample))| {
+                            add_counts(
+                                total,
+                                classify_weighted(
+                                    (mean, m2, count),
+                                    sample,
+                                    weights[index % channels],
+                                    rejection,
+                                ),
+                            )
+                        },
+                    )
+            })
+            .reduce(|| (0, 0), add_counts)
     }
 
     fn snapshot(&self) -> (Vec<f32>, Vec<f32>) {
@@ -2606,6 +2750,139 @@ pub(crate) fn fill_photosite_gaps(
 /// Samples per parallel task in the accumulator's per-sample passes.
 const ACCUMULATE_CHUNK: usize = 16 * 1024;
 
+/// The accumulator samples a placed frame's region covers: `span` of each
+/// whole row of the grid in `rows`, rows `grid_row` samples long.
+struct RegionRows {
+    rows: std::ops::Range<usize>,
+    span: std::ops::Range<usize>,
+    grid_row: usize,
+}
+
+impl RegionRows {
+    fn of(frame: Placed<'_>) -> Self {
+        let channels = frame.channels();
+        let grid_row = frame.width * channels;
+        let start = frame.region.x * channels;
+        Self {
+            rows: frame.region.y * grid_row..(frame.region.y + frame.region.height) * grid_row,
+            span: start..start + frame.region.width * channels,
+            grid_row,
+        }
+    }
+}
+
+/// Sum two (accepted, refused) tallies.
+fn add_counts(left: (usize, usize), right: (usize, usize)) -> (usize, usize) {
+    (left.0 + right.0, left.1 + right.1)
+}
+
+/// Integrate `samples` into equal-weight moments one by one, by Welford's
+/// update, skipping those not finite and counting those rejection refuses.
+/// Returns how many were accepted and how many refused.
+fn integrate_run(
+    means: &mut [f32],
+    m2s: &mut [f32],
+    counts: &mut [u32],
+    rejecteds: &mut [u32],
+    samples: &[f32],
+    rejection: RejectionMode,
+) -> (usize, usize) {
+    let (mut accepted, mut refused) = (0, 0);
+    for ((((mean, m2), count), rejected), &sample) in means
+        .iter_mut()
+        .zip(m2s.iter_mut())
+        .zip(counts.iter_mut())
+        .zip(rejecteds.iter_mut())
+        .zip(samples)
+    {
+        if !sample.is_finite() {
+            continue;
+        }
+        if should_reject_sample(*mean, *m2, *count, sample, rejection) {
+            *rejected = rejected.saturating_add(1);
+            refused += 1;
+            continue;
+        }
+        let next_count = count.saturating_add(1);
+        let delta = sample - *mean;
+        *mean += delta / next_count as f32;
+        let delta_after = sample - *mean;
+        *m2 += delta * delta_after;
+        *count = next_count;
+        accepted += 1;
+    }
+    (accepted, refused)
+}
+
+/// Integrate one sample of a frame of weight `weight` into a weighted
+/// accumulator's mean, m2, count, rejected count and weight sum, by West's
+/// update, unless rejection refuses it. Returns `(1, 0)` when it is
+/// accepted, `(0, 1)` when refused and `(0, 0)` when it is not finite.
+#[inline(always)]
+fn integrate_weighted(
+    (mean, m2, count, rejected, weight_sum): (&mut f32, &mut f32, &mut u32, &mut u32, &mut f32),
+    sample: f32,
+    weight: f32,
+    rejection: RejectionMode,
+) -> (usize, usize) {
+    if !sample.is_finite() {
+        return (0, 0);
+    }
+    if should_reject_weighted_sample(*mean, *m2, *count, sample, weight, rejection) {
+        *rejected = rejected.saturating_add(1);
+        return (0, 1);
+    }
+    // West's weighted update. With weight 1 every operation matches the
+    // equal-weight update bit for bit.
+    let next_weight = *weight_sum + weight;
+    let delta = sample - *mean;
+    let weighted_delta = delta * weight;
+    *mean += weighted_delta / next_weight;
+    let delta_after = sample - *mean;
+    *m2 += weighted_delta * delta_after;
+    *weight_sum = next_weight;
+    *count = count.saturating_add(1);
+    (1, 0)
+}
+
+/// How many of `samples` [`integrate_run`] would accept and refuse.
+fn classify_run(
+    means: &[f32],
+    m2s: &[f32],
+    counts: &[u32],
+    samples: &[f32],
+    rejection: RejectionMode,
+) -> (usize, usize) {
+    let (mut accepted, mut refused) = (0, 0);
+    for (((&mean, &m2), &count), &sample) in means.iter().zip(m2s).zip(counts).zip(samples) {
+        if !sample.is_finite() {
+        } else if should_reject_sample(mean, m2, count, sample, rejection) {
+            refused += 1;
+        } else {
+            accepted += 1;
+        }
+    }
+    (accepted, refused)
+}
+
+/// What [`integrate_weighted`] would return for one sample, given its
+/// mean, m2 and count.
+#[inline(always)]
+fn classify_weighted(
+    (mean, m2, count): (f32, f32, u32),
+    sample: f32,
+    weight: f32,
+    rejection: RejectionMode,
+) -> (usize, usize) {
+    if !sample.is_finite() {
+        (0, 0)
+    } else if should_reject_weighted_sample(mean, m2, count, sample, weight, rejection) {
+        (0, 1)
+    } else {
+        (1, 0)
+    }
+}
+
 /// A sample never observed has an undefined mean; mask it so downstream
 /// renderers can drop it by coverage.
 fn finalized_mean(mean: f32, count: u32) -> f32 {
@@ -2672,6 +2949,10 @@ pub(crate) fn rotation_deviation_degrees(rotation_radians: f64) -> f64 {
     let modulo_half_turn = rotation_radians.to_degrees().rem_euclid(180.0);
     modulo_half_turn.min(180.0 - modulo_half_turn)
 }
+
+#[cfg(test)]
+#[path = "stack_canvas_tests.rs"]
+mod canvas_tests;
 
 #[cfg(test)]
 mod tests {
