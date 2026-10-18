@@ -610,6 +610,32 @@ frames keeps each admitted frame's registered image on disk as it is stacked,
 about four bytes per pixel per channel for each frame, so a reintegration reads
 that instead and gives the same result sooner.
 
+`StackOptions(bin_factor=2)` (or 3, or 4) area-mean bins each light after it is
+calibrated, repaired and debayered, before registration, so a large sensor or a
+mosaic stacks quickly and in a quarter (or a sixteenth) of the memory. Pixel
+options keep their meaning in the sensor's pixels, and `registration_rms_pixels`
+reports in them; the live view, snapshots and each frame's mapping (which then
+carries `"bin_factor"`) are on the binned grid. Bayer drizzle needs single
+photosites, so it is refused with a bin factor above 1, and so is
+`reintegrate_drizzled`. When the session is done, reintegrate the same frames at
+full resolution without registering them again:
+
+```python
+options = seiza.StackOptions(bin_factor=2, normalization="local-background")
+stacker = seiza.LiveStacker("light-001.fits", options=options)
+...                                         # push the rest as usual
+full, refined, rms = stacker.reintegrate_full_resolution()
+full.write_fits("stack-full.fits")          # WCS carried to the sensor's grid
+```
+
+Each frame's transform is carried exactly from the binned grid, and with
+`refine=True` (the default) a single field refits it against stars detected at
+full resolution, as registration would find them there. `refined` counts the
+frames refitted and `rms` is their median registration RMS in the sensor's
+pixels, or None when no frame's is known. A mosaic has no full-resolution
+reference to refine against, so its frames keep their carried transforms, and
+`rms` is the binned pass's, the error those carry.
+
 Frames calibrated, registered and normalized somewhere else, one size on one
 pixel grid with uncovered samples as NaN, take the same rejection through
 `integrate_registered_frames`. It reads each file once per pass and registers

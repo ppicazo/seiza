@@ -41,6 +41,7 @@
 //! That program picks its own threads.
 
 mod batch;
+mod binning;
 mod calibration;
 mod calibration_plan;
 mod color;
@@ -104,8 +105,9 @@ pub use external::{
 };
 pub use fits::{
     FitsFrame, FrameCalibrationState, FrameMetadata, FrameSourceRole, drizzle_reference_headers,
-    write_color_fits_f32, write_drizzle_fits_f32, write_fits_f32, write_linear_image_fits_f32,
-    write_master_fits_f32, write_processed_image_fits_f32, write_stack_export_fits_f32,
+    rescaled_reference_headers, write_color_fits_f32, write_drizzle_fits_f32, write_fits_f32,
+    write_linear_image_fits_f32, write_master_fits_f32, write_processed_image_fits_f32,
+    write_stack_export_fits_f32,
 };
 pub use image::{BayerLayout, Demosaic, LinearImage};
 pub use mapping::RegisteredFrameMapping;
@@ -139,8 +141,8 @@ pub use seiza::CancelSignal;
 pub use snr::{SIGNAL_FRACTION, SnrSample, checkpoint_depths, frame_noise, measure_depth};
 pub use stack::{
     CfaIntegration, DeltaSigmaOptions, FrameAcceptanceCriteria, FrameDiagnostics, FrameDisposition,
-    FrameInputMode, FrameRejectionReason, FrameWeighting, LiveStacker, RejectionMode,
-    StackExportSnapshot, StackOptions, StackSnapshot, StackView,
+    FrameInputMode, FrameRejectionReason, FrameWeighting, FullResolutionStack, LiveStacker,
+    RejectionMode, StackExportSnapshot, StackOptions, StackSnapshot, StackView,
 };
 
 use std::path::PathBuf;

@@ -1819,6 +1819,60 @@ SeizaDrizzleResult *seiza_live_stacker_reintegrate_drizzled(const SeizaLiveStack
                                                             char **error_out);
 
 /*
+ The factor every light of this stack is binned by after calibration and
+ before registration (the `"bin_factor"` of its stack options JSON), 1 to
+ 4: the live view, snapshots and each frame's mapping are on the binned
+ grid. 0 for a null stacker.
+
+ # Safety
+ `stacker` must be null or a live `SeizaLiveStacker` pointer.
+ */
+uint32_t seiza_live_stacker_bin_factor(const SeizaLiveStacker *stacker);
+
+/*
+ [`seiza_live_stacker_reintegrate`] at the sensor's full resolution: every
+ admitted frame of a binned stack read again unbinned and integrated onto
+ a grid [`seiza_live_stacker_bin_factor`] times as fine. At a bin factor
+ of 1 it is [`seiza_live_stacker_reintegrate`].
+
+ No transform is searched for again: each frame's is carried exactly from
+ the binned grid. With `refine`, a single field detects every frame's
+ stars at full resolution, as it does the reference frame's, and refits
+ each transform from that seed; a frame whose stars do not pair keeps the
+ carried one. An expanded canvas has no full-resolution reference to
+ refine against, so its frames keep their carried transforms. The
+ snapshot's reference headers carry the reference's WCS to the finer grid,
+ with its binning and pixel-size cards the sensor's again.
+
+ When non-null, `refined_frames_out` receives how many frames were
+ refined, and `registration_rms_out` the median registration RMS of the
+ admitted frames in the sensor's pixels: each refined frame's refit, and
+ for every other frame the RMS the binned pass measured, which its carried
+ transform is expected to keep (a host may warn on a canvas). It is NaN
+ when no frame's is known, as for a stack reopened from a context and not
+ refined. The refit reads each frame once, and `progress` hears it as
+ pass 0 for each frame in turn before the reintegration's own progress.
+ `low_sigma`, `high_sigma`, `cancel`, `progress` and `context` work as in
+ [`seiza_live_stacker_reintegrate`], and memory is reintegration's on the
+ finer grid.
+
+ # Safety
+ As for [`seiza_live_stacker_reintegrate`]. When non-null,
+ `refined_frames_out` and `registration_rms_out` must each point to
+ writable storage for one value.
+ */
+SeizaStackSnapshot *seiza_live_stacker_reintegrate_full_resolution(const SeizaLiveStacker *stacker,
+                                                                   bool refine,
+                                                                   float low_sigma,
+                                                                   float high_sigma,
+                                                                   const SeizaCancelSignal *cancel,
+                                                                   SeizaStackReintegrateProgressCallback progress,
+                                                                   void *context,
+                                                                   size_t *refined_frames_out,
+                                                                   double *registration_rms_out,
+                                                                   char **error_out);
+
+/*
  # Safety
  `drizzle` must be null or a live `SeizaDrizzleResult` pointer.
  */

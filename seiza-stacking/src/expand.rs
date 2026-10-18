@@ -15,6 +15,7 @@
 //! is planned again on undistorted grids, and every frame's warp leads
 //! through the lens onto its own pixels.
 
+use crate::binning::Scale;
 use crate::lens::{LensDistortion, LensFit, LensFrame};
 use crate::{
     CalibrationMasters, Continue, Error, FitsFrame, FrameMetadata, LinearImage, NormalizationMap,
@@ -172,12 +173,15 @@ struct Window {
 }
 
 impl Window {
+    /// The panel at `region` of `canvas`, binned at `scale`, matching with
+    /// `options` in the sensor's pixels.
     fn new(
         canvas: &LinearImage,
         region: ReferenceRegion,
         options: &RegistrationOptions,
+        scale: Scale,
     ) -> Result<Self> {
-        Self::from_pixels(&crop(canvas, region, 0, 0)?, region, options)
+        Self::from_pixels(&crop(canvas, region, 0, 0)?, region, options, scale)
     }
 
     /// A panel at `region` whose stars are detected in `pixels`, an image of
@@ -186,15 +190,22 @@ impl Window {
         pixels: &LinearImage,
         region: ReferenceRegion,
         options: &RegistrationOptions,
+        scale: Scale,
     ) -> Result<Self> {
-        let options = Self::options(region, options);
-        let stars = crate::registration::detect_stars(pixels, &options, options.dense_star_count());
-        Self::from_stars(region, stars, options)
+        let options = Self::options(region, options, scale);
+        let stars =
+            crate::registration::detect_stars(pixels, &options, options.dense_star_count(), scale);
+        Self::from_stars(region, stars, options, scale)
     }
 
-    /// The registration options a panel at `region` matches with.
-    fn options(region: ReferenceRegion, options: &RegistrationOptions) -> RegistrationOptions {
-        let mut options = options.clone();
+    /// The registration options, in working pixels, a panel at `region`
+    /// matches with, from `options` in the sensor's pixels.
+    fn options(
+        region: ReferenceRegion,
+        options: &RegistrationOptions,
+        scale: Scale,
+    ) -> RegistrationOptions {
+        let mut options = scale.registration(options);
         // A frame overlapping this panel anywhere lies within about two of
         // its diagonals of the panel's center.
         options.maximum_drift_pixels = 2.0 * (region.width as f64).hypot(region.height as f64);
@@ -209,13 +220,14 @@ impl Window {
         region: ReferenceRegion,
         stars: Vec<DetectedStar>,
         options: RegistrationOptions,
+        scale: Scale,
     ) -> Result<Self> {
         let maximum_stars = options.maximum_stars;
         let match_tolerance_pixels = options.match_tolerance_pixels;
         let radius = options.effective_maximum_drift_pixels(region.width, region.height);
         let hypotheses =
             (radius / match_tolerance_pixels).powi(2) + options.maximum_candidates as f64;
-        let registrar = Registrar::from_stars(region.width, region.height, stars, options)?;
+        let registrar = Registrar::from_stars(region.width, region.height, stars, options, scale)?;
         Ok(Self {
             region,
             stars: registrar.reference_star_positions(),
@@ -372,13 +384,15 @@ pub(crate) struct CanvasRegistrar {
 impl CanvasRegistrar {
     /// Panels at `regions` of `canvas`, matching the stars planning saved
     /// for them, or, for a context saved before panels kept their stars,
-    /// the stars of the canvas beneath them.
+    /// the stars of the canvas beneath them. `canvas`, its panels and `lens`
+    /// are binned at `scale`, and `options` are in the sensor's pixels.
     pub(crate) fn new(
         canvas: &LinearImage,
         regions: &[ReferenceRegion],
         stars: Option<Vec<Vec<DetectedStar>>>,
         lens: Option<LensDistortion>,
         options: &RegistrationOptions,
+        scale: Scale,
     ) -> Result<Self> {
         if regions.is_empty() {
             return Err(Error::Stack("an expanded canvas needs a panel".into()));
@@ -412,17 +426,22 @@ impl CanvasRegistrar {
                     )));
                 }
                 match stars.as_mut().and_then(Iterator::next) {
-                    Some(stars) => {
-                        Window::from_stars(*region, stars, Window::options(*region, options))
-                    }
-                    None => Window::new(canvas, *region, options),
+                    Some(stars) => Window::from_stars(
+                        *region,
+                        stars,
+                        Window::options(*region, options, scale),
+                        scale,
+                    ),
+                    None => Window::new(canvas, *region, options, scale),
                 }
             })
             .collect::<Result<Vec<_>>>()?;
         if let Some(lens) = &lens {
             lens.validate()?;
         }
-        let summary = lens.map(|lens| crate::ExpandedLens::new(&lens, None));
+        // Reported in the sensor's pixels, as planning measured it.
+        let summary =
+            lens.map(|lens| crate::ExpandedLens::new(&lens.rescaled(f64::from(scale.bin())), None));
         Ok(Self::from_windows(canvas, windows, lens).with_summary(summary))
     }
 
@@ -544,8 +563,9 @@ impl CanvasRegistrar {
 }
 
 /// Reject the frames that neither start a panel nor fit like the frames
-/// warped onto one; see [`RESIDUAL_OUTLIER_FACTOR`].
-fn reject_residual_outliers(plans: &mut HashMap<PathBuf, PlannedRegistration>) {
+/// warped onto one; see [`RESIDUAL_OUTLIER_FACTOR`]. Residuals are in working
+/// pixels, binned at `scale`.
+fn reject_residual_outliers(plans: &mut HashMap<PathBuf, PlannedRegistration>, scale: Scale) {
     let mut residuals = plans
         .values()
         .filter(|plan| !plan.starts_panel)
@@ -557,7 +577,7 @@ fn reject_residual_outliers(plans: &mut HashMap<PathBuf, PlannedRegistration>) {
     }
     residuals.sort_by(f64::total_cmp);
     let median = residuals[residuals.len() / 2];
-    let limit = (RESIDUAL_OUTLIER_FACTOR * median).max(RESIDUAL_OUTLIER_FLOOR_PIXELS);
+    let limit = (RESIDUAL_OUTLIER_FACTOR * median).max(scale.length(RESIDUAL_OUTLIER_FLOOR_PIXELS));
     for plan in plans.values_mut().filter(|plan| !plan.starts_panel) {
         if let Ok(result) = &plan.result
             && result.rms_error_pixels > limit
@@ -827,6 +847,7 @@ pub(crate) fn plan(
     let first = paths
         .first()
         .ok_or_else(|| Error::Stack("expansion needs light frames".into()))?;
+    let scale = options.scale();
     // Keep the original identity across deferred matches and the lens pass.
     // A later read must never combine new pixels with cached star detections.
     let stamps: HashMap<_, _> = paths
@@ -867,7 +888,7 @@ pub(crate) fn plan(
         width: frame.image.width,
         height: frame.image.height,
     };
-    let anchor = Window::new(&frame.image, anchor, &options.registration)?;
+    let anchor = Window::new(&frame.image, anchor, &options.registration, scale)?;
     let record = Record {
         anchor_size: (frame.image.width, frame.image.height),
         anchor_headers: frame.headers.clone(),
@@ -878,6 +899,7 @@ pub(crate) fn plan(
                 &frame.image,
                 &options.registration,
                 LENS_STARS,
+                scale,
             ),
             window: 0,
             creates_window: true,
@@ -909,22 +931,31 @@ pub(crate) fn plan(
         origin: (0.0, 0.0),
         record,
     };
-    let prepare = |path: &Path, channels: usize| -> Result<(LinearImage, OpticalMetadata)> {
-        check_source(path)?;
-        let frame = FitsFrame::open(path)?;
-        let optics = OpticalMetadata::from_frame(&frame);
-        let (frame, _) =
-            crate::stack::prepare_light(frame, calibration, &options.match_tolerances, options)
-                .map_err(crate::stack::LightFailure::into_error)?;
-        check_source(path)?;
-        if frame.image.channels != channels {
-            return Err(Error::Stack(format!(
-                "{} has a different channel count",
-                path.display()
-            )));
-        }
-        Ok((frame.image, optics))
-    };
+    // A frame as the stack prepares it, binned by `bin_factor`: the
+    // stack's own, or 1 for the lens's stars.
+    let prepare_at =
+        |path: &Path, channels: usize, bin_factor: u32| -> Result<(LinearImage, OpticalMetadata)> {
+            check_source(path)?;
+            let frame = FitsFrame::open(path)?;
+            let optics = OpticalMetadata::from_frame(&frame);
+            let (frame, _) = crate::stack::prepare_light_at(
+                frame,
+                calibration,
+                &options.match_tolerances,
+                options,
+                bin_factor,
+            )
+            .map_err(crate::stack::LightFailure::into_error)?;
+            check_source(path)?;
+            if frame.image.channels != channels {
+                return Err(Error::Stack(format!(
+                    "{} has a different channel count",
+                    path.display()
+                )));
+            }
+            Ok((frame.image, optics))
+        };
+    let prepare = |path: &Path, channels: usize| prepare_at(path, channels, options.bin_factor);
     let mut pending = paths[1..]
         .iter()
         .map(|path| Pending {
@@ -1066,7 +1097,15 @@ pub(crate) fn plan(
     // The lens bends neighboring panels' edges opposite ways, which the
     // similarities placing the panels' first frames cannot follow; measured
     // where those frames overlap, it is undone and the canvas planned again.
-    if let Some(fit) = compatible.then(|| plan.estimate_lens()).flatten() {
+    let estimate = if compatible {
+        plan.estimate_lens(
+            &|path, channels| prepare_at(path, channels, 1).map(|(image, _)| image),
+            options,
+        )?
+    } else {
+        None
+    };
+    if let Some((fit, measured)) = estimate {
         match plan.rebuild(
             &fit,
             first,
@@ -1076,7 +1115,7 @@ pub(crate) fn plan(
             &mut progress,
         ) {
             Ok(rebuilt) => {
-                summary = Some(crate::ExpandedLens::new(&fit.distortion, Some(&fit)));
+                summary = Some(measured);
                 plan = rebuilt;
             }
             // Only a geometric or photometric failure can keep the first
@@ -1087,7 +1126,7 @@ pub(crate) fn plan(
             Err(error) => return Err(error),
         }
     }
-    reject_residual_outliers(&mut plan.registrations);
+    reject_residual_outliers(&mut plan.registrations, scale);
     let (width, height) = (plan.image.width, plan.image.height);
     for planned in plan
         .registrations
@@ -1249,7 +1288,8 @@ impl Plan {
         // same frames fit at 0.05px.
         let mut creates_window = false;
         if filled as f64 >= NEW_PANEL_FRACTION * source_area
-            && let Ok(panel) = Window::from_pixels(&incoming, region, &options.registration)
+            && let Ok(panel) =
+                Window::from_pixels(&incoming, region, &options.registration, options.scale())
         {
             self.windows.push(panel);
             self.last_window = self.windows.len() - 1;
@@ -1258,7 +1298,12 @@ impl Plan {
         if starts_panel {
             self.record.starts.push(Start {
                 path: path.to_path_buf(),
-                stars: crate::registration::detect_stars(source, &options.registration, LENS_STARS),
+                stars: crate::registration::detect_stars(
+                    source,
+                    &options.registration,
+                    LENS_STARS,
+                    options.scale(),
+                ),
                 window,
                 creates_window,
             });
@@ -1306,9 +1351,10 @@ impl Plan {
             NormalizationMode::LocalBackground { .. }
         )
         .then(|| {
+            let scale = options.scale();
             [
-                PHOTOMETRY_PAIRING_PIXELS,
-                options.registration.match_tolerance_pixels,
+                scale.floored_length(PHOTOMETRY_PAIRING_PIXELS, 0.75),
+                scale.floored_length(options.registration.match_tolerance_pixels, 1.0),
             ]
             .into_iter()
             .find_map(|tolerance| {
@@ -1324,7 +1370,7 @@ impl Plan {
         let normalization = NormalizationMap::estimate_with_gains(
             existing,
             crate::image::Placed::whole(incoming),
-            options.normalization,
+            options.scale().normalization(options.normalization),
             gains.as_deref(),
         )?;
         let (low, high) = normalization.gain_range();
@@ -1490,13 +1536,15 @@ impl Plan {
         let mut initial = registration.transform;
         initial.translation_x -= region.x as f64;
         initial.translation_y -= region.y as f64;
+        let scale = options.scale();
         let mut refined = crate::registration::refine_similarity(
             &covered,
             source,
             stars,
             initial,
-            &options.registration,
+            &scale.registration(&options.registration),
             options.registration.maximum_stars * PLANNING_STARS_FACTOR,
+            scale,
         )
         .filter(|refined| refined.matched_stars > registration.matched_stars)?;
         refined = admissible(refined, options).ok()?;
@@ -1518,8 +1566,20 @@ impl Plan {
 
     /// Measure the lens where the anchor and the frames that started panels
     /// overlap. `None` unless every frame has the same dimensions and the lens
-    /// explains what their similarities leave.
-    fn estimate_lens(&self) -> Option<LensFit> {
+    /// explains what their similarities leave. Returns the fit on the
+    /// working grid, and what it measured, in the sensor's pixels.
+    ///
+    /// On binned frames the lens is measured on the sensor's own pixels: the
+    /// anchor and each panel start are prepared again unbinned by `native`,
+    /// and their stars detected there, so the lens's pairing radii and the
+    /// improvement it must show keep their meaning rather than falling into
+    /// the centroid noise of a few binned pixels. The fit then carries back
+    /// to the binned grid exactly.
+    fn estimate_lens(
+        &self,
+        native: &dyn Fn(&Path, usize) -> Result<LinearImage>,
+        options: &StackOptions,
+    ) -> Result<Option<(LensFit, crate::ExpandedLens)>> {
         let (width, height) = self.record.anchor_size;
         if self.record.starts.len() < 2
             || self
@@ -1528,31 +1588,81 @@ impl Plan {
                 .iter()
                 .any(|joined| joined.size != (width, height))
         {
-            return None;
+            return Ok(None);
         }
-        let anchor = self.placement(&self.record.starts[0].path)?;
+        let Some(anchor) = self.placement(&self.record.starts[0].path) else {
+            return Ok(None);
+        };
         let to_anchor = SimilarityTransform {
             translation_x: -anchor.translation_x,
             translation_y: -anchor.translation_y,
             ..SimilarityTransform::IDENTITY
         };
-        let frames = self
+        let Some(placements) = self
+            .record
+            .starts
+            .iter()
+            .map(|start| Some(self.placement(&start.path)?.then(to_anchor)))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
+        let focal = focal_length_pixels(&self.record.anchor_headers);
+        let bin = options.bin_factor;
+        if bin == 1 {
+            let frames = self
+                .record
+                .starts
+                .iter()
+                .zip(placements)
+                .map(|(start, placement)| LensFrame {
+                    stars: &start.stars,
+                    placement,
+                })
+                .collect::<Vec<_>>();
+            return Ok(
+                crate::lens::estimate(&frames, width, height, focal).map(|fit| {
+                    let measured = crate::ExpandedLens::new(&fit.distortion, Some(&fit));
+                    (fit, measured)
+                }),
+            );
+        }
+        // The binned grid spans `bin` sensor pixels per pixel, its focal
+        // length and placements with it.
+        let factor = f64::from(bin);
+        let stars = self
             .record
             .starts
             .iter()
             .map(|start| {
-                Some(LensFrame {
-                    stars: &start.stars,
-                    placement: self.placement(&start.path)?.then(to_anchor),
-                })
+                let image = native(&start.path, self.image.channels)?;
+                Ok(crate::registration::detect_stars(
+                    &image,
+                    &options.registration,
+                    LENS_STARS,
+                    Scale::NATIVE,
+                ))
             })
-            .collect::<Option<Vec<_>>>()?;
-        crate::lens::estimate(
+            .collect::<Result<Vec<_>>>()?;
+        let frames = stars
+            .iter()
+            .zip(placements)
+            .map(|(stars, placement)| LensFrame {
+                stars,
+                placement: placement.rescaled(factor),
+            })
+            .collect::<Vec<_>>();
+        let (native_width, native_height) = (width * bin as usize, height * bin as usize);
+        Ok(crate::lens::estimate(
             &frames,
-            width,
-            height,
-            focal_length_pixels(&self.record.anchor_headers),
+            native_width,
+            native_height,
+            focal.map(|focal| focal * factor),
         )
+        .map(|fit| {
+            let measured = crate::ExpandedLens::new(&fit.distortion, Some(&fit));
+            (fit.rescaled(1.0 / factor), measured)
+        }))
     }
 
     /// Plan the canvas again on the undistorted grids `fit` measured: the
@@ -1611,7 +1721,7 @@ impl Plan {
             options.interpolation,
         )?;
         drop(source);
-        let anchor = Window::new(&image, region, &options.registration)?;
+        let anchor = Window::new(&image, region, &options.registration, options.scale())?;
         let mut headers = self.record.anchor_headers.clone();
         // These pixels are undistorted. Translating CRPIX cannot compose the
         // raw frame's WCS (including SIP) with this nonlinear mapping. Leave
@@ -1683,7 +1793,7 @@ impl Plan {
             }
             let seed = creators
                 .get(joined.window)
-                .and_then(|&start| self.seed(joined, start, fit));
+                .and_then(|&start| self.seed(joined, start, fit, options.scale()));
             let result = match plan.register_through_lens(joined, seed, options, maximum_samples) {
                 Ok(result) => Ok(result),
                 Err(error) if retryable(&error) => Err(error.to_string()),
@@ -1720,7 +1830,13 @@ impl Plan {
     /// Within a panel the two frames' distortion all but cancels, so this
     /// lies within a pixel or so, for registration to refine without
     /// searching.
-    fn seed(&self, joined: &Joined, start: usize, fit: &LensFit) -> Option<RegistrationResult> {
+    fn seed(
+        &self,
+        joined: &Joined,
+        start: usize,
+        fit: &LensFit,
+        scale: Scale,
+    ) -> Option<RegistrationResult> {
         let lens = fit.distortion;
         let pose = fit.poses[start];
         let placed = self.placement(&joined.path)?;
@@ -1758,6 +1874,7 @@ impl Plan {
             (bottom - top) as usize,
             &grid,
             &validation,
+            scale,
         )
         .ok()?;
         Some(RegistrationResult {
@@ -1828,7 +1945,13 @@ impl Plan {
                 }
             }
         }
-        let polynomial = fit_panel_geometry(region.width, region.height, &grid, &validation)?;
+        let polynomial = fit_panel_geometry(
+            region.width,
+            region.height,
+            &grid,
+            &validation,
+            options.scale(),
+        )?;
         let warp = polynomial
             .translated(region_x, region_y)
             .with_distortion(lens);
@@ -1884,6 +2007,7 @@ impl Plan {
                 &incoming,
                 region,
                 &options.registration,
+                options.scale(),
             )?);
         }
         self.registrations.insert(
@@ -2071,13 +2195,16 @@ fn point_bounds(points: &[(f64, f64)]) -> (f64, f64, f64, f64) {
 }
 
 /// Keep the simplest approximation meeting the same accuracy bound on both
-/// the fit nodes and independent nodes between them.
+/// the fit nodes and independent nodes between them: in working pixels,
+/// binned at `scale`, [`MAXIMUM_GEOMETRY_ERROR_PIXELS`] of the sensor's.
 fn fit_panel_geometry(
     width: usize,
     height: usize,
     grid: &[crate::registration::PointPair],
     validation: &[crate::registration::PointPair],
+    scale: Scale,
 ) -> Result<PolynomialWarp> {
+    let limit = scale.length(MAXIMUM_GEOMETRY_ERROR_PIXELS);
     let mut worst = f64::INFINITY;
     for order in [2, 3] {
         let Some(warp) = PolynomialWarp::fit(order, width, height, grid) else {
@@ -2095,12 +2222,12 @@ fn fit_panel_geometry(
                     f64::INFINITY
                 }
             });
-        if worst <= MAXIMUM_GEOMETRY_ERROR_PIXELS {
+        if worst <= limit {
             return Ok(warp);
         }
     }
     Err(Error::Registration(format!(
-        "a panel start's sky projection cannot be approximated within {MAXIMUM_GEOMETRY_ERROR_PIXELS}px (worst {worst:.3}px)"
+        "a panel start's sky projection cannot be approximated within {limit}px (worst {worst:.3}px)"
     )))
 }
 
@@ -2114,7 +2241,8 @@ fn admissible(
     options: &StackOptions,
 ) -> Result<RegistrationResult> {
     let criteria = options.acceptance;
-    if registration.rms_error_pixels > criteria.maximum_registration_rms_pixels
+    if options.scale().native_length(registration.rms_error_pixels)
+        > criteria.maximum_registration_rms_pixels
         || (registration.transform.scale - 1.0).abs() > criteria.maximum_scale_deviation
         || crate::stack::rotation_deviation_degrees(registration.transform.rotation_radians)
             > criteria.maximum_rotation_degrees
@@ -2307,7 +2435,7 @@ mod tests {
             let (a, b) = quadratic.apply(x, y);
             (a - u).hypot(b - v) > MAXIMUM_GEOMETRY_ERROR_PIXELS
         }));
-        let warp = fit_panel_geometry(width, height, &grid, &validation).unwrap();
+        let warp = fit_panel_geometry(width, height, &grid, &validation, Scale::NATIVE).unwrap();
         assert_eq!(warp.order(), 3);
         warp.validate().unwrap();
         // Saved warps, including the compact context payload, must replay
@@ -2326,7 +2454,7 @@ mod tests {
         // Independent checks must also be allowed to veto the fit.
         let mut inconsistent = validation.clone();
         inconsistent[0].1.0 += 1.0;
-        assert!(fit_panel_geometry(width, height, &grid, &inconsistent).is_err());
+        assert!(fit_panel_geometry(width, height, &grid, &inconsistent, Scale::NATIVE).is_err());
     }
 
     fn optical_frame(camera: &str, filter: &str, date: &str) -> FitsFrame {
@@ -2424,7 +2552,14 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let restore = |region, stars| {
-            CanvasRegistrar::new(&canvas, &[region], Some(vec![stars]), None, &options)
+            CanvasRegistrar::new(
+                &canvas,
+                &[region],
+                Some(vec![stars]),
+                None,
+                &options,
+                Scale::NATIVE,
+            )
         };
         assert!(restore(region, stars.clone()).is_ok());
         for coordinate in [f64::NAN, f64::INFINITY, -1.0, 100.0] {
@@ -2537,7 +2672,7 @@ mod tests {
         plans.insert("start".into(), planned(1.3, true));
         plans.insert("partial".into(), planned(0.54, false));
         plans.insert("seeing".into(), planned(0.25, false));
-        reject_residual_outliers(&mut plans);
+        reject_residual_outliers(&mut plans, Scale::NATIVE);
         assert!(plans[Path::new("start")].result.is_ok());
         assert!(plans[Path::new("seeing")].result.is_ok(), "under the floor");
         assert!(
@@ -2552,7 +2687,7 @@ mod tests {
             ("a".into(), planned(0.05, false)),
             ("b".into(), planned(0.9, false)),
         ]);
-        reject_residual_outliers(&mut few);
+        reject_residual_outliers(&mut few, Scale::NATIVE);
         assert!(few.values().all(|plan| plan.result.is_ok()));
     }
 

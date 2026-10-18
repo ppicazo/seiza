@@ -52,6 +52,24 @@ impl LensDistortion {
         }
     }
 
+    /// The same distortion on a grid `scale` times as fine, or `1 / b` for
+    /// the frame binned by `b`: its centre moves as a pixel centre does,
+    /// `scale · x + (scale − 1) / 2`, its radius and frame stretch by
+    /// `scale`, and its coefficients, which act on the squared distance over
+    /// the squared radius, stand. The frame must divide evenly at a scale
+    /// under 1.
+    pub(crate) fn rescaled(&self, scale: f64) -> Self {
+        let offset = (scale - 1.0) / 2.0;
+        Self {
+            width: (self.width as f64 * scale).round() as usize,
+            height: (self.height as f64 * scale).round() as usize,
+            center_x: scale * self.center_x + offset,
+            center_y: scale * self.center_y + offset,
+            radius: scale * self.radius,
+            ..*self
+        }
+    }
+
     /// The sensor position of an undistorted frame position.
     pub(crate) fn distort(&self, x: f64, y: f64) -> (f64, f64) {
         let (u, v) = (x - self.center_x, y - self.center_y);
@@ -256,6 +274,41 @@ pub(crate) struct LensFit {
     /// RMS over every pair, and with the same pairs fitted undistorted.
     pub overall_rms: f64,
     pub undistorted_rms: f64,
+}
+
+impl LensFit {
+    /// The same fit on a grid `scale` times as fine, or `1 / b` for frames
+    /// binned by `b`, as [`LensDistortion::rescaled`] carries the
+    /// distortion. A pixel centre moves to `scale · x + (scale − 1) / 2`;
+    /// a similarity pose is carried through that map, and a camera rotation
+    /// keeps its rotation with its focal length, like the projection's,
+    /// stretched by `scale`. Distances stretch by `scale` too.
+    pub(crate) fn rescaled(&self, scale: f64) -> Self {
+        let offset = (scale - 1.0) / 2.0;
+        Self {
+            distortion: self.distortion.rescaled(scale),
+            projection: self.projection.map(|projection| Projection {
+                focal: projection.focal * scale,
+                center_x: scale * projection.center_x + offset,
+                center_y: scale * projection.center_y + offset,
+            }),
+            poses: self
+                .poses
+                .iter()
+                .map(|pose| match *pose {
+                    Pose::Similarity(transform) => Pose::Similarity(transform.rescaled(scale)),
+                    Pose::Rotation { rotation, focal } => Pose::Rotation {
+                        rotation,
+                        focal: focal * scale,
+                    },
+                })
+                .collect(),
+            pairs: self.pairs.clone(),
+            rms: self.rms.iter().map(|rms| rms * scale).collect(),
+            overall_rms: self.overall_rms * scale,
+            undistorted_rms: self.undistorted_rms * scale,
+        }
+    }
 }
 
 /// Stars each frame must pair with the others for its pose to be trusted.
@@ -894,6 +947,78 @@ mod tests {
             assert!((back_x - x).abs() < 1.0e-8 && (back_y - y).abs() < 1.0e-8);
         }
         assert!(lens.largest_shift() > 5.0);
+    }
+
+    /// A lens and the poses fitted with it carry between the sensor's grid
+    /// and a binned one exactly: each maps a binned point where it maps the
+    /// sensor's point, converted.
+    #[test]
+    fn a_lens_fit_carries_between_the_sensor_and_a_binned_grid() {
+        let mut lens = LensDistortion::none(2000, 1300);
+        lens.k1 = 0.012;
+        lens.k2 = -0.004;
+        lens.center_x += 31.0;
+        lens.center_y -= 17.0;
+        let projection = Projection {
+            focal: 9000.0,
+            center_x: 999.5,
+            center_y: 649.5,
+        };
+        let fit = LensFit {
+            distortion: lens,
+            projection: Some(projection),
+            poses: vec![
+                Pose::Rotation {
+                    rotation: IDENTITY,
+                    focal: 9000.0,
+                },
+                Pose::Rotation {
+                    rotation: rodrigues([0.01, -0.02, 0.003]),
+                    focal: 9012.0,
+                },
+                Pose::Similarity(SimilarityTransform {
+                    scale: 0.999,
+                    rotation_radians: 3.1,
+                    translation_x: 1834.0,
+                    translation_y: 1199.5,
+                }),
+            ],
+            pairs: vec![0, 40, 41],
+            rms: vec![0.0, 0.2, 0.3],
+            overall_rms: 0.25,
+            undistorted_rms: 1.4,
+        };
+        for bin in [2.0, 4.0] {
+            let offset = (bin - 1.0) / 2.0;
+            let to_binned = |x: f64, y: f64| ((x - offset) / bin, (y - offset) / bin);
+            let binned = fit.rescaled(1.0 / bin);
+            binned.distortion.validate().unwrap();
+            assert_eq!(
+                (binned.distortion.width, binned.distortion.height),
+                (2000 / bin as usize, 1300 / bin as usize)
+            );
+            let projection = binned.projection.unwrap();
+            assert_eq!(
+                (projection.center_x, projection.center_y),
+                ((2000.0 / bin - 1.0) / 2.0, (1300.0 / bin - 1.0) / 2.0)
+            );
+            for (x, y) in [(0.0, 0.0), (1999.0, 1299.0), (731.5, 222.25)] {
+                let (bx, by) = to_binned(x, y);
+                let close = |(a, b): (f64, f64), (c, d): (f64, f64)| {
+                    (bin * a + offset - c).abs() < 1e-7 && (bin * b + offset - d).abs() < 1e-7
+                };
+                assert!(close(binned.distortion.distort(bx, by), lens.distort(x, y)));
+                for (native, coarse) in fit.poses.iter().zip(&binned.poses) {
+                    let expected = native.apply(fit.projection, x, y).unwrap();
+                    let found = coarse.apply(binned.projection, bx, by).unwrap();
+                    assert!(close(found, expected), "{found:?} against {expected:?}");
+                }
+            }
+            assert_eq!(binned.rms, vec![0.0, 0.2 / bin, 0.3 / bin]);
+            let back = binned.rescaled(bin);
+            assert!((back.distortion.center_x - lens.center_x).abs() < 1e-9);
+            assert!((back.distortion.radius - lens.radius).abs() < 1e-9);
+        }
     }
 
     #[test]

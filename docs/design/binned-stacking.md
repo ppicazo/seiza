@@ -1,8 +1,8 @@
 # Binned stacking
 
-Status: designed, decisions taken (see [Decisions](#decisions)). Nothing is
-implemented; implementation waits on two branches in flight (see
-[Sequencing](#sequencing)).
+Status: phases 0 and 1 implemented (#306, and the PR that adds this line);
+phase 2 not started. Where phase 1 departs from this design, see
+[As built](#as-built-phase-1).
 
 ## Summary
 
@@ -640,6 +640,43 @@ Taken on the recommendations above; reopen any of them in review.
    carries an optional `bin_factor`, omitted at 1, as `warp` is omitted
    when absent. Compact binary encodings keep their layout, and the stack's
    options carry the factor there.
+
+## As built (phase 1)
+
+Phase 1 follows the decisions above, with these differences:
+
+- **`rebinned` takes the target factor only.** A mapping records its own
+  bin factor (decision 8), so `RegisteredFrameMapping::rebinned(to)` carries
+  it from that factor to any that divides it. There is no
+  `Ledger::native_mapping`; the full-resolution pass rebins the whole ledger.
+- **`reintegrate_full_resolution` returns a `FullResolutionStack`**, not a
+  bare `BatchStackResult`: the result, the reference headers carried to the
+  finer grid (WCS rescaled, binning and pixel-size cards back to the
+  sensor's, no `SEIZABIN`), how many frames were refined, and the median
+  registration RMS in sensor pixels that decision 3 asks a canvas to report.
+  The C call returns the snapshot and gives the last two through out
+  parameters; Python returns a `(snapshot, refined, rms)` tuple. Each frame's
+  live registration RMS is recorded in the ledger for this, but a context does
+  not keep it, so a reopened stack that is not refined reports none.
+- **Drizzling a binned stack is refused.** §5.3's native-source mapping is
+  left for later; `reintegrate_drizzled` says to reintegrate at full
+  resolution instead.
+- **Global normalization is reused, and it is noise-driven.** A global gain
+  is the ratio of the reference's dispersion to a resampled frame's, which
+  on a sparse sky is the noise's, and binning changes it: synthetic frames
+  took gains of 1.47 at full resolution and 1.36 binned by 2. The promoted
+  stack keeps the binned gains, as §3.3 says, so it differs from a native
+  stack by that much in its stars. With `LocalBackground` (photometric gains)
+  the promoted stack is within a fraction of one frame's sky noise of a
+  native one, and with no normalization a refined promotion matches the
+  native stack to the bit in at least 99% of its pixels.
+- **Not converted:** `ColorCrop::OFF_CENTER_PIXELS` (colour composition does
+  not know a stack's bin factor; its fractional bound dominates on large
+  frames) and the `bin_factor` on `SnrSample` (§4's last rows). The pipeline's
+  in-flight memory estimate counts native frames for preparation and binned
+  ones for integration.
+- **Detection's minimum area** uses the interim rule of §4 (3, 2 at b=2, 1
+  from 3), and `Scale::detection` says so; open question 1 still stands.
 
 ## Still open
 

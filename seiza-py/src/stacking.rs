@@ -176,7 +176,8 @@ impl PyStackOptions {
         match_tolerances=None,
         registration_model="similarity",
         weighting="equal",
-        defects=None
+        defects=None,
+        bin_factor=1
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -209,6 +210,7 @@ impl PyStackOptions {
         registration_model: &str,
         weighting: &str,
         defects: Option<PyRef<'_, PyDefectMap>>,
+        bin_factor: u32,
     ) -> PyResult<Self> {
         let weighting = match weighting {
             "equal" => FrameWeighting::Equal,
@@ -299,6 +301,7 @@ impl PyStackOptions {
         inner.acceptance.minimum_integrated_fraction = minimum_integrated_fraction;
         inner.demosaic = demosaic;
         inner.match_tolerances = crate::calibration::tolerances_or_default(match_tolerances);
+        inner.bin_factor = bin_factor;
         inner
             .validate()
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
@@ -373,6 +376,14 @@ impl PyStackOptions {
     #[getter]
     fn maximum_drift_fraction(&self) -> f64 {
         self.inner.registration.maximum_drift_fraction
+    }
+
+    /// The factor, 1 to 4, each light is area-mean binned by after
+    /// calibration and before registration. Pixel options keep their
+    /// meaning in the sensor's pixels.
+    #[getter]
+    fn bin_factor(&self) -> u32 {
+        self.inner.bin_factor
     }
 
     /// The sensor defects repaired in every light before debayering, as
@@ -1457,6 +1468,14 @@ impl PyLiveStacker {
         Ok(self.active()?.view().rejected_frames)
     }
 
+    /// The factor every light is binned by after calibration, as
+    /// :attr:`StackOptions.bin_factor` set it: the live view, snapshots and
+    /// each frame's mapping are on the binned grid.
+    #[getter]
+    fn bin_factor(&self) -> PyResult<u32> {
+        Ok(self.active()?.bin_factor())
+    }
+
     /// False for a stack aligned to a separate reference image, which starts
     /// with no accepted frames.
     #[getter]
@@ -1783,6 +1802,41 @@ impl PyLiveStacker {
             input_paths: stacker.protected_paths(),
         };
         Ok((PyStackSnapshot::of(stacker, result.snapshot), drizzled))
+    }
+
+    /// :meth:`reintegrate` at the sensor's full resolution: every admitted
+    /// frame of a binned stack read again unbinned and integrated onto a
+    /// grid :attr:`bin_factor` times as fine. No transform is searched for
+    /// again; each is carried exactly from the binned grid. With ``refine``,
+    /// a single field detects every frame's stars at full resolution and
+    /// refits each transform from that seed; an expanded canvas keeps the
+    /// carried ones. Returns the stack, whose ``write_fits`` carries the WCS
+    /// to the finer grid; how many frames were refined; and the frames'
+    /// median registration RMS in the sensor's pixels, None when no frame's
+    /// is known.
+    #[pyo3(signature = (*, refine=true, sigma_low=3.0, sigma_high=3.0, scratch_directory=None))]
+    fn reintegrate_full_resolution(
+        &self,
+        py: Python<'_>,
+        refine: bool,
+        sigma_low: f32,
+        sigma_high: f32,
+        scratch_directory: Option<PathBuf>,
+    ) -> PyResult<(PyStackSnapshot, usize, Option<f64>)> {
+        let stacker = self.active()?;
+        let options = batch_options(sigma_low, sigma_high, scratch_directory)?;
+        let full = py
+            .detach(|| stacker.reintegrate_full_resolution(&options, refine, |_, _, _| {}))
+            .map_err(stack_error)?;
+        Ok((
+            PyStackSnapshot {
+                inner: full.result.snapshot,
+                reference_headers: full.reference_headers,
+                input_paths: stacker.protected_paths(),
+            },
+            full.refined_frames,
+            full.registration_rms_pixels,
+        ))
     }
 
     /// Consume the accumulator, optionally write a linear FITS file, and return its arrays.

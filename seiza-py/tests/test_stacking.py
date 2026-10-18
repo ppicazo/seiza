@@ -913,6 +913,49 @@ def test_snapshots_write_with_the_reference_headers(tmp_path):
         assert hdus[0].header["CRVAL1"] == 83.8
 
 
+def test_binned_stack_reintegrates_at_full_resolution(tmp_path):
+    image, paths = lights_with_a_header(tmp_path)
+    assert seiza.StackOptions().bin_factor == 1
+    with pytest.raises(ValueError, match="bin factor"):
+        seiza.StackOptions(bin_factor=5)
+    options = seiza.StackOptions(normalization="none", rejection="none", bin_factor=2)
+    assert options.bin_factor == 2
+    stacker = seiza.LiveStacker(paths[0], options=options)
+    assert stacker.bin_factor == 2
+    assert stacker.reference_mapping["bin_factor"] == 2
+    for path in paths[1:]:
+        disposition = stacker.push_fits(path)
+        assert disposition.accepted
+        assert disposition.mapping["bin_factor"] == 2
+
+    # The live stack is on the binned grid, its WCS with it.
+    binned_output = tmp_path / "binned.fits"
+    stacker.snapshot().write_fits(binned_output)
+    with fits.open(binned_output) as hdus:
+        assert hdus[0].data.shape == (64, 80)
+        assert hdus[0].header["CRPIX1"] == 40.5
+        assert hdus[0].header["CDELT1"] == pytest.approx(-0.0006)
+        assert hdus[0].header["SEIZABIN"] == 2
+
+    full, refined, rms = stacker.reintegrate_full_resolution()
+    assert full.image.shape == image.shape
+    assert refined == 2
+    assert rms is not None and 0.0 <= rms < 1.0
+    np.testing.assert_allclose(full.image, image, rtol=0.0, atol=1.0e-2)
+    full_output = tmp_path / "full.fits"
+    full.write_fits(full_output)
+    with fits.open(full_output) as hdus:
+        assert hdus[0].header["CRPIX1"] == pytest.approx(80.5)
+        assert hdus[0].header["CDELT1"] == pytest.approx(-0.0003)
+        assert "SEIZABIN" not in hdus[0].header
+
+    unrefined, refined, _ = stacker.reintegrate_full_resolution(refine=False)
+    assert refined == 0
+    assert unrefined.image.shape == image.shape
+    with pytest.raises(Exception, match="full resolution"):
+        stacker.reintegrate_drizzled(scale=2)
+
+
 def test_live_stacker_state_describes_the_stack(tmp_path):
     _, paths = lights_with_a_header(tmp_path, count=2)
     stacker = seiza.LiveStacker(paths[0], options=no_adjustment_options())

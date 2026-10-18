@@ -57,6 +57,22 @@ const BAYER_DEFAULT: &[f64] = &[
     4.0142902e2, 3.0100272e2, 1.9984351e2, 4.0275519e2, 3.0402594e2, 2.0407870e2,
 ];
 #[rustfmt::skip]
+const BINNED: &[f64] = &[
+    1.4311715e2, 2.4653842e2, 2.9428250e3, 9.8566231e1, 1.0354869e2, 1.0185313e2,
+    1.0289874e2, 1.0433101e2, 9.8669312e1, 1.0080196e2, 1.0262335e2, 1.5487537e3,
+    1.0499112e2, 3.2784250e2, 1.0115610e2, 1.0298831e2, 1.0412970e2, 1.0742923e2,
+    1.0033507e2, 2.2662872e2, 1.0329276e2, 1.0484836e2, 5.1373145e2, 1.0109541e2,
+    1.1836398e2, 1.0411025e2, 1.0556331e2, 1.0695666e2,
+];
+#[rustfmt::skip]
+const FULL_RESOLUTION: &[f64] = &[
+    1.4310797e2, 2.6825418e2, 3.6725220e3, 9.7422989e1, 9.9715958e1, 1.0107971e2,
+    1.1757957e2, 1.0521172e2, 9.8150475e1, 1.0046536e2, 1.0211687e2, 1.0329865e2,
+    1.0460469e2, 9.8414558e1, 1.0147755e2, 1.0316610e2, 1.0423871e2, 1.0615415e2,
+    1.0020127e2, 1.0096130e2, 1.0359206e2, 1.0612683e2, 1.0727988e2, 1.0100352e2,
+    1.7025096e2, 1.0470015e2, 1.0667790e2, 1.1075444e2,
+];
+#[rustfmt::skip]
 const DARK_MASTER: &[f64] = &[
     5.0018033e2, 5.0018273e2, 5.0560712e2, 4.9912210e2, 5.0097733e2, 5.0010815e2,
     5.0059848e2, 5.0013586e2, 5.0037161e2, 5.0233649e2, 5.0203445e2, 4.9982404e2,
@@ -509,6 +525,44 @@ fn a_reintegration_and_its_drizzle_keep_their_output() {
         .reintegrate_drizzled(&options, &drizzle, |_, _, _| {})
         .unwrap();
     check("DRIZZLED", &summary(&drizzled.image), DRIZZLED);
+}
+
+/// Lights binned by 2 after calibration and before registration, and the
+/// same lights reintegrated at the sensor's full resolution from the binned
+/// stack, each frame's transform refined from its binned one.
+#[test]
+fn a_binned_stack_and_its_full_resolution_reintegration_keep_their_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = SHIFTS
+        .iter()
+        .enumerate()
+        .map(|(frame, &(dx, dy))| {
+            let image = mono_field(dx, dy, 0.96 + 0.01 * frame as f32, frame);
+            write_raw(&directory, "light", frame, image.data, "LIGHT")
+        })
+        .collect::<Vec<_>>();
+    let options = StackOptions {
+        bin_factor: 2,
+        ..StackOptions::default()
+    };
+    let mut stacker = LiveStacker::open_fits(&paths[0], None, None, None, None, options).unwrap();
+    for path in &paths[1..] {
+        admit(stacker.push_fits(path).unwrap());
+    }
+    check(
+        "BINNED",
+        &summary(&stacker.snapshot().unwrap().image),
+        BINNED,
+    );
+    let full = stacker
+        .reintegrate_full_resolution(&BatchStackOptions::default(), true, |_, _, _| {})
+        .unwrap();
+    assert_eq!(full.refined_frames, paths.len() - 1);
+    check(
+        "FULL_RESOLUTION",
+        &summary(&full.result.snapshot.image),
+        FULL_RESOLUTION,
+    );
 }
 
 /// Two overlapping panels on a canvas that grows to hold them both, with

@@ -288,6 +288,43 @@ impl FitsFrame {
             .0)
     }
 
+    /// This frame binned by `factor`, as [`crate::StackOptions::bin_factor`]
+    /// bins every light once it is calibrated, repaired and debayered: its
+    /// image by [`LinearImage::binned`], and its headers carried to the
+    /// coarser grid. `XBINNING` and `YBINNING` (or `CCDXBIN` and `CCDYBIN`)
+    /// and `XPIXSZ` and `YPIXSZ` grow by the factor, as SBFITSEXT defines
+    /// them after binning, so a focal length or plate scale read from them
+    /// stays right; `SEIZABIN` records the software bin, so a reader can tell
+    /// it from the camera's; `NAXIS1` and `NAXIS2` give the binned size; and
+    /// the WCS moves to the binned grid by [`rescaled_reference_headers`].
+    /// A raw CFA frame is refused, since binning follows debayering. A
+    /// factor of 1 returns the frame as it is.
+    pub fn binned(self, factor: u32) -> Result<Self> {
+        if factor == 1 {
+            return Ok(self);
+        }
+        if self.bayer.is_some() {
+            return Err(Error::InvalidImage(
+                "a raw CFA frame is binned only once it is debayered".into(),
+            ));
+        }
+        let image = self.image.binned(factor)?;
+        let mut headers = rebinned_headers(&self.headers, 1, factor);
+        for (key, value) in &mut headers {
+            let size = match key.as_str() {
+                "NAXIS1" => image.width,
+                "NAXIS2" => image.height,
+                _ => continue,
+            };
+            *value = HeaderValue::Integer(size as i64);
+        }
+        Ok(Self {
+            image,
+            headers,
+            ..self
+        })
+    }
+
     /// [`Self::into_prepared`], also returning the Bayer layout the frame was
     /// debayered from, for Bayer drizzle. The prepared frame itself carries
     /// none.
@@ -558,7 +595,65 @@ fn write_stack_image_fits_f32(
         rejected_frames as i64,
         "rejected input frames",
     ));
+    // A stack of binned lights says so, as its reference does.
+    if let Some(bin) = software_bin(reference_headers) {
+        cards.push(integer_card(SOFTWARE_BIN_KEY, bin, SOFTWARE_BIN_COMMENT));
+    }
     write_linear_image_fits_f32(path, image, reference_headers, &cards)
+}
+
+/// The card recording a software bin after calibration, which
+/// [`FitsFrame::binned`] writes.
+const SOFTWARE_BIN_KEY: &str = "SEIZABIN";
+const SOFTWARE_BIN_COMMENT: &str = "software bin after calibration";
+
+/// The software bin `headers` record, when above 1.
+fn software_bin(headers: &[(String, HeaderValue)]) -> Option<i64> {
+    headers
+        .iter()
+        .find(|(key, _)| key == SOFTWARE_BIN_KEY)
+        .and_then(|(_, value)| value.as_f64())
+        .filter(|bin| bin.is_finite() && *bin > 1.0)
+        .map(|bin| bin.round() as i64)
+}
+
+/// The headers of an image binned by `from` (1 for the sensor's own
+/// sampling), carried to the same image binned by `to`: the WCS by
+/// [`rescaled_reference_headers`], the binning and pixel-size cards by the
+/// ratio, and `SEIZABIN` to the software bin that results, dropped at 1.
+pub(crate) fn rebinned_headers(
+    headers: &[(String, HeaderValue)],
+    from: u32,
+    to: u32,
+) -> Vec<(String, HeaderValue)> {
+    let ratio = f64::from(to) / f64::from(from);
+    let software = software_bin(headers).unwrap_or(1) as f64 * ratio;
+    let mut headers = rescaled_reference_headers(headers, 1.0 / ratio);
+    headers.retain(|(key, _)| key != SOFTWARE_BIN_KEY);
+    for (key, value) in &mut headers {
+        if !matches!(
+            key.as_str(),
+            "XBINNING" | "YBINNING" | "CCDXBIN" | "CCDYBIN" | "XPIXSZ" | "YPIXSZ"
+        ) {
+            continue;
+        }
+        let rewritten = match value {
+            HeaderValue::Integer(number) if (*number as f64 * ratio).fract() == 0.0 => {
+                HeaderValue::Integer((*number as f64 * ratio) as i64)
+            }
+            HeaderValue::Integer(number) => HeaderValue::Float(*number as f64 * ratio),
+            HeaderValue::Float(number) if number.is_finite() => HeaderValue::Float(*number * ratio),
+            _ => continue,
+        };
+        *value = rewritten;
+    }
+    if software.round() > 1.0 {
+        headers.push((
+            SOFTWARE_BIN_KEY.into(),
+            HeaderValue::Integer(software.round() as i64),
+        ));
+    }
+    headers
 }
 
 /// Write a composed RGB image as primary-HDU 32-bit floating-point FITS.
@@ -606,17 +701,29 @@ pub fn write_color_fits_f32(
 }
 
 /// A reference frame's headers for an image drizzled `scale` times finer,
-/// such as [`crate::DrizzleResult::image`]: the WCS keeps the same sky.
-///
-/// `CRPIX` moves to the finer grid, whose pixel edges fall at the
-/// reference's; `CD` and `CDELT` shrink by the scale; and each SIP
-/// coefficient of order `p + q` scales by `scale^(1 - p - q)`, since SIP
-/// maps pixel offsets to pixel offsets.
+/// such as [`crate::DrizzleResult::image`]: the WCS keeps the same sky. See
+/// [`rescaled_reference_headers`].
 pub fn drizzle_reference_headers(
     headers: &[(String, HeaderValue)],
     scale: u32,
 ) -> Vec<(String, HeaderValue)> {
-    let scale = f64::from(scale);
+    rescaled_reference_headers(headers, f64::from(scale))
+}
+
+/// A reference frame's headers for the same sky on a grid `scale` times as
+/// fine: above 1 for a drizzle, `1 / b` for the reference binned by `b`.
+///
+/// `CRPIX` moves to the new grid, whose pixel edges fall at the
+/// reference's: with pixel centres on whole numbers and FITS counting from
+/// 1, `CRPIX' = (CRPIX − 0.5) · scale + 0.5`. `CD` and `CDELT` shrink by
+/// the scale, `A_DMAX` and `B_DMAX` grow by it, and each SIP coefficient of
+/// order `p + q` scales by `scale^(1 − p − q)`, since SIP maps pixel
+/// offsets to pixel offsets. Binning by `b` and drizzling the result by `b`
+/// gives the reference's WCS back.
+pub fn rescaled_reference_headers(
+    headers: &[(String, HeaderValue)],
+    scale: f64,
+) -> Vec<(String, HeaderValue)> {
     let sip_order = |key: &str| {
         let rest = ["AP_", "BP_", "A_", "B_"]
             .iter()
@@ -1127,6 +1234,123 @@ fn preserve_processed_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cards_of(cards: &[(&str, HeaderValue)]) -> Vec<(String, HeaderValue)> {
+        cards
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.clone()))
+            .collect()
+    }
+
+    fn number(headers: &[(String, HeaderValue)], key: &str) -> Option<f64> {
+        headers
+            .iter()
+            .find(|(name, _)| name == key)
+            .and_then(|(_, value)| value.as_f64())
+    }
+
+    /// Binning a frame carries its WCS, SIP included, to the binned grid,
+    /// and drizzling the result by the same factor carries it back: a
+    /// round trip that leaves every card as it was.
+    #[test]
+    fn binned_wcs_drizzles_back_to_the_sensor_grid() {
+        let solved = cards_of(&[
+            ("CTYPE1", HeaderValue::String("RA---TAN-SIP".into())),
+            ("CTYPE2", HeaderValue::String("DEC--TAN-SIP".into())),
+            ("CRVAL1", HeaderValue::Float(10.68)),
+            ("CRVAL2", HeaderValue::Float(41.27)),
+            ("CRPIX1", HeaderValue::Float(3124.5)),
+            ("CRPIX2", HeaderValue::Float(2088.25)),
+            ("CD1_1", HeaderValue::Float(-1.95e-4)),
+            ("CD1_2", HeaderValue::Float(2.0e-6)),
+            ("CD2_1", HeaderValue::Float(-2.0e-6)),
+            ("CD2_2", HeaderValue::Float(1.95e-4)),
+            ("A_ORDER", HeaderValue::Integer(2)),
+            ("A_2_0", HeaderValue::Float(3.1e-7)),
+            ("A_0_2", HeaderValue::Float(-1.2e-7)),
+            ("B_1_1", HeaderValue::Float(2.2e-7)),
+            ("A_DMAX", HeaderValue::Float(1.8)),
+        ]);
+        for bin in [2_u32, 3, 4] {
+            let scale = 1.0 / f64::from(bin);
+            let binned = rescaled_reference_headers(&solved, scale);
+            // CRPIX counts from 1, so a pixel centre X maps to (X + 0.5) / b
+            // − 0.5, and the card to (CRPIX − 0.5) / b + 0.5.
+            let crpix = number(&binned, "CRPIX1").unwrap();
+            assert!((crpix - ((3124.5 - 0.5) / f64::from(bin) + 0.5)).abs() < 1e-12);
+            assert!((number(&binned, "CD1_1").unwrap() + 1.95e-4 * f64::from(bin)).abs() < 1e-18);
+            // An order-2 SIP term grows by the factor; the largest correction
+            // shrinks by it.
+            assert!((number(&binned, "A_2_0").unwrap() - 3.1e-7 * f64::from(bin)).abs() < 1e-20);
+            assert!((number(&binned, "A_DMAX").unwrap() - 1.8 / f64::from(bin)).abs() < 1e-15);
+            assert_eq!(number(&binned, "A_ORDER"), Some(2.0));
+            let back = drizzle_reference_headers(&binned, bin);
+            for ((key, original), (_, round)) in solved.iter().zip(&back) {
+                match (original.as_f64(), round.as_f64()) {
+                    (Some(original), Some(round)) => assert!(
+                        (round - original).abs() <= 1e-12 * original.abs().max(1.0),
+                        "{key}: {round} against {original}"
+                    ),
+                    _ => assert_eq!(original, round, "{key}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_binned_frame_says_so_in_its_headers() {
+        let frame = FitsFrame {
+            image: LinearImage::new(6, 4, 1, (0..24).map(|value| value as f32).collect()).unwrap(),
+            headers: cards_of(&[
+                ("NAXIS1", HeaderValue::Integer(6)),
+                ("NAXIS2", HeaderValue::Integer(4)),
+                ("CCDXBIN", HeaderValue::Integer(1)),
+                ("YBINNING", HeaderValue::Integer(2)),
+                ("XPIXSZ", HeaderValue::Float(3.76)),
+                ("YPIXSZ", HeaderValue::Integer(4)),
+                ("FOCALLEN", HeaderValue::Float(530.0)),
+            ]),
+            exposure_seconds: Some(60.0),
+            bayer: None,
+            source: None,
+            bounds: None,
+        };
+        let binned = frame.clone().binned(2).unwrap();
+        assert_eq!((binned.image.width, binned.image.height), (3, 2));
+        for (key, expected) in [
+            ("NAXIS1", 3.0),
+            ("NAXIS2", 2.0),
+            ("CCDXBIN", 2.0),
+            ("YBINNING", 4.0),
+            ("XPIXSZ", 7.52),
+            ("YPIXSZ", 8.0),
+            ("FOCALLEN", 530.0),
+            ("SEIZABIN", 2.0),
+        ] {
+            assert_eq!(number(&binned.headers, key), Some(expected), "{key}");
+        }
+        assert_eq!(binned.metadata().signature.binning_x, Some(2));
+        // Carried back to the sensor, the cards are the sensor's again.
+        let native = rebinned_headers(&binned.headers, 2, 1);
+        assert_eq!(number(&native, "CCDXBIN"), Some(1.0));
+        assert_eq!(number(&native, "XPIXSZ"), Some(3.76));
+        assert_eq!(number(&native, "SEIZABIN"), None);
+        // Binning a binned stack's frame again records both.
+        let twice = rebinned_headers(&binned.headers, 1, 2);
+        assert_eq!(number(&twice, "SEIZABIN"), Some(4.0));
+        // A factor of 1 leaves the frame alone, and a raw mosaic is refused.
+        let same = frame.clone().binned(1).unwrap();
+        assert_eq!(same.headers, frame.headers);
+        let mosaic = FitsFrame {
+            bayer: Some(BayerLayout {
+                pattern: seiza_fits::BayerPattern::Rggb,
+                x_offset: 0,
+                y_offset: 0,
+            }),
+            ..frame
+        };
+        assert!(mosaic.binned(2).is_err());
+    }
 
     /// A PixInsight-style XISF keeps its solution only as properties;
     /// opening it yields the equivalent FITS WCS cards.

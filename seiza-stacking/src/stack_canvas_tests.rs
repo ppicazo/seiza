@@ -505,3 +505,63 @@ fn canvas_reintegration_timing_by_panel_count() {
         }
     }
 }
+
+/// A mosaic of binned lights reintegrates at full resolution through its
+/// frames' carried transforms, as a canvas has no full-resolution
+/// reference to refine them against, and reports the error they carry.
+#[test]
+fn a_binned_mosaic_reintegrates_at_full_resolution_unrefined() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = mosaic(directory.path(), (2, 1), (512, 384), 2, 1);
+    let mut covered = Vec::new();
+    for bin_factor in [1, 2] {
+        let mut options = StackOptions {
+            bin_factor,
+            ..StackOptions::default()
+        };
+        options.acceptance.minimum_overlap_fraction = 0.1;
+        let mut stacker = LiveStacker::with_expanding_reference(
+            &paths,
+            CalibrationMasters::default(),
+            options,
+            usize::MAX,
+            |_, _, _, _| Continue::Yes,
+        )
+        .unwrap();
+        let mut native = 0.0_f64;
+        for path in &paths {
+            match stacker.push_fits(path).unwrap() {
+                FrameDisposition::Accepted(diagnostics) => {
+                    assert_eq!(diagnostics.mapping.bin_factor(), bin_factor);
+                    native = native.max(diagnostics.registration_rms_pixels);
+                }
+                FrameDisposition::Rejected(reason) => panic!("{}: {reason}", path.display()),
+            }
+        }
+        let full = stacker
+            .reintegrate_full_resolution(&BatchStackOptions::default(), true, |_, _, _| {})
+            .unwrap();
+        let image = &full.result.snapshot.image;
+        let factor = bin_factor as usize;
+        assert_eq!(
+            (image.width, image.height),
+            (
+                stacker.view().width * factor,
+                stacker.view().height * factor
+            )
+        );
+        assert_eq!(full.refined_frames, 0);
+        let rms = full.registration_rms_pixels.unwrap();
+        assert!(rms > 0.0 && rms <= native, "{rms} against {native}");
+        covered.push(
+            full.result
+                .snapshot
+                .coverage
+                .iter()
+                .filter(|&&count| count > 0)
+                .count() as f64,
+        );
+    }
+    // Promoted, the binned mosaic covers the sky the native one does.
+    assert!((covered[1] / covered[0] - 1.0).abs() < 0.02, "{covered:?}");
+}

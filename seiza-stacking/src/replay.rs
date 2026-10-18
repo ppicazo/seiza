@@ -146,6 +146,11 @@ pub(crate) struct AdmittedFrame {
     /// from the defaults (see [`Ledger::tolerances`]).
     #[serde(skip)]
     tolerances: seiza_calibration::MatchTolerances,
+    /// The frame's registration RMS in the sensor's pixels, as the live pass
+    /// measured it, for a full-resolution pass to report what an unrefined
+    /// transform carries. A context does not keep it.
+    #[serde(skip)]
+    registration_rms_pixels: Option<f64>,
 }
 
 /// The tolerances each admitted frame was judged under: each distinct gate
@@ -187,6 +192,7 @@ impl Ledger {
                 mapping: RegisteredFrameMapping::identity(reference),
                 weighting: FrameWeightRecord::default(),
                 tolerances,
+                registration_rms_pixels: None,
             }],
             calibrations: vec![CalibrationRecord::default()],
         }
@@ -201,6 +207,14 @@ impl Ledger {
         Self {
             frames: Vec::new(),
             calibrations: vec![CalibrationRecord::default()],
+        }
+    }
+
+    /// Record `bin_factor` on every admitted frame's mapping: the stack's
+    /// own, which a context's compact ledger leaves out.
+    pub(crate) fn set_bin_factor(&mut self, bin_factor: u32) {
+        for frame in &mut self.frames {
+            frame.mapping.set_bin_factor(bin_factor);
         }
     }
 
@@ -247,7 +261,35 @@ impl Ledger {
             mapping,
             weighting,
             tolerances,
+            registration_rms_pixels: None,
         });
+    }
+
+    /// Record the registration RMS, in the sensor's pixels, of the frame
+    /// admitted last.
+    pub(crate) fn record_registration_rms(&mut self, rms_pixels: f64) {
+        if let Some(frame) = self.frames.last_mut() {
+            frame.registration_rms_pixels = Some(rms_pixels);
+        }
+    }
+
+    /// Each admitted frame's live registration RMS in the sensor's pixels,
+    /// where it is known.
+    pub(crate) fn registration_rms(&self) -> Vec<Option<f64>> {
+        self.frames
+            .iter()
+            .map(|frame| frame.registration_rms_pixels)
+            .collect()
+    }
+
+    /// Every admitted frame's mapping carried to the frames binned by
+    /// `bin_factor`; see [`RegisteredFrameMapping::rebinned`].
+    pub(crate) fn rebinned(&self, bin_factor: u32) -> Result<Self> {
+        let mut ledger = self.clone();
+        for frame in &mut ledger.frames {
+            frame.mapping = frame.mapping.rebinned(bin_factor)?;
+        }
+        Ok(ledger)
     }
 
     /// The tolerances each admitted frame was judged under, or `None` when
@@ -1812,10 +1854,105 @@ impl LiveStacker {
         Ok(())
     }
 
+    /// The source of admitted frame `index`, prepared as the live pass
+    /// prepared it but at the sensor's full resolution, unbinned.
+    pub(crate) fn read_full_resolution(&self, index: usize) -> Result<LinearImage> {
+        let admitted = &self.ledger.frames[index];
+        let masters = MastersCache::default();
+        let masters = masters.get(self, admitted.calibration)?;
+        let (frame, _) = crate::stack::prepare_light_at(
+            self.read_source(admitted)?,
+            &masters,
+            &admitted.tolerances,
+            &self.options,
+            1,
+        )
+        .map_err(crate::stack::LightFailure::into_error)?;
+        self.source_unchanged(admitted)?;
+        Ok(frame.image)
+    }
+
+    /// For a stack at the sensor's full resolution standing in for a binned
+    /// one (see [`Self::reintegrate_full_resolution`]): refine each admitted
+    /// frame's similarity, carried from the binned stack, against
+    /// `registrar`'s stars of the full-resolution reference, and fit the
+    /// registration model's warp around it. A frame keeps its carried
+    /// mapping where too few stars pair, or the refit fails the registration
+    /// RMS gate. Each frame is read once, and its registered image kept in
+    /// the frame cache for the reintegration that follows. Returns each
+    /// refined frame's RMS, in pixels.
+    pub(crate) fn refine_full_resolution(
+        &mut self,
+        registrar: &crate::Registrar,
+        cancel: Option<&CancelSignal>,
+        progress: &mut dyn FnMut(BatchStackPass, usize, usize),
+    ) -> Result<Vec<Option<f64>>> {
+        let count = self.ledger.frames.len();
+        let masters = MastersCache::default();
+        let mut refined = vec![None; count];
+        for (index, refined) in refined.iter_mut().enumerate() {
+            if cancel.is_some_and(CancelSignal::is_cancelled) {
+                return Err(Error::Cancelled);
+            }
+            progress(BatchStackPass::Estimate, index, count);
+            // An integrated reference maps onto itself exactly.
+            if index == 0 && self.reference_is_integrated {
+                continue;
+            }
+            let admitted = &self.ledger.frames[index];
+            let image = {
+                let masters = masters.get(self, admitted.calibration)?;
+                self.read_admitted(admitted, &masters)?.0.image
+            };
+            let stars = registrar.detect_source_stars(&image);
+            let carried = admitted.mapping.clone();
+            if let Ok(mut result) = registrar.refine_similarity_stars(carried.transform(), &stars) {
+                result.warp = carried.warp().cloned();
+                if let Some((warp, pairs, rms)) = registrar.warp_stars(result.transform, &stars) {
+                    result.warp = Some(warp);
+                    result.matched_stars = pairs;
+                    result.rms_error_pixels = rms;
+                }
+                if result.rms_error_pixels
+                    <= self.options.acceptance.maximum_registration_rms_pixels
+                {
+                    self.ledger.frames[index].mapping =
+                        carried.with_geometry(result.transform, result.warp)?;
+                    *refined = Some(result.rms_error_pixels);
+                }
+            }
+            if let Some(cache) = &self.frame_cache {
+                let admitted = &self.ledger.frames[index];
+                cache.get_or_prepare(index, Vec::new(), || {
+                    self.register_unnormalized(admitted, &image, self.options.interpolation, false)
+                })?;
+            }
+        }
+        Ok(refined)
+    }
+
+    /// A cache for the frames a full-resolution pass refines, in
+    /// `scratch_directory` or the system temporary directory.
+    pub(crate) fn full_resolution_cache(
+        &self,
+        scratch_directory: Option<&Path>,
+    ) -> Option<FrameCache> {
+        FrameCache::new(
+            scratch_directory,
+            self.ledger.frames.len(),
+            self.background_samples(),
+        )
+        .ok()
+    }
+
     /// The samples a local background fit reads from a registered frame, for
     /// a stack normalized that way.
     fn background_samples(&self) -> Option<BackgroundSamples> {
-        match self.options.normalization {
+        match self
+            .options
+            .scale()
+            .normalization(self.options.normalization)
+        {
             crate::NormalizationMode::LocalBackground { tile_size } => {
                 Some(BackgroundSamples::for_image(&self.reference, tile_size))
             }
@@ -1939,6 +2076,13 @@ impl LiveStacker {
         if self.canvas_registrar.is_some() {
             return Err(Error::Stack(
                 "drizzle is not supported on an expanded canvas".into(),
+            ));
+        }
+        if self.options.bin_factor > 1 {
+            return Err(Error::Stack(
+                "drizzle drops each frame's sensor pixels, which a binned stack's mappings \
+                 do not place; reintegrate it at full resolution instead"
+                    .into(),
             ));
         }
         let (result, drizzled) = self.replay(options, Some(drizzle), progress)?;

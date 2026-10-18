@@ -241,6 +241,66 @@ impl LinearImage {
         Self::new(region.width, region.height, self.channels, data)
     }
 
+    /// The image binned by `factor`: each output sample is the mean of the
+    /// finite samples of its channel in a `factor` by `factor` block, and
+    /// `NaN` where none is finite. Rows and columns past the last whole
+    /// block are dropped, so the output is `width / factor` by
+    /// `height / factor` and output pixel `x` is centred on input pixel
+    /// `factor · x + (factor − 1) / 2`.
+    ///
+    /// A mean rather than a sum keeps samples on their input scale, so
+    /// saturation levels and declared ranges mean what they did. A factor of
+    /// 1 returns a copy.
+    pub fn binned(&self, factor: u32) -> Result<Self> {
+        let factor = factor as usize;
+        if factor == 0 || factor > self.width || factor > self.height {
+            return Err(Error::InvalidImage(format!(
+                "cannot bin a {}x{} image by {factor}",
+                self.width, self.height
+            )));
+        }
+        if factor == 1 {
+            return Ok(self.clone());
+        }
+        let (width, height, channels) = (self.width / factor, self.height / factor, self.channels);
+        let mut data = vec![0.0_f32; width * height * channels];
+        data.par_chunks_mut(width * channels)
+            .enumerate()
+            .for_each(|(row, output)| {
+                for (column, pixel) in output.chunks_exact_mut(channels).enumerate() {
+                    for (channel, value) in pixel.iter_mut().enumerate() {
+                        let (mut sum, mut count) = (0.0_f64, 0_u32);
+                        for y in row * factor..(row + 1) * factor {
+                            let start = (y * self.width + column * factor) * channels + channel;
+                            for &sample in self.data[start..=start + (factor - 1) * channels]
+                                .iter()
+                                .step_by(channels)
+                            {
+                                if sample.is_finite() {
+                                    sum += f64::from(sample);
+                                    count += 1;
+                                }
+                            }
+                        }
+                        *value = if count == 0 {
+                            f32::NAN
+                        } else {
+                            (sum / f64::from(count)) as f32
+                        };
+                    }
+                }
+            });
+        Self::new(width, height, channels, data)
+    }
+
+    /// [`Self::binned`], keeping this image itself at a factor of 1.
+    pub(crate) fn into_binned(self, factor: u32) -> Result<Self> {
+        if factor == 1 {
+            return Ok(self);
+        }
+        self.binned(factor)
+    }
+
     /// One luminance value per pixel: the sample itself for mono, Rec.709 luma
     /// for RGB.
     pub fn luminance(&self) -> Vec<f32> {
@@ -852,6 +912,30 @@ pub(crate) fn rec709_luma(red: f32, green: f32, blue: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binning_averages_finite_samples_and_drops_the_remainder() {
+        let nan = f32::NAN;
+        #[rustfmt::skip]
+        let image = LinearImage::new(5, 3, 1, vec![
+            1.0, 2.0, 3.0, 4.0, 99.0,
+            5.0, 6.0, nan, 8.0, 99.0,
+            77.0, 77.0, 77.0, 77.0, 77.0,
+        ])
+        .unwrap();
+        let binned = image.binned(2).unwrap();
+        assert_eq!((binned.width, binned.height, binned.channels), (2, 1, 1));
+        assert_eq!(binned.data, vec![3.5, 5.0]);
+        let empty = LinearImage::new(2, 2, 1, vec![nan; 4]).unwrap();
+        assert!(empty.binned(2).unwrap().data[0].is_nan());
+        // Each channel of a colour image is binned on its own.
+        let rgb = LinearImage::new(2, 2, 3, (0..12).map(|value| value as f32).collect()).unwrap();
+        assert_eq!(rgb.binned(2).unwrap().data, vec![4.5, 5.5, 6.5]);
+        // A factor of 1 copies, and one the image cannot hold is refused.
+        assert_eq!(image.binned(1).unwrap().width, 5);
+        assert!(image.binned(0).is_err());
+        assert!(image.binned(4).is_err());
+    }
 
     /// `vng_rows` as it was before same-colour pixels ran as vector lanes:
     /// one pixel at a time, skipping the directions it drops.
