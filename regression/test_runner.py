@@ -60,6 +60,26 @@ class GateTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 runner.solve_metrics(responses, self.expected)
 
+    def test_bad_stacks_cannot_pass(self):
+        admitted = {'accepted_frames': 12, 'rejected_frames': 0}
+        quality = {'pixelRmse': 0.001, 'fluxRelativeError': 0.001, 'defectResidual': 0.001}
+        expected = {'acceptedFrames': 12, 'maxPixelRmse': 0.002, 'maxFluxRelativeError': 0.01,
+                    'maxDefectResidual': 0.003}
+        self.assertEqual(runner.stack_metrics(admitted, quality, expected)['acceptedFrames'], 12)
+        for frames in ({'accepted_frames': 11, 'rejected_frames': 0}, {'accepted_frames': 12, 'rejected_frames': 1}):
+            with self.subTest(frames=frames), self.assertRaises(ValueError):
+                runner.stack_metrics(frames, quality, expected)
+        # A defect left in the stack, an unmeasured one, or a nonfinite one fails.
+        for residual in (0.004, float('nan'), None):
+            altered = dict(quality, defectResidual=residual)
+            if residual is None:
+                del altered['defectResidual']
+            with self.subTest(residual=residual), self.assertRaises(ValueError):
+                runner.stack_metrics(admitted, altered, expected)
+        for metric in ('pixelRmse', 'fluxRelativeError'):
+            with self.subTest(metric=metric), self.assertRaises(ValueError):
+                runner.stack_metrics(admitted, dict(quality, **{metric: 0.5}), expected)
+
     def test_corrupt_cached_asset_is_rejected_without_network(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -899,10 +899,7 @@ fn prepare_decoded(
             crate::FrameRejectionReason::Calibration(message),
         ));
     }
-    if let Some(filter) = &half.options.cosmetic
-        && let Err(error) =
-            crate::cosmetic::suppress_impulses(&mut frame.image, frame.bayer, filter)
-    {
+    if let Err(error) = half.options.repair(&mut frame) {
         return Ok(PreparedFrame::Rejected(
             crate::FrameRejectionReason::Calibration(error.to_string()),
         ));

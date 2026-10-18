@@ -472,4 +472,5 @@ Integrating a third of the sequence leaves a grainier background than the
 2. Watched-directory CLI mode with atomic snapshots and restartable state.
 3. Disk-backed/memory-mapped moment buffers for very large mono and RGB data.
 4. Drizzle, distortion-aware WCS reprojection, weighting, and mosaic framing.
-5. Raw calibration-frame integration and defect/cosmetic-correction maps.
+5. Raw calibration-frame integration, and defect maps from master darks
+   (lights without a dark already teach one: `detect_defects`).

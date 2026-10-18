@@ -174,6 +174,17 @@ exposes the **superset** of what both apps need.
   mapping (registration, a turn, drizzle or binning, a crop) to the image
   made from it; the mapping counts pixels from 0 with centres on whole
   numbers.
+- **Sensor defects without a dark** — `seiza_stack_detect_defects_json`
+  learns a sensor's hot and dead pixels from a JSON array of dithered light
+  paths, calibrated with optional bias, dark and flat masters, as the CLI's
+  `--defects` does. Its schema-1 JSON holds `defects` (`width`, `height`,
+  `frames`, `pixels`, and for steady hot pixels `excess` at
+  `exposure_seconds`) in the form the stack options take: put it under
+  `"defects"` in any open's `options_json`, and every light has those pixels
+  repaired before debayering and registration, a steady hot pixel by
+  subtracting its excess scaled to the light's exposure, as a dark would,
+  and the rest from their same-colour neighbours' median. Options JSON
+  (`sigma`, `persistence`, `maximum_frames`) is optional.
 - **Automatic stack reference** — `seiza_stack_choose_reference_json` scores
   an ordered JSON array of FITS/XISF paths using the native stacking algorithm.
   It chooses the flattest background among frames with nearly the best star
