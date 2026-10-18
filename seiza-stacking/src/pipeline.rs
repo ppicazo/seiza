@@ -875,42 +875,14 @@ fn prepare_decoded(
     }
     // Recorded after the rescale, which a replay repeats.
     let source = crate::replay::FrameSource::of(&frame);
-    if let Err(error) = half
-        .calibration
-        .validate_light_frame_with(&frame, &half.options.match_tolerances)
-    {
-        let message = match error {
-            Error::Calibration(message) => message,
-            other => other.to_string(),
-        };
-        return Ok(PreparedFrame::Rejected(
-            crate::FrameRejectionReason::Calibration(message),
-        ));
-    }
-    if let Err(error) =
-        half.calibration
-            .apply(&mut frame.image, frame.exposure_seconds, frame.bayer)
-    {
-        let message = match error {
-            Error::Calibration(message) => message,
-            other => other.to_string(),
-        };
-        return Ok(PreparedFrame::Rejected(
-            crate::FrameRejectionReason::Calibration(message),
-        ));
-    }
-    if let Err(error) = half.options.repair(&mut frame) {
-        return Ok(PreparedFrame::Rejected(
-            crate::FrameRejectionReason::Calibration(error.to_string()),
-        ));
-    }
-    let (frame, cfa) = match frame.into_prepared_with_layout(half.options.demosaic) {
+    let (frame, cfa) = match crate::stack::prepare_light(
+        frame,
+        half.calibration,
+        &half.options.match_tolerances,
+        half.options,
+    ) {
         Ok(prepared) => prepared,
-        Err(error) => {
-            return Ok(PreparedFrame::Rejected(
-                crate::FrameRejectionReason::IncompatibleImage(error.to_string()),
-            ));
-        }
+        Err(failure) => return Ok(PreparedFrame::Rejected(failure.rejection())),
     };
     Ok(prepare_frame(
         half.reference,
