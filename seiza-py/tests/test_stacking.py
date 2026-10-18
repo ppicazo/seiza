@@ -923,7 +923,11 @@ def test_live_stacker_state_describes_the_stack(tmp_path):
     assert (state.width, state.height, state.channels) == (160, 128, 1)
     assert (state.accepted_frames, state.rejected_frames) == (2, 0)
     assert state.input_mode == "calibrate-and-prepare"
-    assert state.input_paths == paths
+    # Rust's canonical paths can carry a Windows extended-length prefix.
+    assert len(state.input_paths) == len(paths)
+    assert all(
+        actual.samefile(expected) for actual, expected in zip(state.input_paths, paths)
+    )
     assert state.reference_integrated
     assert state.reference_image_path is None
     assert state.reintegration_unavailable is None
@@ -955,7 +959,7 @@ def test_masters_can_be_replaced_part_way_through(tmp_path):
     stacker.set_calibration_fits(bias=bias)
     after = stacker.state()
     assert after.configuration_fingerprint != before
-    assert bias in after.input_paths
+    assert any(path.samefile(bias) for path in after.input_paths)
     assert stacker.push_fits(paths[1]).accepted
 
     stacker.set_calibration_fits()
