@@ -17,7 +17,7 @@ use super::{
     Moments, OutputChunk, Outputs, PackedFates, Rejection, SampleFate, check_cancelled,
     estimate_chunk, integrate_chunk, refine_chunk, validate_options,
 };
-use crate::{CancelSignal, Error, Result};
+use crate::{CancelSignal, Error, ReferenceRegion, Result};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -26,6 +26,19 @@ pub(crate) trait BandSource: Sync {
     /// Fill `band`, whole rows of interleaved samples, with frame `index`'s
     /// registered and normalized samples from row `top` on.
     fn read(&self, index: usize, top: usize, band: &mut [f32]) -> Result<()>;
+
+    /// The region of the grid frame `index` covers, every sample beyond
+    /// which is `NaN`, when it is not the whole grid: a frame on part of an
+    /// expanded canvas. A band it does not reach is not read.
+    fn region(&self, _index: usize) -> Option<ReferenceRegion> {
+        None
+    }
+}
+
+/// Whether `region`, or the whole grid when there is none, holds any of
+/// rows `top..top + rows`.
+fn reaches_rows(region: Option<ReferenceRegion>, top: usize, rows: usize) -> bool {
+    region.is_none_or(|region| top < region.y + region.height && region.y < top + rows)
 }
 
 /// Bytes of every frame's samples one tile should span: small enough for a
@@ -95,7 +108,9 @@ pub(crate) fn band_rows(shape: (usize, usize, usize), frame_count: usize, memory
 
 /// Read every frame of `shape` from `source` a band of `rows` rows at a
 /// time, handing each band's samples, one slice per frame, to `each` with
-/// the band's index and first row, in order. The next band is read while
+/// the band's index and first row, in order. A frame whose
+/// [`BandSource::region`] holds none of the band's rows is not read, and its
+/// slice is empty: every sample of it is `NaN`. The next band is read while
 /// `each` works on this one, so two bands of every frame are held: on a
 /// thread of its own, or from a pool thread as a task in that pool; see
 /// [`crate::tasks`].
@@ -111,6 +126,16 @@ pub(crate) fn for_each_band(
     let row_samples = width * channels;
     let bands = height.div_ceil(rows);
     let band_samples = |band: usize| rows.min(height - band * rows) * row_samples;
+    let regions = (0..frame_count)
+        .map(|index| source.region(index))
+        .collect::<Vec<_>>();
+    let reaches = |index: usize, band: usize| {
+        reaches_rows(
+            regions[index],
+            band * rows,
+            band_samples(band) / row_samples,
+        )
+    };
     let cancelled = || cancel.is_some_and(CancelSignal::is_cancelled);
     let read = |band: usize, mut frames: Vec<Vec<f32>>| {
         if cancelled() {
@@ -119,6 +144,7 @@ pub(crate) fn for_each_band(
         frames
             .par_iter_mut()
             .enumerate()
+            .filter(|(index, _)| reaches(*index, band))
             .try_for_each(|(index, buffer)| {
                 source.read(index, band * rows, &mut buffer[..band_samples(band)])
             })?;
@@ -144,7 +170,15 @@ pub(crate) fn for_each_band(
                 }
                 let samples = frames
                     .iter()
-                    .map(|frame| &frame[..band_samples(band)])
+                    .enumerate()
+                    .map(|(index, frame)| {
+                        let len = if reaches(index, band) {
+                            band_samples(band)
+                        } else {
+                            0
+                        };
+                        &frame[..len]
+                    })
                     .collect::<Vec<_>>();
                 each(band, band * rows, &samples)?;
                 drop(samples);
@@ -171,7 +205,16 @@ struct FrameCounts {
 
 /// What every tile of a band shares.
 struct Band<'a, const C: usize> {
+    /// Every frame's samples of the band; empty for a frame the band does
+    /// not reach.
     frames: &'a [&'a [f32]],
+    /// The region of the grid each frame covers, when it is not the whole
+    /// grid.
+    regions: &'a [Option<ReferenceRegion>],
+    /// The grid's width in pixels and its channels: `C` is 1 for colour
+    /// frames of equal weight.
+    width: usize,
+    channels: usize,
     weights: &'a [ChannelWeights<C>],
     rejection: &'a Rejection,
     cancel: Option<&'a CancelSignal>,
@@ -183,6 +226,8 @@ struct Band<'a, const C: usize> {
 
 /// A task's working space for one tile.
 struct TileScratch {
+    /// The frames that reach the tile, in order.
+    reaching: Vec<usize>,
     first: Vec<FirstEstimate>,
     kept: Vec<Moments>,
     /// One bit per sample per frame: what pass 2 kept.
@@ -214,6 +259,9 @@ impl Run<'_> {
         let tile = tile_pixels * channels;
 
         let mut outputs = Outputs::new(samples, WEIGHTED);
+        let regions = (0..frame_count)
+            .map(|index| source.region(index))
+            .collect::<Vec<_>>();
         let counts = (0..frame_count)
             .map(|_| FrameCounts::default())
             .collect::<Vec<_>>();
@@ -234,9 +282,14 @@ impl Run<'_> {
             options.cancel.as_ref(),
             |band, top, frames| {
                 progress(band, bands);
-                let band_samples = frames[0].len();
+                // A frame the band does not reach was not read, and its
+                // samples are empty.
+                let band_samples = rows.min(height - top) * row_samples;
                 let context = Band {
                     frames,
+                    regions: &regions,
+                    width,
+                    channels,
                     weights,
                     rejection: &rejection,
                     cancel: options.cancel.as_ref(),
@@ -283,6 +336,7 @@ impl Run<'_> {
 impl TileScratch {
     fn new(tile: usize, frame_count: usize) -> Self {
         Self {
+            reaching: Vec::with_capacity(frame_count),
             first: vec![FirstEstimate::default(); tile],
             kept: vec![Moments::default(); tile],
             keep: vec![0; frame_count * tile.div_ceil(64)],
@@ -314,6 +368,29 @@ fn pack_codes(words: &mut [u64], offset: usize, codes: &[u8]) {
 }
 
 impl<const C: usize> Band<'_, C> {
+    /// Whether frame `index` covers any of the `len` samples from sample
+    /// `absolute` of the whole image on. Every sample of a frame beyond its
+    /// region is `NaN`, which no pass counts, so leaving out a frame that
+    /// covers none of a tile changes nothing.
+    fn reaches(&self, index: usize, absolute: usize, len: usize) -> bool {
+        let Some(region) = self.regions[index] else {
+            return true;
+        };
+        let (first, last) = (
+            absolute / self.channels,
+            (absolute + len - 1) / self.channels,
+        );
+        let (top, bottom) = (first / self.width, last / self.width);
+        let rows = region.y..region.y + region.height;
+        let columns = |from: usize, to: usize| from < region.x + region.width && region.x <= to;
+        if top == bottom {
+            return rows.contains(&top) && columns(first % self.width, last % self.width);
+        }
+        (rows.contains(&top) && columns(first % self.width, self.width - 1))
+            || (rows.contains(&bottom) && columns(0, last % self.width))
+            || (top + 1 < bottom && top + 1 < rows.end && rows.start < bottom)
+    }
+
     /// All three passes over the tile of the band that starts `start`
     /// samples in and whose outputs are `output`.
     fn tile<const WEIGHTED: bool>(
@@ -327,11 +404,25 @@ impl<const C: usize> Band<'_, C> {
         }
         let len = output.mean.len();
         let rejection = self.rejection;
+        // Fates are packed from sample 0 of the whole image; the tile's
+        // first and last words can be shared with the neighbouring tiles.
+        let absolute = self.start + start;
+        scratch.reaching.clear();
+        scratch.reaching.extend(
+            (0..self.frames.len())
+                .filter(|&index| !self.frames[index].is_empty())
+                .filter(|&index| self.reaches(index, absolute, len)),
+        );
+        let reaching = &scratch.reaching;
 
         let first = &mut scratch.first[..len];
         first.fill(FirstEstimate::default());
-        for (frame, weights) in self.frames.iter().zip(self.weights) {
-            estimate_chunk(first, &frame[start..start + len], weights);
+        for &index in reaching {
+            estimate_chunk(
+                first,
+                &self.frames[index][start..start + len],
+                &self.weights[index],
+            );
         }
         for first in first.iter_mut() {
             first.finish(rejection);
@@ -340,39 +431,27 @@ impl<const C: usize> Band<'_, C> {
         let kept = &mut scratch.kept[..len];
         kept.fill(Moments::default());
         let words = len.div_ceil(64);
-        let keep = &mut scratch.keep[..self.frames.len() * words];
+        // One run of keep bits for each frame that reaches the tile.
+        let keep = &mut scratch.keep[..reaching.len() * words];
         keep.fill(0);
-        for ((frame, weights), keep) in self
-            .frames
-            .iter()
-            .zip(self.weights)
-            .zip(keep.chunks_mut(words))
-        {
+        for (&index, keep) in reaching.iter().zip(keep.chunks_mut(words)) {
             refine_chunk(
                 kept,
                 first,
-                &frame[start..start + len],
-                weights,
+                &self.frames[index][start..start + len],
+                &self.weights[index],
                 rejection,
                 keep,
             );
         }
 
-        // Fates are packed from sample 0 of the whole image; the tile's
-        // first and last words can be shared with the neighbouring tiles.
-        let absolute = self.start + start;
         let (first_word, offset) = (
             absolute / SampleFate::PER_WORD,
             absolute % SampleFate::PER_WORD,
         );
         let fate_words = (offset + len).div_ceil(SampleFate::PER_WORD);
-        for (index, ((frame, weights), keep)) in self
-            .frames
-            .iter()
-            .zip(self.weights)
-            .zip(keep.chunks(words))
-            .enumerate()
-        {
+        for (&index, keep) in reaching.iter().zip(keep.chunks(words)) {
+            let (frame, weights) = (self.frames[index], &self.weights[index]);
             scratch.counts[index] = match self.fates {
                 Some(fates) => {
                     // A byte per fate keeps the stores independent; they
@@ -411,7 +490,8 @@ impl<const C: usize> Band<'_, C> {
                 ),
             };
         }
-        for (frame, &(finite, integrated)) in scratch.counts.iter().enumerate() {
+        for &frame in reaching {
+            let (finite, integrated) = scratch.counts[frame];
             self.counts[frame]
                 .finite
                 .fetch_add(finite, Ordering::Relaxed);

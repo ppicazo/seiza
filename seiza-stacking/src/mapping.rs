@@ -211,6 +211,20 @@ impl RegisteredFrameMapping {
         crate::registration::FrameGeometry::of(self.transform, self.warp.as_ref())
     }
 
+    /// The region of the reference grid a `source_width` by `source_height`
+    /// frame reaches through this mapping; see
+    /// [`crate::registration::footprint_region`].
+    pub(crate) fn footprint(&self, source_width: usize, source_height: usize) -> ReferenceRegion {
+        crate::registration::footprint_region(
+            source_width,
+            source_height,
+            self.reference_width,
+            self.reference_height,
+            self.geometry(),
+            self.transform,
+        )
+    }
+
     /// Check the serialized mapping before it is used for pixel work.
     pub fn validate(&self) -> Result<()> {
         if self.schema_version != REGISTERED_FRAME_MAPPING_SCHEMA_VERSION {

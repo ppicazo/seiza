@@ -2267,12 +2267,12 @@ thread_local! {
 /// Whether [`prepare_frame`] prepares a frame over the whole of an expanded
 /// canvas: only for a test comparing that with its footprint.
 #[cfg(test)]
-fn resamples_whole_canvas() -> bool {
+pub(crate) fn resamples_whole_canvas() -> bool {
     WHOLE_CANVAS.get()
 }
 
 #[cfg(not(test))]
-fn resamples_whole_canvas() -> bool {
+pub(crate) fn resamples_whole_canvas() -> bool {
     false
 }
 

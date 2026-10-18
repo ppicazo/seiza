@@ -28,6 +28,62 @@ pub(crate) struct Placed<'a> {
     pub(crate) height: usize,
 }
 
+/// An image of one `region` of a larger grid, owning its samples: what a
+/// [`Placed`] reads.
+#[derive(Clone, Debug)]
+pub(crate) struct PlacedImage {
+    pub(crate) image: LinearImage,
+    pub(crate) region: ReferenceRegion,
+    /// The grid's width and height in pixels.
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+}
+
+impl PlacedImage {
+    /// `image` as the whole of its own grid.
+    pub(crate) fn whole(image: LinearImage) -> Self {
+        let (width, height) = (image.width, image.height);
+        Self {
+            region: ReferenceRegion {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
+            image,
+            width,
+            height,
+        }
+    }
+
+    pub(crate) fn view(&self) -> Placed<'_> {
+        Placed {
+            image: &self.image,
+            region: self.region,
+            width: self.width,
+            height: self.height,
+        }
+    }
+
+    /// The grid-sized image this stands for, `NaN` beyond the region.
+    pub(crate) fn into_grid(self) -> Result<LinearImage> {
+        if self.view().is_whole() {
+            return Ok(self.image);
+        }
+        let channels = self.image.channels;
+        let (row, run) = (self.width * channels, self.region.width * channels);
+        let mut data = vec![f32::NAN; row * self.height];
+        for (rows, window) in data[self.region.y * row..(self.region.y + self.region.height) * row]
+            .chunks_exact_mut(row)
+            .zip(self.image.data.chunks_exact(run))
+        {
+            let start = self.region.x * channels;
+            rows[start..start + run].copy_from_slice(window);
+        }
+        LinearImage::new(self.width, self.height, channels, data)
+    }
+}
+
 impl<'a> Placed<'a> {
     /// `image` as `region` of a grid shaped as `grid`.
     pub(crate) fn on(image: &'a LinearImage, region: ReferenceRegion, grid: &LinearImage) -> Self {
