@@ -838,7 +838,9 @@ pub(crate) fn plan(
     let frame = FitsFrame::open(first)?;
     let metadata = frame.metadata();
     let anchor_optics = OpticalMetadata::from_frame(&frame);
-    let (frame, _) = crate::stack::prepare_reference(frame, calibration, options)?;
+    let (frame, _) =
+        crate::stack::prepare_light(frame, calibration, &options.match_tolerances, options)
+            .map_err(crate::stack::LightFailure::into_error)?;
     check_source(first)?;
     if frame.image.sample_count() > maximum_samples {
         return Err(Error::Stack(format!(
@@ -903,7 +905,9 @@ pub(crate) fn plan(
         check_source(path)?;
         let frame = FitsFrame::open(path)?;
         let optics = OpticalMetadata::from_frame(&frame);
-        let (frame, _) = crate::stack::prepare_reference(frame, calibration, options)?;
+        let (frame, _) =
+            crate::stack::prepare_light(frame, calibration, &options.match_tolerances, options)
+                .map_err(crate::stack::LightFailure::into_error)?;
         check_source(path)?;
         if frame.image.channels != channels {
             return Err(Error::Stack(format!(

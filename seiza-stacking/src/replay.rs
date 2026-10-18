@@ -2192,58 +2192,50 @@ impl LiveStacker {
         }
     }
 
-    /// Read, calibrate and filter an admitted frame's source, refusing a
-    /// file that changed since it was stacked.
-    fn read_source(
-        &self,
-        admitted: &AdmittedFrame,
-        masters: &CalibrationMasters,
-    ) -> Result<FitsFrame> {
+    /// Read an admitted frame's source, rescaled as it was when stacked,
+    /// refusing a file that changed since it was stacked.
+    fn read_source(&self, admitted: &AdmittedFrame) -> Result<FitsFrame> {
+        self.source_unchanged(admitted)?;
         let source = admitted
             .source
             .as_ref()
             .ok_or_else(|| Error::Stack("an admitted frame has no source file".into()))?;
-        let changed = || {
-            Error::Stack(format!(
-                "{} changed since it was stacked; rebuild the stack",
-                source.path.display()
-            ))
-        };
-        if source.stamp.is_some() && SourceStamp::of(&source.path) != source.stamp {
-            return Err(changed());
-        }
         let mut frame = FitsFrame::open(&source.path)?;
         if let Some(full_scale) = source.rescale_to {
             frame.rescale_declared_unit_bounds(full_scale);
         }
-        masters.validate_light_frame_with(&frame, &admitted.tolerances)?;
-        masters.apply(&mut frame.image, frame.exposure_seconds, frame.bayer)?;
-        self.options.repair(&mut frame)?;
-        if source.stamp.is_some() && SourceStamp::of(&source.path) != source.stamp {
-            return Err(changed());
-        }
         Ok(frame)
     }
 
-    /// Read, calibrate, filter and debayer an admitted frame's source,
-    /// refusing a file that changed since it was stacked.
+    /// Read and prepare an admitted frame's source as a live stack prepares
+    /// a light, refusing a file that changed since it was stacked.
     fn read_admitted(
         &self,
         admitted: &AdmittedFrame,
         masters: &CalibrationMasters,
     ) -> Result<(FitsFrame, Option<crate::BayerLayout>)> {
-        self.read_source(admitted, masters)?
-            .into_prepared_with_layout(self.options.demosaic)
+        let prepared = crate::stack::prepare_light(
+            self.read_source(admitted)?,
+            masters,
+            &admitted.tolerances,
+            &self.options,
+        )
+        .map_err(crate::stack::LightFailure::into_error)?;
+        self.source_unchanged(admitted)?;
+        Ok(prepared)
     }
 
-    /// An admitted frame's calibrated and filtered source pixels, not
+    /// An admitted frame's calibrated and repaired source pixels, not
     /// debayered, with the Bayer layout of a colour sensor's mosaic.
     fn read_calibrated(
         &self,
         admitted: &AdmittedFrame,
         masters: &CalibrationMasters,
     ) -> Result<(LinearImage, Option<crate::BayerLayout>)> {
-        let frame = self.read_source(admitted, masters)?;
+        let mut frame = self.read_source(admitted)?;
+        crate::stack::calibrate_light(&mut frame, masters, &admitted.tolerances, &self.options)
+            .map_err(crate::stack::LightFailure::into_error)?;
+        self.source_unchanged(admitted)?;
         Ok((frame.image, frame.bayer))
     }
 

@@ -622,7 +622,9 @@ impl LiveStacker {
     ) -> Result<Self> {
         let source = crate::replay::FrameSource::of(&reference);
         let reference_metadata = reference.metadata();
-        let (reference, cfa) = prepare_reference(reference, &calibration, &options)?;
+        let (reference, cfa) =
+            prepare_light(reference, &calibration, &options.match_tolerances, &options)
+                .map_err(LightFailure::into_error)?;
         let mut stacker = Self::from_prepared(
             reference.image,
             reference.headers,
@@ -690,7 +692,13 @@ impl LiveStacker {
             let channel_reference = channel_reference?;
             tried += 1;
             let metadata = channel_reference.metadata();
-            let (channel, _) = prepare_reference(channel_reference, &calibration, &options)?;
+            let (channel, _) = prepare_light(
+                channel_reference,
+                &calibration,
+                &options.match_tolerances,
+                &options,
+            )
+            .map_err(LightFailure::into_error)?;
             let noise = if options.weighting.is_equal() {
                 Vec::new()
             } else {
@@ -1389,37 +1397,17 @@ impl LiveStacker {
     /// Calibrate, prepare, and try to integrate a FITS frame, reporting whether
     /// it was admitted or turned away. Stacks created from prepared pixels
     /// reject this path so later inputs cannot skip the caller's preparation.
-    pub fn push(&mut self, mut frame: FitsFrame) -> Result<FrameDisposition> {
+    pub fn push(&mut self, frame: FitsFrame) -> Result<FrameDisposition> {
         self.require_fits_input_mode()?;
         let source = crate::replay::FrameSource::of(&frame);
-        if let Err(error) = self
-            .calibration
-            .validate_light_frame_with(&frame, &self.options.match_tolerances)
-        {
-            let message = match error {
-                Error::Calibration(message) => message,
-                other => other.to_string(),
-            };
-            return Ok(self.reject(FrameRejectionReason::Calibration(message)));
-        }
-        if let Err(error) =
-            self.calibration
-                .apply(&mut frame.image, frame.exposure_seconds, frame.bayer)
-        {
-            let message = match error {
-                Error::Calibration(message) => message,
-                other => other.to_string(),
-            };
-            return Ok(self.reject(FrameRejectionReason::Calibration(message)));
-        }
-        if let Err(error) = self.options.repair(&mut frame) {
-            return Ok(self.reject(FrameRejectionReason::Calibration(error.to_string())));
-        }
-        let (frame, cfa) = match frame.into_prepared_with_layout(self.options.demosaic) {
+        let (frame, cfa) = match prepare_light(
+            frame,
+            &self.calibration,
+            &self.options.match_tolerances,
+            &self.options,
+        ) {
             Ok(prepared) => prepared,
-            Err(error) => {
-                return Ok(self.reject(FrameRejectionReason::IncompatibleImage(error.to_string())));
-            }
+            Err(failure) => return Ok(self.reject(failure.rejection())),
         };
         let cache = self
             .frame_cache
@@ -1792,20 +1780,72 @@ fn distinct_input_paths<'a>(
     Ok(identities)
 }
 
-/// Calibrate and prepare a light used as a channel's photometric target.
-pub(crate) fn prepare_reference(
-    mut reference: FitsFrame,
+/// The step at which preparing a light failed, which decides how a live
+/// stack turns the frame away. The reference, planning and replay paths pass
+/// the error on as it is.
+pub(crate) enum LightFailure {
+    /// The masters refused the light, or applying them failed.
+    Calibration(Error),
+    /// Repairing its defects or filtering its impulses failed.
+    Repair(Error),
+    /// Debayering failed.
+    Debayer(Error),
+}
+
+impl LightFailure {
+    /// The reason a live stack reports for turning the light away.
+    pub(crate) fn rejection(self) -> FrameRejectionReason {
+        match self {
+            Self::Calibration(Error::Calibration(message)) => {
+                FrameRejectionReason::Calibration(message)
+            }
+            Self::Calibration(error) | Self::Repair(error) => {
+                FrameRejectionReason::Calibration(error.to_string())
+            }
+            Self::Debayer(error) => FrameRejectionReason::IncompatibleImage(error.to_string()),
+        }
+    }
+
+    /// The error itself, for a path that passes it on. Not a `From`
+    /// conversion: [`Error`] converting only from itself is what lets a
+    /// closure's `?` infer its error type.
+    pub(crate) fn into_error(self) -> Error {
+        match self {
+            Self::Calibration(error) | Self::Repair(error) | Self::Debayer(error) => error,
+        }
+    }
+}
+
+/// Check a light against its masters under `tolerances`, calibrate it, then
+/// repair its defects and filter its impulses: every step a light takes on
+/// its sensor's own photosites, before debayering.
+pub(crate) fn calibrate_light(
+    frame: &mut FitsFrame,
     calibration: &CalibrationMasters,
+    tolerances: &seiza_calibration::MatchTolerances,
     options: &StackOptions,
-) -> Result<(FitsFrame, Option<BayerLayout>)> {
-    calibration.validate_light_frame_with(&reference, &options.match_tolerances)?;
-    calibration.apply(
-        &mut reference.image,
-        reference.exposure_seconds,
-        reference.bayer,
-    )?;
-    options.repair(&mut reference)?;
-    reference.into_prepared_with_layout(options.demosaic)
+) -> std::result::Result<(), LightFailure> {
+    calibration
+        .validate_light_frame_with(frame, tolerances)
+        .map_err(LightFailure::Calibration)?;
+    calibration
+        .apply(&mut frame.image, frame.exposure_seconds, frame.bayer)
+        .map_err(LightFailure::Calibration)?;
+    options.repair(frame).map_err(LightFailure::Repair)
+}
+
+/// Prepare a light read from a file, as every path that stacks, plans or
+/// replays one does: [`calibrate_light`], then debayer.
+pub(crate) fn prepare_light(
+    mut frame: FitsFrame,
+    calibration: &CalibrationMasters,
+    tolerances: &seiza_calibration::MatchTolerances,
+    options: &StackOptions,
+) -> std::result::Result<(FitsFrame, Option<BayerLayout>), LightFailure> {
+    calibrate_light(&mut frame, calibration, tolerances, options)?;
+    frame
+        .into_prepared_with_layout(options.demosaic)
+        .map_err(LightFailure::Debayer)
 }
 
 /// Measure noise before any registration resampling changes its variance.
