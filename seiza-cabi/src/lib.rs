@@ -571,6 +571,14 @@ struct StackReferenceResponse {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct DefectMapResponse {
+    schema_version: u32,
+    /// In the form the stack options take it, so a host passes it on as is.
+    defects: seiza_stacking::DefectMap,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ChannelReferenceSelectionResponse {
     schema_version: u32,
     channel_reference_index: usize,
@@ -3134,6 +3142,96 @@ pub unsafe extern "C" fn seiza_stack_choose_reference_json(
                 .into_iter()
                 .map(|score| score.map(StackReferenceScoreResponse::from))
                 .collect(),
+        })
+    })
+    .unwrap_or(ptr::null_mut())
+}
+
+#[unsafe(no_mangle)]
+/// Learn a sensor's hot and dead pixels from its lights, as the CLI's
+/// `--defects` does, for lights with no master dark to subtract them.
+///
+/// `paths_json` is a JSON array of FITS or XISF light paths. Up to
+/// `maximum_frames` of them, evenly spaced, are read and calibrated with the
+/// optional bias, dark and flat masters (`dark_exposure_seconds` as for
+/// [`seiza_live_stacker_open_fits`]). A pixel is a defect when it stands out
+/// from its same-colour neighbours, the same way, in most of those lights,
+/// and its neighbours do not rise as a star's do; the lights must have
+/// moved on the sensor, by dithering or drift, for a star to be told from a
+/// defect. Pass null or empty `options_json` for the defaults; its fields
+/// are `seiza_stacking::DefectDetectionOptions`'s: `"sigma"` (5),
+/// `"persistence"` (0.6, the fraction of lights) and `"maximum_frames"` (16,
+/// at least 3). A light that cannot be read or calibrated, or of another
+/// size than the first, is passed over.
+///
+/// Returns owned schema-1 JSON whose `defects` holds `width`, `height`,
+/// `frames` (the lights examined) and `pixels`, ascending raw-frame indices
+/// `y * width + x`, and, when any pixel is a steady hot pixel, `excess`: one
+/// value per pixel, its excess over its neighbours at `exposure_seconds`
+/// (present when every light had an exposure), subtracted from each light
+/// scaled to its own exposure, as a dark would subtract it, or zero where the
+/// neighbours' median replaces the pixel. The map is empty when fewer than
+/// three lights were examined.
+/// Put it as it is under `"defects"` in the `options_json` of
+/// [`seiza_live_stacker_open_fits`] or any other open, and every light the
+/// stack calibrates has those pixels repaired from their same-colour
+/// neighbours before debayering, registration and integration. Free the
+/// JSON, or an `error_out` string on failure, with [`seiza_string_free`].
+///
+/// # Safety
+/// `paths_json` must be a valid NUL-terminated string. Optional paths and
+/// `options_json` may be null; when non-null they must be NUL-terminated.
+/// When non-null, `error_out` must point to writable storage for one pointer.
+pub unsafe extern "C" fn seiza_stack_detect_defects_json(
+    paths_json: *const c_char,
+    bias_path: *const c_char,
+    dark_path: *const c_char,
+    flat_path: *const c_char,
+    dark_exposure_seconds: f64,
+    options_json: *const c_char,
+    error_out: *mut *mut c_char,
+) -> *mut c_char {
+    clear_error(error_out);
+    ffi_result(error_out, || {
+        let paths_json = required_str(paths_json, "defect detection light paths")?;
+        let paths: Vec<PathBuf> = serde_json::from_str::<Vec<String>>(&paths_json)
+            .map_err(|error| {
+                format!("defect detection light paths must be a JSON array of strings: {error}")
+            })?
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+        let bias_path = optional_path(bias_path)?;
+        let dark_path = optional_path(dark_path)?;
+        let flat_path = optional_path(flat_path)?;
+        if dark_path.is_none() && dark_exposure_seconds != 0.0 {
+            return Err("a master-dark exposure override requires a dark path".into());
+        }
+        let dark_exposure_seconds =
+            optional_positive_seconds(dark_exposure_seconds, "master-dark exposure override")?;
+        let options = if options_json.is_null() {
+            String::new()
+        } else {
+            required_str(options_json, "defect detection options JSON")?
+        };
+        let options = if options.trim().is_empty() {
+            seiza_stacking::DefectDetectionOptions::default()
+        } else {
+            serde_json::from_str(&options)
+                .map_err(|error| format!("invalid defect detection options JSON: {error}"))?
+        };
+        let calibration = seiza_stacking::CalibrationMasters::from_fits_paths(
+            bias_path.as_deref(),
+            dark_path.as_deref(),
+            flat_path.as_deref(),
+            dark_exposure_seconds,
+        )
+        .map_err(|error| error.to_string())?;
+        let defects = seiza_stacking::detect_defects(&paths, &calibration, &options)
+            .map_err(|error| error.to_string())?;
+        owned_json(&DefectMapResponse {
+            schema_version: 1,
+            defects,
         })
     })
     .unwrap_or(ptr::null_mut())
@@ -8547,6 +8645,109 @@ fn set_error(error_out: *mut *mut c_char, error: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn defect_detection_cabi_returns_the_map_stack_options_take() {
+        // Integer dithers of one field, cut from a larger one, with two hot
+        // pixels fixed on the sensor.
+        let directory = tempfile::tempdir().unwrap();
+        let (width, height, margin) = (160, 128, 8);
+        let field = stacking_star_field(width + 2 * margin, height + 2 * margin);
+        let hot = [40 * width + 50, 90 * width + 120];
+        let paths = [(0, 0), (5, -3), (-4, 4), (3, 6), (-6, -5), (7, 2)]
+            .into_iter()
+            .enumerate()
+            .map(|(index, (dx, dy)): (usize, (isize, isize))| {
+                let mut data = (0..width * height)
+                    .map(|pixel| {
+                        let x = (pixel % width) as isize + margin as isize - dx;
+                        let y = (pixel / width) as isize + margin as isize - dy;
+                        field[y as usize * (width + 2 * margin) + x as usize]
+                    })
+                    .collect::<Vec<_>>();
+                for &pixel in &hot {
+                    data[pixel] += 5_000.0;
+                }
+                let path = directory.path().join(format!("light-{index}.fits"));
+                let image = LinearImage::new(width, height, 1, data).unwrap();
+                seiza_stacking::write_processed_image_fits_f32(&path, &image, &[], &[]).unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        let expected = seiza_stacking::detect_defects(
+            &paths,
+            &seiza_stacking::CalibrationMasters::default(),
+            &seiza_stacking::DefectDetectionOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(expected.pixels(), hot.map(|pixel| pixel as u32));
+        let strings = paths
+            .iter()
+            .map(|path| path.to_str().unwrap())
+            .collect::<Vec<_>>();
+        let paths_json = CString::new(serde_json::to_string(&strings).unwrap()).unwrap();
+
+        let mut error = ptr::null_mut();
+        let raw = unsafe {
+            seiza_stack_detect_defects_json(
+                paths_json.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                0.0,
+                ptr::null(),
+                &mut error,
+            )
+        };
+        assert!(error.is_null());
+        let response: Value =
+            serde_json::from_str(unsafe { CStr::from_ptr(raw) }.to_str().unwrap()).unwrap();
+        unsafe { seiza_string_free(raw) };
+        assert_eq!(response["schemaVersion"], 1);
+        // The map the core learned, every float exactly as it was.
+        let returned: seiza_stacking::DefectMap =
+            serde_json::from_value(response["defects"].clone()).unwrap();
+        assert_eq!(returned, expected);
+        assert_eq!(returned.excess().len(), hot.len());
+
+        // The map goes into a stack's options as it came.
+        let options =
+            CString::new(serde_json::json!({ "defects": response["defects"] }).to_string())
+                .unwrap();
+        let reference = CString::new(strings[0]).unwrap();
+        let stacker = unsafe {
+            seiza_live_stacker_open_fits(
+                reference.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                0.0,
+                options.as_ptr(),
+                &mut error,
+            )
+        };
+        assert!(error.is_null());
+        assert!(!stacker.is_null());
+        let state = unsafe { required_live_stacker(stacker) }.unwrap();
+        assert_eq!(state.stacker.view().accepted_frames, 1);
+        unsafe { seiza_live_stacker_free(stacker) };
+
+        let options = CString::new(r#"{"persistence": 2.0}"#).unwrap();
+        let raw = unsafe {
+            seiza_stack_detect_defects_json(
+                paths_json.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                0.0,
+                options.as_ptr(),
+                &mut error,
+            )
+        };
+        assert!(raw.is_null());
+        assert!(!error.is_null());
+        unsafe { seiza_string_free(error) };
+    }
 
     #[test]
     fn stack_reference_cabi_preserves_order_scores_and_selected_path() {

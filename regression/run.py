@@ -120,6 +120,18 @@ def solve_metrics(responses, expected):
     return metrics
 
 
+def stack_metrics(admitted, quality, expected):
+    frames = expected['acceptedFrames']
+    if admitted['accepted_frames'] != frames or admitted['rejected_frames'] != 0:
+        raise ValueError(f'stack must integrate all {frames} frames without rejection')
+    metrics = dict(quality, acceptedFrames=admitted['accepted_frames'])
+    for metric in ('pixelRmse', 'fluxRelativeError'):
+        bounded(metrics[metric], expected['max' + metric[0].upper() + metric[1:]], metric)
+    if 'maxDefectResidual' in expected:
+        bounded(metrics.get('defectResidual'), expected['maxDefectResidual'], 'defectResidual')
+    return metrics
+
+
 def measured(command, *, cwd, env, payload, timeout):
     # GNU time reports this child's high-water RSS, not a process-global maximum
     # accumulated over earlier cases. Compilation and fixture creation are excluded.
@@ -168,14 +180,11 @@ def run_case(case, directory, binary, fixtures, env, timeout):
             command.append('--reintegrate')
         _, usage = measured(command, cwd=directory, env=env, payload=None, timeout=timeout)
         admitted = json.loads(admission.read_text())
-        if admitted['accepted_frames'] != 3 or admitted['rejected_frames'] != 0:
-            raise ValueError('stack must integrate all three frames without rejection')
-        verification = subprocess.run([str(fixtures), 'check-stack', str(directory), str(output)],
-                                      text=True, capture_output=True, check=True, timeout=timeout)
-        metrics = json.loads(verification.stdout)
-        metrics['acceptedFrames'] = admitted['accepted_frames']
-        for metric in ('pixelRmse', 'fluxRelativeError'):
-            bounded(metrics[metric], case['expected']['max' + metric[0].upper() + metric[1:]], metric)
+        check = [str(fixtures), 'check-stack', str(directory), str(output)]
+        if 'probes' in case:
+            check.append(str(directory / case['probes']))
+        verification = subprocess.run(check, text=True, capture_output=True, check=True, timeout=timeout)
+        metrics = stack_metrics(admitted, json.loads(verification.stdout), case['expected'])
     return dict(usage, quality=metrics)
 
 

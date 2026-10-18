@@ -390,6 +390,23 @@ the frame.
 calibrated and debayered, keeping its FITS header cards, so you can correct a
 frame between calibration and registration; push later frames as arrays.
 
+Without a `dark`, `stack_fits` learns the sensor's hot and dead pixels from up
+to 16 of the lights and repairs them in every light before debayering and
+registration, as the CLI's `--defects auto` does: a defect stays on its pixel
+while dithering or drift moves the sky, so a pixel counts only when it stands
+out in most of the lights, and never when its neighbours rise as a star's do.
+`defects="on"` does so with a dark as well, for the defects its master leaves,
+and `defects="off"` never. `seiza.detect_defects(paths, bias=..., flat=...)`
+gives the map on its own, a `DefectMap` with `width`, `height`, `frames` (the
+lights examined) and `pixels`, raw-frame indices `y * width + x`. A steady hot
+pixel's `excess` over its neighbours, learned at `exposure_seconds`, is
+subtracted from each light as a dark would subtract it, so a star the dither
+carries onto it keeps its core; dead and wandering pixels take the median of
+their neighbours. Pass the map as
+`StackOptions(defects=...)` to any stack, or build one from a known list with
+`DefectMap(width, height, pixels)`. Its `sigma` (5), `persistence` (0.6, the
+fraction of lights) and `maximum_frames` (16) are the CLI's.
+
 The first light is the reference unless `reference="auto"`, which scores every
 light and takes the best, as the CLI's `--reference auto` does. The result's
 `reference_light` names the light used. `seiza.choose_reference(paths)` gives

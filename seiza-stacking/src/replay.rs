@@ -2218,9 +2218,7 @@ impl LiveStacker {
         }
         masters.validate_light_frame_with(&frame, &admitted.tolerances)?;
         masters.apply(&mut frame.image, frame.exposure_seconds, frame.bayer)?;
-        if let Some(filter) = &self.options.cosmetic {
-            crate::cosmetic::suppress_impulses(&mut frame.image, frame.bayer, filter)?;
-        }
+        self.options.repair(&mut frame)?;
         if source.stamp.is_some() && SourceStamp::of(&source.path) != source.stamp {
             return Err(changed());
         }

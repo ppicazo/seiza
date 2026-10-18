@@ -1098,3 +1098,62 @@ def test_a_stack_reads_a_light_at_the_angle_the_host_measured(tmp_path):
         seiza.MatchTolerances(light_rotation="sideways")
     with pytest.raises(ValueError, match="finite"):
         seiza.MatchTolerances(light_rotation=float("nan"))
+
+
+def dithered_lights(tmp_path, hot):
+    """Six integer dithers of one star field, with hot pixels fixed on the
+    sensor and fresh noise in each."""
+    rng = np.random.default_rng(3)
+    field = synthetic_star_field(height=144, width=176, noise=0.0)
+    paths = []
+    dithers = [(0, 0), (5, -3), (-4, 4), (3, 6), (-6, -5), (7, 2)]
+    for index, (dy, dx) in enumerate(dithers):
+        light = field[8 - dy : 136 - dy, 8 - dx : 168 - dx].copy()
+        light += rng.normal(0.0, 1.5, light.shape).astype(np.float32)
+        for y, x in hot:
+            light[y, x] += 5000.0
+        path = tmp_path / f"light-{index}.fits"
+        fits.writeto(path, light.astype(np.float32))
+        paths.append(path)
+    return paths
+
+
+def test_defects_are_learned_from_dithered_lights_and_repaired(tmp_path):
+    hot = [(40, 50), (90, 120)]
+    lights = dithered_lights(tmp_path, hot)
+    defects = seiza.detect_defects(lights)
+    assert defects.pixels == sorted(y * 160 + x for y, x in hot)
+    assert (defects.width, defects.height, defects.frames, len(defects)) == (
+        160,
+        128,
+        6,
+        2,
+    )
+    # Steady hot pixels: their excess is learned, as a dark would hold it.
+    assert all(abs(excess - 5000.0) < 50.0 for excess in defects.excess)
+    assert defects.exposure_seconds is None
+
+    options = seiza.StackOptions(normalization="none", rejection="none", defects=defects)
+    assert options.defects.pixels == defects.pixels
+    reference = seiza.LiveStacker(lights[0], options=options).snapshot()
+    for y, x in hot:
+        assert reference.image[y, x] < 120.0
+
+    # Without a dark, stack_fits learns the map itself.
+    seiza.stack_fits(lights, tmp_path / "auto.fits", options=no_adjustment_options())
+    seiza.stack_fits(
+        lights, tmp_path / "off.fits", options=no_adjustment_options(), defects="off"
+    )
+    with fits.open(tmp_path / "auto.fits") as auto, fits.open(tmp_path / "off.fits") as off:
+        for y, x in hot:
+            assert auto[0].data[y, x] < 120.0
+            assert off[0].data[y, x] > 500.0
+    with pytest.raises(ValueError, match="defects"):
+        seiza.stack_fits(lights, tmp_path / "unused.fits", defects="maybe")
+
+    built = seiza.DefectMap(160, 128, [5, 1, 5])
+    assert (built.pixels, built.frames) == ([1, 5], 0)
+    with pytest.raises(ValueError, match="inside the frame"):
+        seiza.DefectMap(4, 4, [16])
+    with pytest.raises(seiza.StackError, match="persistence"):
+        seiza.detect_defects(lights, persistence=2.0)

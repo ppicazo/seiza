@@ -3,15 +3,15 @@ use numpy::{PyArrayDyn, PyReadonlyArrayDyn};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use seiza_stacking::{
-    BatchStackOptions, CalibrationMasters, CancelSignal, DarkLevelScreening, DeltaSigmaOptions,
-    Demosaic, DrizzleOptions, DrizzleResult, FitsFrame, FlatStarMaskingOptions,
-    FlatStarMaskingStatistics, FrameDisposition, FrameWeighting, ImpulseFilterOptions, LinearImage,
-    LiveStacker, MasterBuildOptions, MasterDark, MasterFrameKind, MasterRejectionOptions,
-    NormalizationMode, PipelineOptions, PipelineReport, RegistrationModel, RejectionMode,
-    SnrSample, StackOptions, StackSnapshot, build_master_from_fits,
-    build_master_from_fits_with_scratch, checkpoint_depths, measure_depth, path_identity,
-    paths_refer_to_same_file, write_drizzle_fits_f32, write_fits_f32, write_master_fits_f32,
-    write_stack_export_fits_f32,
+    BatchStackOptions, CalibrationMasters, CancelSignal, DarkLevelScreening,
+    DefectDetectionOptions, DefectMap, DeltaSigmaOptions, Demosaic, DrizzleOptions, DrizzleResult,
+    FitsFrame, FlatStarMaskingOptions, FlatStarMaskingStatistics, FrameDisposition, FrameWeighting,
+    ImpulseFilterOptions, LinearImage, LiveStacker, MasterBuildOptions, MasterDark,
+    MasterFrameKind, MasterRejectionOptions, NormalizationMode, PipelineOptions, PipelineReport,
+    RegistrationModel, RejectionMode, SnrSample, StackOptions, StackSnapshot,
+    build_master_from_fits, build_master_from_fits_with_scratch, checkpoint_depths, measure_depth,
+    path_identity, paths_refer_to_same_file, write_drizzle_fits_f32, write_fits_f32,
+    write_master_fits_f32, write_stack_export_fits_f32,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -62,6 +62,81 @@ impl PyPipelineReport {
     }
 }
 
+/// A sensor's defective pixels, repaired in every light from their
+/// same-colour neighbours after calibration and before debayering when
+/// given to :class:`StackOptions`. Pixels are raw-frame indices
+/// ``y * width + x``, ascending; a frame of another size is left as it is.
+#[pyclass(skip_from_py_object, frozen, name = "DefectMap", module = "seiza")]
+#[derive(Clone)]
+pub(crate) struct PyDefectMap {
+    inner: DefectMap,
+}
+
+#[pymethods]
+impl PyDefectMap {
+    /// A map of the given pixels, in any order, for a sensor whose defects
+    /// are known another way.
+    #[new]
+    fn new(width: usize, height: usize, pixels: Vec<u32>) -> PyResult<Self> {
+        DefectMap::new(width, height, pixels)
+            .map(|inner| Self { inner })
+            .map_err(|error| PyValueError::new_err(error.to_string()))
+    }
+
+    /// Raw frame width the map describes.
+    #[getter]
+    fn width(&self) -> usize {
+        self.inner.width()
+    }
+
+    /// Raw frame height the map describes.
+    #[getter]
+    fn height(&self) -> usize {
+        self.inner.height()
+    }
+
+    /// Lights the map was learned from; zero for a map given directly.
+    #[getter]
+    fn frames(&self) -> u32 {
+        self.inner.frames()
+    }
+
+    /// Defective pixels, as ascending raw-frame indices ``y * width + x``.
+    #[getter]
+    fn pixels(&self) -> Vec<u32> {
+        self.inner.pixels().to_vec()
+    }
+
+    /// Each pixel's steady excess over its neighbours, subtracted from every
+    /// light (scaled to its exposure) as a dark would subtract it, or zero
+    /// where the neighbours' median replaces the pixel; empty when every
+    /// pixel takes the median.
+    #[getter]
+    fn excess(&self) -> Vec<f32> {
+        self.inner.excess().to_vec()
+    }
+
+    /// The exposure, in seconds, the excess was learned at, or None.
+    #[getter]
+    fn exposure_seconds(&self) -> Option<f64> {
+        self.inner.exposure_seconds()
+    }
+
+    fn __len__(&self) -> usize {
+        self.inner.len()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "DefectMap(width={}, height={}, frames={}, pixels={})",
+            self.inner.width(),
+            self.inner.height(),
+            self.inner.frames(),
+            self.inner.len()
+        )
+    }
+}
+
 #[pyclass(skip_from_py_object, frozen, name = "StackOptions", module = "seiza")]
 #[derive(Clone, Default)]
 pub(crate) struct PyStackOptions {
@@ -100,7 +175,8 @@ impl PyStackOptions {
         demosaic="vng",
         match_tolerances=None,
         registration_model="similarity",
-        weighting="equal"
+        weighting="equal",
+        defects=None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -132,6 +208,7 @@ impl PyStackOptions {
         match_tolerances: Option<crate::calibration::PyMatchTolerances>,
         registration_model: &str,
         weighting: &str,
+        defects: Option<PyRef<'_, PyDefectMap>>,
     ) -> PyResult<Self> {
         let weighting = match weighting {
             "equal" => FrameWeighting::Equal,
@@ -199,6 +276,7 @@ impl PyStackOptions {
             normalization,
             rejection,
             weighting,
+            defects: defects.map(|defects| defects.inner.clone()),
             ..StackOptions::default()
         };
         inner.registration.detection_sigma = detection_sigma;
@@ -295,6 +373,16 @@ impl PyStackOptions {
     #[getter]
     fn maximum_drift_fraction(&self) -> f64 {
         self.inner.registration.maximum_drift_fraction
+    }
+
+    /// The sensor defects repaired in every light before debayering, as
+    /// :func:`detect_defects` learns them, or None.
+    #[getter]
+    fn defects(&self) -> Option<PyDefectMap> {
+        self.inner
+            .defects
+            .clone()
+            .map(|inner| PyDefectMap { inner })
     }
 
     /// How close a light's readings must be to its masters' for them to
@@ -1950,7 +2038,8 @@ impl PyMasterResult {
     flat=None,
     dark_exposure_seconds=None,
     reference_image=None,
-    reference="first"
+    reference="first",
+    defects="auto"
 ))]
 #[allow(clippy::too_many_arguments)]
 fn stack_fits(
@@ -1964,6 +2053,7 @@ fn stack_fits(
     dark_exposure_seconds: Option<f64>,
     reference_image: Option<PathBuf>,
     reference: &str,
+    defects: &str,
 ) -> PyResult<PyStackResult> {
     if images.len() < 2 {
         return Err(PyValueError::new_err(
@@ -1976,6 +2066,16 @@ fn stack_fits(
         other => {
             return Err(PyValueError::new_err(format!(
                 "reference must be \"first\" or \"auto\", not {other:?}"
+            )));
+        }
+    };
+    let learn_defects = match defects {
+        "auto" => dark.is_none(),
+        "on" => true,
+        "off" => false,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "defects must be \"auto\", \"on\" or \"off\", not {other:?}"
             )));
         }
     };
@@ -2002,7 +2102,7 @@ fn stack_fits(
             .collect::<Vec<_>>();
         validate_distinct_paths(&paths)?;
     }
-    let options = options
+    let mut options = options
         .as_ref()
         .map_or_else(StackOptions::default, |options| options.inner.clone());
     py.detach(move || {
@@ -2016,6 +2116,20 @@ fn stack_fits(
             let (_, scores) = seiza_stacking::choose_reference(&images, 8)?;
             candidates = seiza_stacking::rank_references(&scores);
             candidates.truncate(CHANNEL_REFERENCE_ATTEMPTS);
+        }
+        // Without a master dark the lights keep their hot pixels: learn
+        // them from the lights, best reference first, as the CLI does,
+        // unless the options already carry a map.
+        if learn_defects && options.defects.is_none() {
+            let mut ordered = images.clone();
+            let best = ordered.remove(candidates[0]);
+            ordered.insert(0, best);
+            let map = seiza_stacking::detect_defects(
+                &ordered,
+                &calibration,
+                &DefectDetectionOptions::default(),
+            )?;
+            options.defects = (!map.is_empty()).then_some(map);
         }
         // The reference light goes first. Without a reference image it is
         // the stack's reference; with one, it sets only normalization and
@@ -2072,6 +2186,55 @@ fn stack_fits(
             frames,
         })
     })
+    .map_err(stack_error)
+}
+
+/// Learn a sensor's hot and dead pixels from its lights, as the CLI's
+/// ``--defects`` does, for lights with no master dark to subtract them.
+/// Up to ``maximum_frames`` of the images, evenly spaced, are read and
+/// calibrated with the optional masters. A pixel is a defect when it stands
+/// ``sigma`` from its same-colour neighbours, the same way, in
+/// ``persistence`` of those lights, and its neighbours do not rise as a
+/// star's do; the lights must have moved on the sensor, by dithering or
+/// drift, for a star to be told from a defect. A light that cannot be read
+/// or calibrated, or of another size than the first, is passed over, and
+/// fewer than three examined lights give an empty map. Give the map to
+/// :class:`StackOptions` to have it repaired in every light.
+#[pyfunction]
+#[pyo3(signature = (
+    images,
+    *,
+    bias=None,
+    dark=None,
+    flat=None,
+    dark_exposure_seconds=None,
+    sigma=5.0,
+    persistence=0.6,
+    maximum_frames=16
+))]
+#[allow(clippy::too_many_arguments)]
+fn detect_defects(
+    py: Python<'_>,
+    images: Vec<PathBuf>,
+    bias: Option<PathBuf>,
+    dark: Option<PathBuf>,
+    flat: Option<PathBuf>,
+    dark_exposure_seconds: Option<f64>,
+    sigma: f32,
+    persistence: f32,
+    maximum_frames: usize,
+) -> PyResult<PyDefectMap> {
+    validate_exposure_override(dark.as_ref(), dark_exposure_seconds, "dark")?;
+    let options = DefectDetectionOptions {
+        sigma,
+        persistence,
+        maximum_frames,
+    };
+    py.detach(move || {
+        let calibration = load_calibration(bias, dark, flat, dark_exposure_seconds)?;
+        seiza_stacking::detect_defects(&images, &calibration, &options)
+    })
+    .map(|inner| PyDefectMap { inner })
     .map_err(stack_error)
 }
 
@@ -2661,6 +2824,8 @@ fn frame_noise(py: Python<'_>, image: PyReadonlyArrayDyn<'_, f32>) -> PyResult<O
 
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyStackOptions>()?;
+    module.add_class::<PyDefectMap>()?;
+    module.add_function(wrap_pyfunction!(detect_defects, module)?)?;
     module.add_class::<PyFrameDisposition>()?;
     module.add_class::<PyPipelineReport>()?;
     module.add_class::<PyStackResult>()?;

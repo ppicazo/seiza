@@ -490,6 +490,16 @@ class CalibrationPlan:
     selected_paths: list[Path]
     excluded: list[tuple[Path, str]]
 
+class DefectMap:
+    width: int
+    height: int
+    frames: int
+    pixels: list[int]
+    excess: list[float]
+    exposure_seconds: float | None
+    def __init__(self, width: int, height: int, pixels: Sequence[int]) -> None: ...
+    def __len__(self) -> int: ...
+
 class StackOptions:
     normalization: str
     local_tile_size: int | None
@@ -499,6 +509,7 @@ class StackOptions:
     rejection: str
     maximum_drift_pixels: float
     maximum_drift_fraction: float
+    defects: DefectMap | None
     match_tolerances: MatchTolerances
     def __init__(
         self,
@@ -531,6 +542,7 @@ class StackOptions:
         match_tolerances: MatchTolerances | None = None,
         registration_model: str = "similarity",
         weighting: str = "equal",
+        defects: DefectMap | None = None,
     ) -> None: ...
 
 class FrameDisposition:
@@ -1280,7 +1292,19 @@ def stack_fits(
     dark_exposure_seconds: float | None = None,
     reference_image: str | Path | None = None,
     reference: str = "first",
+    defects: str = "auto",
 ) -> StackResult: ...
+def detect_defects(
+    images: Sequence[str | Path],
+    *,
+    bias: str | Path | None = None,
+    dark: str | Path | None = None,
+    flat: str | Path | None = None,
+    dark_exposure_seconds: float | None = None,
+    sigma: float = 5.0,
+    persistence: float = 0.6,
+    maximum_frames: int = 16,
+) -> DefectMap: ...
 def choose_reference(
     images: Sequence[str | Path],
     *,
