@@ -533,6 +533,32 @@ impl PolynomialWarp {
         }
     }
 
+    /// This warp to a source grid `scale` times as fine, the reference grid
+    /// as it is: the source side alone of [`Self::rescaled`], `C ∘ W`, its
+    /// lens moving with the source.
+    pub(crate) fn source_rescaled(&self, scale: f64) -> Self {
+        let offset = (scale - 1.0) / 2.0;
+        let carry = |coefficients: &[f64]| {
+            coefficients
+                .iter()
+                .enumerate()
+                .map(|(term, &value)| {
+                    if term == 0 {
+                        scale * value + offset
+                    } else {
+                        scale * value
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        Self {
+            x: carry(&self.x),
+            y: carry(&self.y),
+            distortion: self.distortion.map(|distortion| distortion.rescaled(scale)),
+            ..self.clone()
+        }
+    }
+
     /// This polynomial read as reaching undistorted source positions, which
     /// `distortion` carries onto the source's pixels.
     pub(crate) fn with_distortion(self, distortion: crate::lens::LensDistortion) -> Self {
@@ -1659,6 +1685,108 @@ impl From<Interpolation> for Sampling {
             Interpolation::Lanczos3 => Self::Lanczos3,
         }
     }
+}
+
+/// Where each channel of a frame samples the sky, relative to its pixel's
+/// centre, in its own pixels: red, green and blue.
+///
+/// A [`crate::Demosaic::Superpixel`] pixel takes its red and blue from one
+/// photosite each, half a sensor pixel from the 2x2 cell's centre
+/// diagonally, and its green from the two greens either side of it, whose
+/// mean lies at the centre. Binning on by the rest of the bin factor keeps
+/// those offsets in sensor pixels, so in the frame's own they are
+/// `±0.5 / bin_factor`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ChannelSites([(f64, f64); 3]);
+
+impl ChannelSites {
+    /// The sites of a superpixel frame of `layout`, binned by `bin_factor`
+    /// in all.
+    pub(crate) fn superpixel(layout: crate::BayerLayout, bin_factor: u32) -> Self {
+        let mut sites = [(0.0, 0.0); 3];
+        for (x, y) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            let channel = layout.channel_at(x, y);
+            if channel != 1 {
+                sites[channel] = (
+                    (x as f64 - 0.5) / f64::from(bin_factor),
+                    (y as f64 - 0.5) / f64::from(bin_factor),
+                );
+            }
+        }
+        Self(sites)
+    }
+}
+
+/// [`resample_region_geometry`] for a frame whose channels sample the sky
+/// at `sites`: each output pixel takes every channel from where that
+/// channel's samples put the pixel's centre, so its colours line up.
+/// Without sites it is [`resample_region_geometry`] itself.
+pub(crate) fn resample_region_sited(
+    source: &LinearImage,
+    reference_width: usize,
+    reference_height: usize,
+    region: ReferenceRegion,
+    geometry: FrameGeometry<'_>,
+    sampling: Sampling,
+    sites: Option<ChannelSites>,
+) -> Result<LinearImage> {
+    let Some(ChannelSites(sites)) = sites.filter(|_| source.channels == 3) else {
+        return resample_region_geometry(
+            source,
+            reference_width,
+            reference_height,
+            region,
+            geometry,
+            sampling,
+        );
+    };
+    if let Sampling::NearestPhotosite(_) = sampling {
+        return Err(Error::Registration(
+            "photosite sampling takes no channel sites".into(),
+        ));
+    }
+    // A channel sampled at its site `d` holds the sky at `x + d` at pixel
+    // `x`, so the sky at source position `p` is its sample at `p − d`.
+    let channels = sites
+        .iter()
+        .enumerate()
+        .map(|(channel, &(dx, dy))| {
+            let source = source.channel(channel)?;
+            let shifted = |(x, y): (f64, f64)| (x - dx, y - dy);
+            match geometry {
+                FrameGeometry::Similarity(transform) => {
+                    transform.validate()?;
+                    let inverse = transform.inverse_map();
+                    resample_region_with_inverse(
+                        &source,
+                        reference_width,
+                        reference_height,
+                        region,
+                        |x, y| shifted(inverse(x, y)),
+                        sampling,
+                    )
+                }
+                FrameGeometry::Warp(warp) => {
+                    warp.validate()?;
+                    resample_region_with_inverse(
+                        &source,
+                        reference_width,
+                        reference_height,
+                        region,
+                        |x, y| shifted(warp.apply(x, y)),
+                        sampling,
+                    )
+                }
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut data = vec![0.0_f32; region.width * region.height * 3];
+    data.par_chunks_mut(3).enumerate().for_each(|(pixel, rgb)| {
+        for (value, channel) in rgb.iter_mut().zip(&channels) {
+            *value = channel.data[pixel];
+        }
+    });
+    LinearImage::new(region.width, region.height, 3, data)
 }
 
 /// How a resampled sample is formed from the source.
@@ -3124,6 +3252,99 @@ mod tests {
         )
         .unwrap();
         assert!(sparse.fit_warp(2, quadratic.transform, &[]).is_none());
+    }
+
+    /// A superpixel frame's red and blue sit half a sensor pixel off the
+    /// cell's centre, and resampling from those sites gives every channel
+    /// the same sky: on a plane, which bilinear interpolation follows
+    /// exactly, the three channels agree everywhere both reach, through a
+    /// shift and a half turn alike.
+    #[test]
+    fn resampling_from_channel_sites_lines_colours_up() {
+        let rggb = crate::BayerLayout {
+            pattern: seiza_fits::BayerPattern::Rggb,
+            x_offset: 0,
+            y_offset: 0,
+        };
+        let sites = ChannelSites::superpixel(rggb, 2);
+        assert_eq!(sites.0, [(-0.25, -0.25), (0.0, 0.0), (0.25, 0.25)]);
+        let gbrg = crate::BayerLayout {
+            pattern: seiza_fits::BayerPattern::Gbrg,
+            x_offset: 0,
+            y_offset: 0,
+        };
+        assert_eq!(
+            ChannelSites::superpixel(gbrg, 4).0,
+            [(-0.125, 0.125), (0.0, 0.0), (0.125, -0.125)]
+        );
+        // A plane on the sensor, superpixelled: each colour holds the plane
+        // where its photosite lies.
+        let plane = |x: f64, y: f64| (100.0 + 3.0 * x - 2.0 * y) as f32;
+        let (width, height) = (64, 48);
+        let mosaic = (0..width * height)
+            .map(|index| plane((index % width) as f64, (index / width) as f64))
+            .collect();
+        let frame = LinearImage::new(width, height, 1, mosaic)
+            .unwrap()
+            .debayer_with(rggb, crate::Demosaic::Superpixel)
+            .unwrap();
+        let (w, h) = (frame.width, frame.height);
+        let region = ReferenceRegion {
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+        };
+        for transform in [
+            SimilarityTransform::IDENTITY,
+            SimilarityTransform {
+                translation_x: 1.3,
+                translation_y: -0.6,
+                ..SimilarityTransform::IDENTITY
+            },
+            SimilarityTransform {
+                scale: 1.0,
+                rotation_radians: std::f64::consts::PI,
+                translation_x: (w - 1) as f64,
+                translation_y: (h - 1) as f64,
+            },
+        ] {
+            let sited = resample_region_sited(
+                &frame,
+                w,
+                h,
+                region,
+                FrameGeometry::Similarity(transform),
+                Sampling::Bilinear,
+                Some(sites),
+            )
+            .unwrap();
+            let unsited = resample_region_sited(
+                &frame,
+                w,
+                h,
+                region,
+                FrameGeometry::Similarity(transform),
+                Sampling::Bilinear,
+                None,
+            )
+            .unwrap();
+            let mut compared = 0;
+            for (pixel, unsited) in sited.data.chunks_exact(3).zip(unsited.data.chunks_exact(3)) {
+                if pixel.iter().all(|value| value.is_finite()) {
+                    assert!((pixel[0] - pixel[1]).abs() < 1e-3, "{pixel:?}");
+                    assert!((pixel[2] - pixel[1]).abs() < 1e-3, "{pixel:?}");
+                    // Green sits at the centre, where it was already.
+                    assert_eq!(pixel[1], unsited[1]);
+                    compared += 1;
+                }
+            }
+            assert!(compared > w * h / 2, "{transform:?}");
+            // Read from the pixel centres, red and blue differ by a sensor
+            // pixel of the plane's slope in each axis.
+            let first = &unsited.data[(h / 2 * w + w / 2) * 3..][..3];
+            assert!((first[2] - first[0]).abs() > 0.5, "{first:?}");
+        }
     }
 
     #[test]

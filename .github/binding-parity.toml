@@ -437,6 +437,7 @@ objects = [
 "seiza-stacking::LiveStacker::set_calibration" = { none = "the C ABI replaces masters from FITS paths (set_calibration_from_fits_paths)" }
 "seiza-stacking::write_linear_image_fits_f32" = { none = "the C ABI writes stacks through write_fits_f32 and drizzles through write_drizzle_fits_f32" }
 "seiza-stacking::write_processed_image_fits_f32" = { none = "the C ABI writes stacks through write_fits_f32 and drizzles through write_drizzle_fits_f32" }
+"seiza-stacking::measure_depth" = { none = "both bindings read a live stack's depth through LiveStacker::measure_depth, which calls it and adds the stack's bin factor" }
 "seiza-stacking::drizzle_reference_headers" = { none = "the C drizzle result carries its reference headers already" }
 "seiza-stacking::rescaled_reference_headers" = { none = "binned stacks and full-resolution reintegrations carry their reference headers already rescaled" }
 "seiza-stacking::covered_region" = { none = "crop_report gives the region and more; the C ABI calls crop_report" }

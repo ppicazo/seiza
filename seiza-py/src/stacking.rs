@@ -9,9 +9,9 @@ use seiza_stacking::{
     ImpulseFilterOptions, LinearImage, LiveStacker, MasterBuildOptions, MasterDark,
     MasterFrameKind, MasterRejectionOptions, NormalizationMode, PipelineOptions, PipelineReport,
     RegistrationModel, RejectionMode, SnrSample, StackOptions, StackSnapshot,
-    build_master_from_fits, build_master_from_fits_with_scratch, checkpoint_depths, measure_depth,
-    path_identity, paths_refer_to_same_file, write_drizzle_fits_f32, write_fits_f32,
-    write_master_fits_f32, write_stack_export_fits_f32,
+    build_master_from_fits, build_master_from_fits_with_scratch, checkpoint_depths, path_identity,
+    paths_refer_to_same_file, write_drizzle_fits_f32, write_fits_f32, write_master_fits_f32,
+    write_stack_export_fits_f32,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -238,9 +238,10 @@ impl PyStackOptions {
             "vng" => Demosaic::Vng,
             "mhc" => Demosaic::Mhc,
             "bilinear" => Demosaic::Bilinear,
+            "superpixel" => Demosaic::Superpixel,
             value => {
                 return Err(PyValueError::new_err(format!(
-                    "demosaic must be 'vng', 'mhc', or 'bilinear', not {value:?}"
+                    "demosaic must be 'vng', 'mhc', 'bilinear', or 'superpixel', not {value:?}"
                 )));
             }
         };
@@ -318,13 +319,16 @@ impl PyStackOptions {
         }
     }
 
-    /// How Bayer frames are demosaiced: "vng", "mhc", or "bilinear".
+    /// How Bayer frames are demosaiced: "vng", "mhc", "bilinear", or
+    /// "superpixel", which bins each 2x2 cell into one pixel and needs an
+    /// even ``bin_factor``.
     #[getter]
     fn demosaic(&self) -> &'static str {
         match self.inner.demosaic {
             Demosaic::Vng => "vng",
             Demosaic::Mhc => "mhc",
             Demosaic::Bilinear => "bilinear",
+            Demosaic::Superpixel => "superpixel",
         }
     }
 
@@ -1604,7 +1608,7 @@ impl PyLiveStacker {
     fn measure_depth(&self, py: Python<'_>) -> PyResult<Option<PySnrSample>> {
         let stacker = self.active()?;
         Ok(py
-            .detach(|| measure_depth(stacker.view()))
+            .detach(|| stacker.measure_depth())
             .map(|sample| PySnrSample { inner: sample }))
     }
 
@@ -1766,8 +1770,10 @@ impl PyLiveStacker {
     /// DrizzleIntegration does. A pixel the integration rejected is left
     /// out; Bayer frames drop each photosite into its own colour.
     /// ``drop_shrink`` is each drop's side in source pixels, by default 0.9
-    /// for monochrome and 1.0 for Bayer frames. Returns the reintegrated
-    /// stack and the drizzled one.
+    /// for monochrome and 1.0 for Bayer frames. A stack binned by ``b`` (see
+    /// :attr:`bin_factor`) drops its frames' sensor pixels, so ``scale=b``
+    /// gives the sensor's resolution. Returns the reintegrated stack and the
+    /// drizzled one.
     #[pyo3(signature = (
         *,
         scale=1,
@@ -1809,8 +1815,9 @@ impl PyLiveStacker {
     /// grid :attr:`bin_factor` times as fine. No transform is searched for
     /// again; each is carried exactly from the binned grid. With ``refine``,
     /// a single field detects every frame's stars at full resolution and
-    /// refits each transform from that seed; an expanded canvas keeps the
-    /// carried ones. Returns the stack, whose ``write_fits`` carries the WCS
+    /// refits each transform from that seed, and an expanded canvas refits
+    /// each frame against the canvas the other frames build at full
+    /// resolution. Returns the stack, whose ``write_fits`` carries the WCS
     /// to the finer grid; how many frames were refined; and the frames'
     /// median registration RMS in the sensor's pixels, None when no frame's
     /// is known.
@@ -2828,6 +2835,14 @@ impl PySnrSample {
     #[getter]
     fn channel_noise(&self) -> Vec<f64> {
         self.inner.channel_noise.clone()
+    }
+
+    /// The factor the stack's lights were binned by, which lowers each
+    /// pixel's noise about as much: compare noise and SNR only between
+    /// readings of one bin factor.
+    #[getter]
+    fn bin_factor(&self) -> u32 {
+        self.inner.bin_factor
     }
 
     /// This reading's signal against its own noise.

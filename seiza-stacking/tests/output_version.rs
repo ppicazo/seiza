@@ -73,6 +73,39 @@ const FULL_RESOLUTION: &[f64] = &[
     1.7025096e2, 1.0470015e2, 1.0667790e2, 1.1075444e2,
 ];
 #[rustfmt::skip]
+const SUPERPIXEL: &[f64] = &[
+    4.5056642e2, 5.1461645e2, 3.7941848e3, 3.4991561e2, 4.2811706e2, 3.7417290e3,
+    2.2169566e2, 2.4952920e2, 1.9389568e3, 4.0112073e2, 2.9977878e2, 2.0000548e2,
+    4.0481573e2, 3.0254874e2, 2.0079019e2, 4.0097467e2, 2.9991870e2, 2.0088794e2,
+    4.0043704e2, 3.0047525e2, 1.9980557e2, 3.9878918e2, 3.0012012e2, 2.0062187e2,
+    3.9961615e2, 2.9866693e2, 2.0009059e2, 4.0098495e2, 3.0070251e2, 1.9977524e2,
+    3.9968878e2, 3.0110107e2, 2.0002367e2, 2.2513330e3, 2.0821128e3, 9.0497809e2,
+    3.9951294e2, 2.9996356e2, 1.9996620e2, 7.0606750e2, 6.3206653e2, 3.0315860e2,
+    4.0049579e2, 3.0004858e2, 1.9898215e2, 4.0048694e2, 2.9974792e2, 1.9960785e2,
+    4.0029657e2, 2.9866653e2, 1.9957559e2, 4.0279974e2, 3.0297729e2, 2.0015086e2,
+    4.0091287e2, 2.9898071e2, 1.9929868e2, 5.5209436e2, 4.5315872e2, 2.6305588e2,
+    3.9998114e2, 2.9879013e2, 2.0003249e2, 3.9933450e2, 3.0003784e2, 1.9961035e2,
+    9.3254974e2, 8.2864453e2, 4.1087515e2, 3.9988791e2, 3.0035577e2, 1.9985046e2,
+    4.1872589e2, 3.2848203e2, 2.0588953e2, 4.0029883e2, 2.9965512e2, 2.0006384e2,
+    3.9799783e2, 2.9996805e2, 1.9934007e2, 3.9979184e2, 2.9921347e2, 2.0013539e2,
+];
+#[rustfmt::skip]
+const BINNED_DRIZZLED: &[f64] = &[
+    1.4310613e2, 2.6877686e2, 3.6995620e3, 9.7408691e1, 9.9783958e1, 1.0105090e2,
+    1.1783337e2, 1.0524158e2, 9.8157951e1, 1.0044919e2, 1.0214176e2, 1.0327659e2,
+    1.0460580e2, 9.8405037e1, 1.0147527e2, 1.0319716e2, 1.0421772e2, 1.0610207e2,
+    1.0018525e2, 1.0092257e2, 1.0354213e2, 1.0615263e2, 1.0729715e2, 1.0100514e2,
+    1.7140848e2, 1.0446319e2, 1.0666625e2, 1.1061572e2,
+];
+#[rustfmt::skip]
+const MOSAIC_FULL_RESOLUTION: &[f64] = &[
+    2.2342357e2, 4.1493165e2, 5.0366611e3, 1.0009515e2, 1.0359967e2, 1.0392278e2,
+    1.4567566e2, 1.9966444e2, 1.0127506e2, 2.2257149e2, 9.9761011e2, 1.3664514e2,
+    1.5093257e2, 1.0202713e2, 1.0343097e2, 1.6650745e2, 1.7741840e2, 1.0598458e2,
+    1.0179967e2, 1.0169817e2, 1.0327754e2, 1.0577757e2, 1.0626158e2, 2.4992326e2,
+    1.8955243e2, 1.0545649e2, 7.9738617e2, 1.0734964e2,
+];
+#[rustfmt::skip]
 const DARK_MASTER: &[f64] = &[
     5.0018033e2, 5.0018273e2, 5.0560712e2, 4.9912210e2, 5.0097733e2, 5.0010815e2,
     5.0059848e2, 5.0013586e2, 5.0037161e2, 5.0233649e2, 5.0203445e2, 4.9982404e2,
@@ -562,6 +595,90 @@ fn a_binned_stack_and_its_full_resolution_reintegration_keep_their_output() {
         "FULL_RESOLUTION",
         &summary(&full.result.snapshot.image),
         FULL_RESOLUTION,
+    );
+}
+
+/// Raw RGGB lights made into one pixel per 2x2 cell, their colours resampled
+/// from their photosites' places, and binned no further.
+#[test]
+fn a_superpixel_stack_keeps_its_output() {
+    let options = StackOptions {
+        demosaic: Demosaic::Superpixel,
+        bin_factor: 2,
+        ..StackOptions::default()
+    };
+    check(
+        "SUPERPIXEL",
+        &summary(&bayer_stack(options).image),
+        SUPERPIXEL,
+    );
+}
+
+/// Lights binned by 2, drizzled from their sensor pixels back onto the
+/// sensor's grid.
+#[test]
+fn a_binned_stack_s_drizzle_keeps_its_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = SHIFTS
+        .iter()
+        .enumerate()
+        .map(|(frame, &(dx, dy))| {
+            let image = mono_field(dx, dy, 0.96 + 0.01 * frame as f32, frame);
+            write_raw(&directory, "light", frame, image.data, "LIGHT")
+        })
+        .collect::<Vec<_>>();
+    let options = StackOptions {
+        bin_factor: 2,
+        ..StackOptions::default()
+    };
+    let mut stacker = LiveStacker::open_fits(&paths[0], None, None, None, None, options).unwrap();
+    for path in &paths[1..] {
+        admit(stacker.push_fits(path).unwrap());
+    }
+    let drizzle = DrizzleOptions {
+        scale: 2,
+        ..DrizzleOptions::default()
+    };
+    let (_, drizzled) = stacker
+        .reintegrate_drizzled(&BatchStackOptions::default(), &drizzle, |_, _, _| {})
+        .unwrap();
+    check(
+        "BINNED_DRIZZLED",
+        &summary(&drizzled.image),
+        BINNED_DRIZZLED,
+    );
+}
+
+/// A mosaic of lights binned by 2, reintegrated at the sensor's full
+/// resolution, each frame refit against the canvas the others build there.
+#[test]
+fn a_binned_mosaic_s_full_resolution_reintegration_keeps_its_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = mosaic_panels(&directory);
+    let mut options = StackOptions {
+        bin_factor: 2,
+        ..StackOptions::default()
+    };
+    options.acceptance.minimum_overlap_fraction = 0.1;
+    let mut stacker = LiveStacker::with_expanding_reference(
+        &paths,
+        CalibrationMasters::default(),
+        options,
+        usize::MAX,
+        |_, _, _, _| Continue::Yes,
+    )
+    .unwrap();
+    for path in &paths {
+        admit(stacker.push_fits(path).unwrap());
+    }
+    let full = stacker
+        .reintegrate_full_resolution(&BatchStackOptions::default(), true, |_, _, _| {})
+        .unwrap();
+    assert!(full.refined_frames > 0);
+    check(
+        "MOSAIC_FULL_RESOLUTION",
+        &summary(&full.result.snapshot.image),
+        MOSAIC_FULL_RESOLUTION,
     );
 }
 

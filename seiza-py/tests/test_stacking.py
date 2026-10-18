@@ -55,6 +55,11 @@ def test_stack_options_choose_the_demosaic():
     assert seiza.StackOptions().demosaic == "vng"
     for method in ["vng", "mhc", "bilinear"]:
         assert seiza.StackOptions(demosaic=method).demosaic == method
+    options = seiza.StackOptions(demosaic="superpixel", bin_factor=2)
+    assert options.demosaic == "superpixel"
+    # A superpixel bins each 2x2 cell, so it needs an even bin factor.
+    with pytest.raises(ValueError, match="superpixel"):
+        seiza.StackOptions(demosaic="superpixel")
 
 
 def test_live_stacker_accepts_numpy_and_returns_owned_snapshot():
@@ -952,8 +957,14 @@ def test_binned_stack_reintegrates_at_full_resolution(tmp_path):
     unrefined, refined, _ = stacker.reintegrate_full_resolution(refine=False)
     assert refined == 0
     assert unrefined.image.shape == image.shape
-    with pytest.raises(Exception, match="full resolution"):
-        stacker.reintegrate_drizzled(scale=2)
+    # A drizzle by the bin factor drops each frame's sensor pixels back onto
+    # the sensor's grid.
+    _, drizzled = stacker.reintegrate_drizzled(scale=2)
+    assert drizzled.image.shape == image.shape
+    # A depth reading says what the stack was binned by.
+    depth = stacker.measure_depth()
+    if depth is not None:
+        assert depth.bin_factor == 2
 
 
 def test_live_stacker_state_describes_the_stack(tmp_path):

@@ -308,21 +308,25 @@ impl FitsFrame {
                 "a raw CFA frame is binned only once it is debayered".into(),
             ));
         }
-        let image = self.image.binned(factor)?;
-        let mut headers = rebinned_headers(&self.headers, 1, factor);
-        for (key, value) in &mut headers {
+        let mut frame = Self {
+            image: self.image.binned(factor)?,
+            ..self
+        };
+        frame.rebin_headers(factor);
+        Ok(frame)
+    }
+
+    /// Carry the headers to this frame's image, just binned by `factor`.
+    fn rebin_headers(&mut self, factor: u32) {
+        self.headers = rebinned_headers(&self.headers, 1, factor);
+        for (key, value) in &mut self.headers {
             let size = match key.as_str() {
-                "NAXIS1" => image.width,
-                "NAXIS2" => image.height,
+                "NAXIS1" => self.image.width,
+                "NAXIS2" => self.image.height,
                 _ => continue,
             };
             *value = HeaderValue::Integer(size as i64);
         }
-        Ok(Self {
-            image,
-            headers,
-            ..self
-        })
     }
 
     /// [`Self::into_prepared`], also returning the Bayer layout the frame was
@@ -335,6 +339,10 @@ impl FitsFrame {
         let layout = self.bayer.take();
         if let Some(layout) = layout {
             self.image = self.image.debayer_with(layout, demosaic)?;
+            // A superpixel is a bin of 2 as well as a demosaic.
+            if demosaic == crate::Demosaic::Superpixel {
+                self.rebin_headers(2);
+            }
         }
         Ok((self, layout))
     }

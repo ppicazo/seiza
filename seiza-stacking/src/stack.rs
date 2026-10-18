@@ -367,7 +367,39 @@ impl StackOptions {
                     .into(),
             ));
         }
+        if self.demosaic == crate::Demosaic::Superpixel && !self.bin_factor.is_multiple_of(2) {
+            return Err(Error::Stack(
+                "a superpixel demosaic bins by 2 as it debayers, so it needs a bin factor of \
+                 2 or 4"
+                    .into(),
+            ));
+        }
         Ok(())
+    }
+
+    /// Where each channel of a light prepared from `cfa` samples the sky:
+    /// off its pixels' centres after a superpixel demosaic, and on them
+    /// otherwise.
+    pub(crate) fn channel_sites(
+        &self,
+        cfa: Option<BayerLayout>,
+    ) -> Option<crate::registration::ChannelSites> {
+        self.channel_sites_at(cfa, self.bin_factor)
+    }
+
+    /// [`Self::channel_sites`] of a light binned by `bin_factor` in place of
+    /// the stack's own.
+    pub(crate) fn channel_sites_at(
+        &self,
+        cfa: Option<BayerLayout>,
+        bin_factor: u32,
+    ) -> Option<crate::registration::ChannelSites> {
+        if self.demosaic != crate::Demosaic::Superpixel || !bin_factor.is_multiple_of(2) {
+            return None;
+        }
+        Some(crate::registration::ChannelSites::superpixel(
+            cfa?, bin_factor,
+        ))
     }
 
     /// How pixel-valued options and constants read on the working grid.
@@ -563,7 +595,8 @@ pub struct FullResolutionStack {
     /// `SEIZABIN`.
     pub reference_headers: Vec<(String, HeaderValue)>,
     /// Admitted frames whose transform was refined against stars detected
-    /// at full resolution: none on an expanded canvas, or without `refine`.
+    /// at full resolution, or against the canvas the other frames build
+    /// there: none without `refine`.
     pub refined_frames: usize,
     /// The median registration RMS of the admitted frames, in the sensor's
     /// pixels: a refined frame's own refit, and for every other frame the
@@ -769,10 +802,15 @@ impl LiveStacker {
         mut rejected: impl FnMut(usize, &FrameRejectionReason),
     ) -> std::result::Result<(Self, usize), E> {
         options.validate()?;
-        let (alignment, _) = reference.into_prepared_with_layout(options.demosaic)?;
-        // The external image is binned as the lights are, so that registration
-        // finds them at the scale it expects.
-        let alignment = alignment.binned(options.bin_factor)?;
+        // The external image is debayered and binned as the lights are, so
+        // that registration finds them at the scale it expects, and its
+        // colours line up as theirs will.
+        let (mut alignment, cfa) = develop(reference, &options, options.bin_factor)?;
+        alignment.image = co_site(
+            alignment.image,
+            options.channel_sites(cfa),
+            options.interpolation,
+        )?;
         let registrar =
             Registrar::at_scale(&alignment.image, &options.registration, options.scale())?;
         // Use the regular registration gates, with no photometric comparison
@@ -789,7 +827,7 @@ impl LiveStacker {
             let channel_reference = channel_reference?;
             tried += 1;
             let metadata = channel_reference.metadata();
-            let (channel, _) = prepare_light(
+            let (channel, channel_cfa) = prepare_light(
                 channel_reference,
                 &calibration,
                 &options.match_tolerances,
@@ -811,7 +849,7 @@ impl LiveStacker {
                 &geometry_options,
                 &[],
                 channel.image,
-                None,
+                channel_cfa,
                 None,
             )? {
                 PreparedFrame::Ready(ready) => {
@@ -985,6 +1023,15 @@ impl LiveStacker {
         )
     }
 
+    /// How deep this stack is: [`crate::measure_depth`] of its
+    /// [`Self::view`], with the bin factor its lights took.
+    pub fn measure_depth(&self) -> Option<crate::SnrSample> {
+        crate::measure_depth(self.view()).map(|sample| crate::SnrSample {
+            bin_factor: self.options.bin_factor,
+            ..sample
+        })
+    }
+
     /// The factor each light is binned by: [`StackOptions::bin_factor`].
     /// The reference, snapshots and every frame's mapping are on the binned
     /// grid; see [`Self::reintegrate_full_resolution`].
@@ -1008,16 +1055,23 @@ impl LiveStacker {
     /// around it. Binning costs registration little at 2 and up to a few
     /// tenths of a pixel at 4 on tight stars, which the refit recovers. A
     /// frame whose stars do not pair, or whose refit fails the registration
-    /// RMS gate, keeps its carried mapping. An expanded canvas has no
-    /// full-resolution reference to refine against, so its frames keep
-    /// their carried mappings, and [`FullResolutionStack`] reports the error
-    /// they are expected to carry, the binned pass's median RMS in the
-    /// sensor's pixels, so a host can warn.
+    /// RMS gate, keeps its carried mapping.
     ///
-    /// The refit reads each frame once, keeping its registered image in
-    /// [`crate::BatchStackOptions::scratch_directory`] for the integration
-    /// that follows; `progress` hears it as [`crate::BatchStackPass::Estimate`]
-    /// for each frame in turn, before the reintegration's own progress. The
+    /// An expanded canvas has no full-resolution reference, so it builds
+    /// one: every frame is carried onto the finer canvas through its
+    /// carried mapping and summed, and each frame's similarity is then
+    /// refit against the stars of the canvas the other frames make over its
+    /// footprint. A frame warped onto its panel, by the registration model
+    /// or a lens, keeps its carried warp, as does one whose refit would move
+    /// a corner further than the match tolerance, as a narrow overlap could
+    /// pull it. [`FullResolutionStack`] reports the median RMS, refined or
+    /// carried, in the sensor's pixels, so a host can warn.
+    ///
+    /// The refit reads each frame once, twice on a canvas, keeping its
+    /// registered image in [`crate::BatchStackOptions::scratch_directory`]
+    /// for the integration that follows; `progress` hears each read as
+    /// [`crate::BatchStackPass::Estimate`] for each frame in turn, before the
+    /// reintegration's own progress. The
     /// live stack is left as it was. Its frames are refused as
     /// [`Self::reintegrate`] refuses them, and memory is reintegration's on
     /// the finer grid.
@@ -1030,9 +1084,8 @@ impl LiveStacker {
         if let Some(reason) = self.reintegration_unavailable() {
             return Err(Error::Stack(reason));
         }
-        let bin = self.options.bin_factor;
         let live = self.ledger.registration_rms();
-        if bin == 1 {
+        if self.options.bin_factor == 1 {
             return Ok(FullResolutionStack {
                 result: self.reintegrate(options, progress)?,
                 reference_headers: self.reference_headers.clone(),
@@ -1040,6 +1093,27 @@ impl LiveStacker {
                 registration_rms_pixels: median_registration_rms(&live, &[]),
             });
         }
+        let (full, refined) = self.full_resolution(options, refine, &mut progress)?;
+        let result = full.reintegrate(options, &mut progress)?;
+        Ok(FullResolutionStack {
+            result,
+            reference_headers: full.reference_headers,
+            refined_frames: refined.iter().flatten().count(),
+            registration_rms_pixels: median_registration_rms(&live, &refined),
+        })
+    }
+
+    /// This binned stack at the sensor's full resolution, ready to
+    /// reintegrate: every frame's mapping carried there exactly, and
+    /// refined when `refine` asks, with each refined frame's RMS. See
+    /// [`Self::reintegrate_full_resolution`].
+    pub(crate) fn full_resolution(
+        &self,
+        options: &crate::BatchStackOptions,
+        refine: bool,
+        progress: &mut dyn FnMut(crate::BatchStackPass, usize, usize),
+    ) -> Result<(Self, Vec<Option<f64>>)> {
+        let bin = self.options.bin_factor;
         let factor = bin as usize;
         let (width, height, channels) = (
             self.reference.width * factor,
@@ -1078,6 +1152,11 @@ impl LiveStacker {
         let mut full = Self {
             options: StackOptions {
                 bin_factor: 1,
+                // A superpixel is a bin of 2; full resolution demosaics.
+                demosaic: match self.options.demosaic {
+                    crate::Demosaic::Superpixel => crate::Demosaic::Vng,
+                    demosaic => demosaic,
+                },
                 ..self.options.clone()
             },
             calibration: self.calibration.clone(),
@@ -1106,17 +1185,15 @@ impl LiveStacker {
         let refined = match &registrar {
             Some(registrar) => {
                 full.frame_cache = full.full_resolution_cache(options.scratch_directory.as_deref());
-                full.refine_full_resolution(registrar, options.cancel.as_ref(), &mut progress)?
+                full.refine_full_resolution(registrar, options.cancel.as_ref(), progress)?
+            }
+            None if refine && full.canvas_registrar.is_some() => {
+                full.frame_cache = full.full_resolution_cache(options.scratch_directory.as_deref());
+                full.refine_canvas_full_resolution(options.cancel.as_ref(), progress)?
             }
             None => Vec::new(),
         };
-        let result = full.reintegrate(options, &mut progress)?;
-        Ok(FullResolutionStack {
-            result,
-            reference_headers: full.reference_headers,
-            refined_frames: refined.iter().flatten().count(),
-            registration_rms_pixels: median_registration_rms(&live, &refined),
-        })
+        Ok((full, refined))
     }
 
     /// The reference frame at the sensor's full resolution, read again: the
@@ -1129,7 +1206,7 @@ impl LiveStacker {
         let Some(path) = &self.reference_image_path else {
             return Ok(None);
         };
-        let (frame, _) = FitsFrame::open(path)?.into_prepared_with_layout(self.options.demosaic)?;
+        let (frame, _) = develop(FitsFrame::open(path)?, &self.options, 1)?;
         Ok(Some(frame.image))
     }
 
@@ -1215,6 +1292,18 @@ impl LiveStacker {
                 registrar,
                 noise,
             } => (*registrar, noise, None, Some(image)),
+        };
+        // A reference whose colours sample the sky off its pixels' centres
+        // is resampled onto them once, as every later frame is when it is
+        // registered; its stars and noise were taken as the lights' are.
+        let reference = if reference_is_integrated {
+            co_site(
+                reference,
+                options.channel_sites(reference_cfa),
+                options.interpolation,
+            )?
+        } else {
+            reference
         };
         let mut accumulator =
             Accumulator::new(reference.sample_count(), !options.weighting.is_equal());
@@ -2130,11 +2219,58 @@ pub(crate) fn prepare_light_at(
     bin_factor: u32,
 ) -> std::result::Result<(FitsFrame, Option<BayerLayout>), LightFailure> {
     calibrate_light(&mut frame, calibration, tolerances, options)?;
-    let (frame, cfa) = frame
-        .into_prepared_with_layout(options.demosaic)
-        .map_err(LightFailure::Image)?;
-    let frame = frame.binned(bin_factor).map_err(LightFailure::Image)?;
-    Ok((frame, cfa))
+    develop(frame, options, bin_factor).map_err(LightFailure::Image)
+}
+
+/// Debayer a calibrated frame as `options` say, and bin it by `bin_factor`
+/// in all: a superpixel demosaic is the first 2x2 of an even bin, and at an
+/// odd one, such as the sensor's full resolution, VNG stands in for it.
+/// Returns the frame and the Bayer layout it was debayered from.
+pub(crate) fn develop(
+    frame: FitsFrame,
+    options: &StackOptions,
+    bin_factor: u32,
+) -> Result<(FitsFrame, Option<BayerLayout>)> {
+    let superpixel = options.demosaic == crate::Demosaic::Superpixel;
+    let demosaic = if superpixel && !bin_factor.is_multiple_of(2) {
+        crate::Demosaic::Vng
+    } else {
+        options.demosaic
+    };
+    let (frame, cfa) = frame.into_prepared_with_layout(demosaic)?;
+    let binned = if cfa.is_some() && demosaic == crate::Demosaic::Superpixel {
+        2
+    } else {
+        1
+    };
+    Ok((frame.binned(bin_factor / binned)?, cfa))
+}
+
+/// `image`, whose channels sample the sky at `sites`, resampled so every
+/// channel samples its pixels' centres, as registration carries every frame
+/// it resamples; `image` itself without sites.
+pub(crate) fn co_site(
+    image: LinearImage,
+    sites: Option<crate::registration::ChannelSites>,
+    interpolation: crate::Interpolation,
+) -> Result<LinearImage> {
+    if sites.is_none() {
+        return Ok(image);
+    }
+    crate::registration::resample_region_sited(
+        &image,
+        image.width,
+        image.height,
+        ReferenceRegion {
+            x: 0,
+            y: 0,
+            width: image.width,
+            height: image.height,
+        },
+        crate::registration::FrameGeometry::Similarity(SimilarityTransform::IDENTITY),
+        interpolation.into(),
+        sites,
+    )
 }
 
 /// The median of each admitted frame's registration RMS: its `refined` one
@@ -2431,13 +2567,14 @@ pub(crate) fn prepare_frame(
             height: reference.height,
         },
     };
-    let mut registered = crate::registration::resample_region_geometry(
+    let mut registered = crate::registration::resample_region_sited(
         &frame,
         reference.width,
         reference.height,
         region,
         geometry,
         options.interpolation.into(),
+        options.channel_sites(cfa),
     )?;
     let finite_samples = registered
         .data

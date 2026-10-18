@@ -266,6 +266,30 @@ impl RegisteredFrameMapping {
         Ok(mapping)
     }
 
+    /// This mapping read from its frames at the sensor's own sampling, onto
+    /// the same binned reference grid, for a drizzle that drops a binned
+    /// stack's sensor pixels: `T ∘ C⁻¹` for the map `C` that carries a
+    /// binned pixel centre to the sensor's, and the warp `C ∘ W`, its lens
+    /// on the sensor's pixels too. The mapping itself at a bin factor of 1.
+    pub(crate) fn sensor_sourced(&self) -> Self {
+        if self.bin_factor == 1 {
+            return self.clone();
+        }
+        let scale = f64::from(self.bin_factor);
+        let offset = (scale - 1.0) / 2.0;
+        let unbin = SimilarityTransform {
+            scale: 1.0 / scale,
+            rotation_radians: 0.0,
+            translation_x: -offset / scale,
+            translation_y: -offset / scale,
+        };
+        Self {
+            transform: unbin.then(self.transform),
+            warp: self.warp.as_ref().map(|warp| warp.source_rescaled(scale)),
+            ..self.clone()
+        }
+    }
+
     /// This mapping through another registration: `transform` and `warp` in
     /// place of its own, on the same grid with the same normalization.
     pub(crate) fn with_geometry(
@@ -369,14 +393,27 @@ impl RegisteredFrameMapping {
         region: ReferenceRegion,
         interpolation: crate::Interpolation,
     ) -> Result<LinearImage> {
+        self.extract_region_sited(source, region, interpolation, None)
+    }
+
+    /// [`Self::extract_region_with`] for a source whose channels sample the
+    /// sky at `sites`; see [`crate::registration::resample_region_sited`].
+    pub(crate) fn extract_region_sited(
+        &self,
+        source: &LinearImage,
+        region: ReferenceRegion,
+        interpolation: crate::Interpolation,
+        sites: Option<crate::registration::ChannelSites>,
+    ) -> Result<LinearImage> {
         self.validate()?;
-        let mut crop = crate::registration::resample_region_geometry(
+        let mut crop = crate::registration::resample_region_sited(
             source,
             self.reference_width,
             self.reference_height,
             region,
             self.geometry(),
             interpolation.into(),
+            sites,
         )?;
         self.normalization
             .apply_region(&mut crop, region.x, region.y)?;

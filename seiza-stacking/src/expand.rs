@@ -123,6 +123,14 @@ const MAXIMUM_GEOMETRY_ERROR_PIXELS: f64 = 0.02;
 /// fitted through.
 const GEOMETRY_GRID: (usize, usize) = (24, 16);
 
+/// Where a prepared frame's colours sample the sky; see
+/// [`crate::StackOptions::channel_sites`].
+type Sites = Option<crate::registration::ChannelSites>;
+
+/// A frame prepared again by its path, for a canvas with this many
+/// channels.
+type Prepare<'a> = dyn Fn(&Path, usize) -> Result<(LinearImage, Sites)> + 'a;
+
 /// Where planning put a frame, or why it could not.
 pub(crate) struct PlannedRegistration {
     pub result: std::result::Result<RegistrationResult, String>,
@@ -867,7 +875,7 @@ pub(crate) fn plan(
     let frame = FitsFrame::open(first)?;
     let metadata = frame.metadata();
     let anchor_optics = OpticalMetadata::from_frame(&frame);
-    let (frame, _) =
+    let (mut frame, anchor_cfa) =
         crate::stack::prepare_light(frame, calibration, &options.match_tolerances, options)
             .map_err(crate::stack::LightFailure::into_error)?;
     check_source(first)?;
@@ -882,6 +890,13 @@ pub(crate) fn plan(
     } else {
         crate::stack::measure_reference_noise(&frame.image)?
     };
+    // The canvas starts as the anchor's pixels, its colours resampled onto
+    // their centres as every frame placed on it is.
+    frame.image = crate::stack::co_site(
+        frame.image,
+        options.channel_sites(anchor_cfa),
+        options.interpolation,
+    )?;
     let anchor = ReferenceRegion {
         x: 0,
         y: 0,
@@ -933,28 +948,31 @@ pub(crate) fn plan(
     };
     // A frame as the stack prepares it, binned by `bin_factor`: the
     // stack's own, or 1 for the lens's stars.
-    let prepare_at =
-        |path: &Path, channels: usize, bin_factor: u32| -> Result<(LinearImage, OpticalMetadata)> {
-            check_source(path)?;
-            let frame = FitsFrame::open(path)?;
-            let optics = OpticalMetadata::from_frame(&frame);
-            let (frame, _) = crate::stack::prepare_light_at(
-                frame,
-                calibration,
-                &options.match_tolerances,
-                options,
-                bin_factor,
-            )
-            .map_err(crate::stack::LightFailure::into_error)?;
-            check_source(path)?;
-            if frame.image.channels != channels {
-                return Err(Error::Stack(format!(
-                    "{} has a different channel count",
-                    path.display()
-                )));
-            }
-            Ok((frame.image, optics))
-        };
+    let prepare_at = |path: &Path,
+                      channels: usize,
+                      bin_factor: u32|
+     -> Result<(LinearImage, OpticalMetadata, Sites)> {
+        check_source(path)?;
+        let frame = FitsFrame::open(path)?;
+        let optics = OpticalMetadata::from_frame(&frame);
+        let (frame, cfa) = crate::stack::prepare_light_at(
+            frame,
+            calibration,
+            &options.match_tolerances,
+            options,
+            bin_factor,
+        )
+        .map_err(crate::stack::LightFailure::into_error)?;
+        check_source(path)?;
+        if frame.image.channels != channels {
+            return Err(Error::Stack(format!(
+                "{} has a different channel count",
+                path.display()
+            )));
+        }
+        let sites = options.channel_sites_at(cfa, bin_factor);
+        Ok((frame.image, optics, sites))
+    };
     let prepare = |path: &Path, channels: usize| prepare_at(path, channels, options.bin_factor);
     let mut pending = paths[1..]
         .iter()
@@ -991,11 +1009,11 @@ pub(crate) fn plan(
             // again only once a panel added since then matches it.
             let mut image = None;
             if item.size.is_none() {
-                let (prepared, optics) = prepare(path, plan.image.channels)?;
+                let (prepared, optics, sites) = prepare(path, plan.image.channels)?;
                 item.optics = Some(optics);
                 item.stars = plan.windows[0].registrar.detect_source_stars(&prepared);
                 item.size = Some((prepared.width, prepared.height));
-                image = Some(prepared);
+                image = Some((prepared, sites));
             }
             let (width, height) = item.size.expect("the frame was measured");
             let panels = plan.windows.len();
@@ -1005,14 +1023,17 @@ pub(crate) fn plan(
                     Err(error)
                 }
                 Ok((registration, window, coverage)) => {
-                    let image = match image {
+                    let (image, sites) = match image {
                         Some(image) => image,
-                        None => prepare(path, plan.image.channels)?.0,
+                        None => {
+                            let (image, _, sites) = prepare(path, plan.image.channels)?;
+                            (image, sites)
+                        }
                     };
                     let joined = plan
                         .join(
                             path,
-                            &image,
+                            (&image, sites),
                             &item.stars,
                             (registration, window, coverage),
                             flipped_start,
@@ -1099,7 +1120,7 @@ pub(crate) fn plan(
     // where those frames overlap, it is undone and the canvas planned again.
     let estimate = if compatible {
         plan.estimate_lens(
-            &|path, channels| prepare_at(path, channels, 1).map(|(image, _)| image),
+            &|path, channels| prepare_at(path, channels, 1).map(|(image, _, _)| image),
             options,
         )?
     } else {
@@ -1109,7 +1130,7 @@ pub(crate) fn plan(
         match plan.rebuild(
             &fit,
             first,
-            &|path, channels| prepare(path, channels).map(|(image, _)| image),
+            &|path, channels| prepare(path, channels).map(|(image, _, sites)| (image, sites)),
             options,
             maximum_samples,
             &mut progress,
@@ -1193,7 +1214,7 @@ impl Plan {
     fn join(
         &mut self,
         path: &Path,
-        source: &LinearImage,
+        (source, sites): (&LinearImage, Sites),
         stars: &[DetectedStar],
         (registration, window, coverage): (RegistrationResult, usize, f64),
         flipped_start: bool,
@@ -1205,7 +1226,7 @@ impl Plan {
         let mut registration = registration;
         let mut refined = false;
         let placed = loop {
-            let placed = self.place(source, &registration, options, maximum_samples)?;
+            let placed = self.place((source, sites), &registration, options, maximum_samples)?;
             // A frame starting a panel sets the geometry its neighbors follow,
             // so it is refit; frames within known sky keep the panel's fit.
             let source_area = finite_source * placed.transform.scale.powi(2);
@@ -1466,11 +1487,12 @@ impl Plan {
         Ok(best)
     }
 
-    /// Where `source` lands under `registration`: the canvas that holds it,
-    /// its resampled footprint, and the canvas beneath.
+    /// Where `source`, its colours sampling the sky at `sites`, lands under
+    /// `registration`: the canvas that holds it, its resampled footprint,
+    /// and the canvas beneath.
     fn place(
         &self,
-        source: &LinearImage,
+        (source, sites): (&LinearImage, Sites),
         registration: &RegistrationResult,
         options: &StackOptions,
         maximum_samples: usize,
@@ -1482,13 +1504,14 @@ impl Plan {
         transform.translation_y += dy as f64;
         let region = footprint(source, transform, width, height)
             .ok_or_else(|| Error::Registration("panel footprint is empty".into()))?;
-        let incoming = crate::resample_region_to_reference_with(
+        let incoming = crate::registration::resample_region_sited(
             source,
             width,
             height,
             region,
-            transform,
-            options.interpolation,
+            crate::registration::FrameGeometry::Similarity(transform),
+            options.interpolation.into(),
+            sites,
         )?;
         let existing = crop(&self.image, region, dx, dy)?;
         let (mut common, mut uncovered) = (0, 0);
@@ -1673,7 +1696,7 @@ impl Plan {
         &self,
         fit: &LensFit,
         first: &Path,
-        prepare: &dyn Fn(&Path, usize) -> Result<LinearImage>,
+        prepare: &Prepare<'_>,
         options: &StackOptions,
         maximum_samples: usize,
         progress: &mut dyn FnMut(&Path, usize, usize, usize) -> Continue,
@@ -1683,7 +1706,7 @@ impl Plan {
         if progress(first, 0, self.image.width, self.image.height) == Continue::No {
             return Err(Error::Cancelled);
         }
-        let source = prepare(first, channels)?;
+        let (source, sites) = prepare(first, channels)?;
         // The anchor's undistorted footprint sets the canvas's first bounds.
         let edge = boundary(source.width, source.height)
             .into_iter()
@@ -1712,13 +1735,14 @@ impl Plan {
             width,
             height,
         };
-        let image = crate::registration::resample_region_warped(
+        let image = crate::registration::resample_region_sited(
             &source,
             width,
             height,
             region,
-            &warp,
-            options.interpolation,
+            crate::registration::FrameGeometry::Warp(&warp),
+            options.interpolation.into(),
+            sites,
         )?;
         drop(source);
         let anchor = Window::new(&image, region, &options.registration, options.scale())?;
@@ -1761,9 +1785,9 @@ impl Plan {
             if progress(&start.path, plan.registrations.len(), width, height) == Continue::No {
                 return Err(Error::Cancelled);
             }
-            let source = prepare(&start.path, channels)?;
+            let (source, sites) = prepare(&start.path, channels)?;
             plan.place_start(
-                &source,
+                (&source, sites),
                 start,
                 stamp(&start.path),
                 fit,
@@ -1892,7 +1916,7 @@ impl Plan {
     #[allow(clippy::too_many_arguments)]
     fn place_start(
         &mut self,
-        source: &LinearImage,
+        (source, sites): (&LinearImage, Sites),
         start: &Start,
         stamp: Option<crate::replay::SourceStamp>,
         fit: &LensFit,
@@ -1960,13 +1984,14 @@ impl Plan {
             .map(|&((x, y), ideal)| (ideal, (x + region_x, y + region_y)))
             .unzip();
         let transform = crate::lens::fit_similarity(&ideal, &placed).ok_or_else(lost)?;
-        let mut incoming = crate::registration::resample_region_warped(
+        let mut incoming = crate::registration::resample_region_sited(
             source,
             width,
             height,
             region,
-            &warp,
-            options.interpolation,
+            crate::registration::FrameGeometry::Warp(&warp),
+            options.interpolation.into(),
+            sites,
         )?;
         let existing = crop(&self.image, region, dx, dy)?;
         let (mut common, mut uncovered) = (0, 0);

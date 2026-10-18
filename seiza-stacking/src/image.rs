@@ -318,12 +318,16 @@ impl LinearImage {
         self.debayer_with(layout, Demosaic::default())
     }
 
-    /// Debayer a one-channel CFA frame with the given method.
+    /// Debayer a one-channel CFA frame with the given method. A
+    /// [`Demosaic::Superpixel`] frame comes back half the size on each side.
     pub(crate) fn debayer_with(self, layout: BayerLayout, demosaic: Demosaic) -> Result<Self> {
         if self.channels != 1 {
             return Err(Error::InvalidImage(
                 "only a one-channel CFA image can be debayered".into(),
             ));
+        }
+        if demosaic == Demosaic::Superpixel {
+            return self.superpixel(layout);
         }
         // VNG estimates each missing colour from colour differences, which
         // assumes white-balanced channels; raw sensor channels are not (on an
@@ -377,7 +381,7 @@ impl LinearImage {
                     Demosaic::Mhc => {
                         malvar_he_cutler_rows(&balanced, width, height, layout, first_row, rows)
                     }
-                    Demosaic::Bilinear => {}
+                    Demosaic::Bilinear | Demosaic::Superpixel => {}
                 }
                 for (band_row, out_row) in rows.chunks_exact_mut(row_samples).enumerate() {
                     let y = first_row + band_row;
@@ -386,6 +390,65 @@ impl LinearImage {
                 }
             });
         Self::new(width, height, 3, rgb)
+    }
+
+    /// [`Demosaic::Superpixel`]: each 2x2 cell of the mosaic, from the top
+    /// left, becomes one RGB pixel, of its red photosite, the mean of its
+    /// finite greens, and its blue photosite. A last odd row or column is
+    /// dropped. Nothing is interpolated, and every cell is one each of red
+    /// and blue and two greens on a diagonal, whatever the pattern's phase.
+    fn superpixel(&self, layout: BayerLayout) -> Result<Self> {
+        let (width, height) = (self.width / 2, self.height / 2);
+        if width == 0 || height == 0 {
+            return Err(Error::InvalidImage(format!(
+                "a {}x{} mosaic has no whole 2x2 cell to superpixel",
+                self.width, self.height
+            )));
+        }
+        let cell = |channel: usize| {
+            [(0, 0), (1, 0), (0, 1), (1, 1)]
+                .into_iter()
+                .filter(move |&(x, y)| layout.channel_at(x, y) == channel)
+        };
+        let red = cell(0).next().expect("a Bayer cell holds a red photosite");
+        let blue = cell(2).next().expect("a Bayer cell holds a blue photosite");
+        let mut greens = cell(1);
+        let greens = [
+            greens.next().expect("a Bayer cell holds two greens"),
+            greens.next().expect("a Bayer cell holds two greens"),
+        ];
+        let mut rgb = vec![0.0_f32; width * height * 3];
+        rgb.par_chunks_mut(width * 3)
+            .enumerate()
+            .for_each(|(row, out)| {
+                let at = |column: usize, (x, y): (usize, usize)| {
+                    self.data[(2 * row + y) * self.width + 2 * column + x]
+                };
+                for (column, pixel) in out.chunks_exact_mut(3).enumerate() {
+                    let (first, second) = (at(column, greens[0]), at(column, greens[1]));
+                    pixel[0] = at(column, red);
+                    pixel[1] = match (first.is_finite(), second.is_finite()) {
+                        (true, true) => (first + second) * 0.5,
+                        (true, false) => first,
+                        (false, true) => second,
+                        (false, false) => f32::NAN,
+                    };
+                    pixel[2] = at(column, blue);
+                }
+            });
+        Self::new(width, height, 3, rgb)
+    }
+
+    /// Channel `channel` alone, as a one-channel image.
+    pub(crate) fn channel(&self, channel: usize) -> Result<Self> {
+        let data = self
+            .data
+            .iter()
+            .skip(channel)
+            .step_by(self.channels)
+            .copied()
+            .collect();
+        Self::new(self.width, self.height, 1, data)
     }
 }
 
@@ -505,6 +568,17 @@ pub enum Demosaic {
     /// The mean of each colour's neighbours: fastest and softest, and it
     /// pulls each colour's centroid toward its own photosites.
     Bilinear,
+    /// Each 2x2 cell of the mosaic becomes one RGB pixel: its red and blue
+    /// photosites and the mean of its two greens, with nothing
+    /// interpolated. It halves each side, so it is a bin of 2 as much as a
+    /// demosaic: a stack takes it only with an even
+    /// [`crate::StackOptions::bin_factor`], in place of the first 2x2 of the
+    /// bin, about ten times faster than VNG and a binned VNG frame's
+    /// interpolation. A pixel's red and blue lie half a sensor pixel from its
+    /// centre, diagonally; registration resamples each colour from where it
+    /// lies, so a stack's colours line up rather than fringing its stars. A
+    /// reintegration at full resolution demosaics with VNG.
+    Superpixel,
 }
 
 impl Demosaic {
@@ -913,6 +987,56 @@ pub(crate) fn rec709_luma(red: f32, green: f32, blue: f32) -> f32 {
 mod tests {
     use super::*;
 
+    /// Each 2x2 cell gives its red, its greens' mean and its blue, whatever
+    /// the pattern and its phase.
+    #[test]
+    fn superpixel_takes_each_cell_s_photosites() {
+        // 5x4: the last column has no whole cell.
+        let mosaic = |nan: bool| {
+            let mut data = (0..20).map(|value| value as f32).collect::<Vec<_>>();
+            if nan {
+                data[1] = f32::NAN;
+            }
+            LinearImage::new(5, 4, 1, data).unwrap()
+        };
+        let layouts = [
+            (BayerPattern::Rggb, 0, 0, [0, 1, 5, 6]),
+            (BayerPattern::Bggr, 0, 0, [6, 1, 5, 0]),
+            (BayerPattern::Grbg, 0, 0, [1, 0, 6, 5]),
+            (BayerPattern::Gbrg, 0, 0, [5, 0, 6, 1]),
+            // RGGB from the second column is GRBG.
+            (BayerPattern::Rggb, 1, 0, [1, 0, 6, 5]),
+        ];
+        for (pattern, x_offset, y_offset, [red, green, other_green, blue]) in layouts {
+            let layout = BayerLayout {
+                pattern,
+                x_offset,
+                y_offset,
+            };
+            let rgb = mosaic(false)
+                .debayer_with(layout, Demosaic::Superpixel)
+                .unwrap();
+            assert_eq!((rgb.width, rgb.height, rgb.channels), (2, 2, 3));
+            let greens = (green + other_green) as f32 * 0.5;
+            assert_eq!(
+                rgb.data[..3],
+                [red as f32, greens, blue as f32],
+                "{pattern:?}"
+            );
+            // The second cell along is two photosites on.
+            assert_eq!(rgb.data[3], red as f32 + 2.0, "{pattern:?}");
+            // A green that is not finite leaves the other.
+            if green == 1 {
+                let rgb = mosaic(true)
+                    .debayer_with(layout, Demosaic::Superpixel)
+                    .unwrap();
+                assert_eq!(rgb.data[1], other_green as f32);
+            }
+        }
+        let single = LinearImage::new(1, 4, 1, vec![1.0; 4]).unwrap();
+        assert!(single.debayer_with(rggb(), Demosaic::Superpixel).is_err());
+    }
+
     #[test]
     fn binning_averages_finite_samples_and_drops_the_remainder() {
         let nan = f32::NAN;
@@ -1259,7 +1383,7 @@ mod tests {
                 Demosaic::Mhc => {
                     malvar_he_cutler_rows(&balanced, width, height, layout, first_row, rows)
                 }
-                Demosaic::Bilinear => {}
+                Demosaic::Bilinear | Demosaic::Superpixel => {}
             }
             for (band_row, out_row) in rows.chunks_exact_mut(row_samples).enumerate() {
                 let y = first_row + band_row;

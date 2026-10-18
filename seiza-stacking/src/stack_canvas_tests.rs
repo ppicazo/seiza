@@ -506,11 +506,11 @@ fn canvas_reintegration_timing_by_panel_count() {
     }
 }
 
-/// A mosaic of binned lights reintegrates at full resolution through its
-/// frames' carried transforms, as a canvas has no full-resolution
-/// reference to refine them against, and reports the error they carry.
+/// A mosaic of binned lights reintegrates at full resolution, each frame's
+/// transform refined against the canvas the other frames build there, which
+/// places the frames closer to the truth than the carried transforms do.
 #[test]
-fn a_binned_mosaic_reintegrates_at_full_resolution_unrefined() {
+fn a_binned_mosaic_reintegrates_at_full_resolution() {
     let directory = tempfile::tempdir().unwrap();
     let paths = mosaic(directory.path(), (2, 1), (512, 384), 2, 1);
     let mut covered = Vec::new();
@@ -550,9 +550,41 @@ fn a_binned_mosaic_reintegrates_at_full_resolution_unrefined() {
                 stacker.view().height * factor
             )
         );
-        assert_eq!(full.refined_frames, 0);
         let rms = full.registration_rms_pixels.unwrap();
-        assert!(rms > 0.0 && rms <= native, "{rms} against {native}");
+        if bin_factor == 1 {
+            assert_eq!(full.refined_frames, 0);
+            assert!(rms > 0.0 && rms <= native, "{rms} against {native}");
+        } else {
+            // Each frame's place, carried and refined: frames of one sky,
+            // only shifted, so every pair's translations differ by the
+            // offsets they were cut at.
+            let offsets = [(0.0, 0.0), (3.0, 1.0), (450.0, 0.0), (453.0, 1.0)];
+            let error = |refine: bool| {
+                let (full, _) = stacker
+                    .full_resolution(&BatchStackOptions::default(), refine, &mut |_, _, _| {})
+                    .unwrap();
+                let transforms = (0..offsets.len())
+                    .map(|index| full.ledger.mapping(index).transform())
+                    .collect::<Vec<_>>();
+                let mut worst = 0.0_f64;
+                for (j, (a, oa)) in transforms.iter().zip(offsets).enumerate() {
+                    for (b, ob) in transforms[j + 1..].iter().zip(&offsets[j + 1..]) {
+                        let dx = (a.translation_x - b.translation_x) - (oa.0 - ob.0);
+                        let dy = (a.translation_y - b.translation_y) - (oa.1 - ob.1);
+                        worst = worst.max(dx.hypot(dy));
+                    }
+                }
+                worst
+            };
+            // Measured: 0.052px carried, 0.042 refined.
+            let (carried, refined) = (error(false), error(true));
+            assert!(
+                refined < 0.08 && refined <= carried + 0.005,
+                "carried {carried:.4}px, refined {refined:.4}px"
+            );
+            assert!(full.refined_frames >= 3, "{}", full.refined_frames);
+            assert!(rms > 0.0 && rms <= native, "{rms} against {native}");
+        }
         covered.push(
             full.result
                 .snapshot

@@ -274,6 +274,9 @@ fn a_binned_context_keeps_its_bin_factor() {
     stacker.save_context(&path).unwrap();
     let mut restored = LiveStacker::open_context(&path).unwrap();
     assert_eq!(restored.bin_factor(), 2);
+    // A depth reading says what the stack was binned by.
+    assert_eq!(restored.measure_depth().unwrap().bin_factor, 2);
+    assert_eq!(crate::measure_depth(restored.view()).unwrap().bin_factor, 1);
     assert_eq!(
         restored.configuration_fingerprint(),
         stacker.configuration_fingerprint()
@@ -404,22 +407,109 @@ fn bin_factors_outside_one_to_four_and_binned_bayer_drizzle_are_refused() {
     }
     .validate()
     .unwrap();
+}
 
-    // A binned stack's mappings do not place its frames' sensor pixels.
+/// The stars [`field`] draws, as the sky holds them.
+fn sky_stars() -> Vec<(f64, f64, f64)> {
+    let mut seed = 0x0b1e_u64;
+    let mut random = move || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (seed >> 33) as f64 / (1u64 << 31) as f64
+    };
+    let margin = 60.0;
+    (0..WIDTH * HEIGHT / 220)
+        .map(|_| {
+            (
+                -margin + random() * (WIDTH as f64 + 2.0 * margin),
+                -margin + random() * (HEIGHT as f64 + 2.0 * margin),
+                150.0 + 9000.0 * random().powi(3),
+            )
+        })
+        .collect()
+}
+
+/// The mean distance, over the brightest stars well apart from the rest,
+/// between where `image`, a mono stack on frame `reference`'s full-resolution
+/// grid, puts them and where the sky does.
+fn star_misplacement(image: &LinearImage, reference: SimilarityTransform) -> f64 {
+    let mut sky = image
+        .data
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect::<Vec<_>>();
+    sky.sort_by(f32::total_cmp);
+    let sky = sky[sky.len() / 2];
+    let placed = sky_stars()
+        .into_iter()
+        .map(|(x, y, peak)| {
+            let (x, y) = reference.apply(x, y);
+            (x, y, peak)
+        })
+        .collect::<Vec<_>>();
+    let (mut total, mut count) = (0.0, 0);
+    for &(x, y, peak) in &placed {
+        let isolated = placed
+            .iter()
+            .filter(|&&(u, v, _)| (u - x).hypot(v - y) < 12.0)
+            .count()
+            == 1;
+        let inside =
+            x > 10.0 && y > 10.0 && x < image.width as f64 - 11.0 && y < image.height as f64 - 11.0;
+        if peak < 2000.0 || !isolated || !inside {
+            continue;
+        }
+        let (mut sum, mut sx, mut sy) = (0.0, 0.0, 0.0);
+        for row in (y.round() as usize - 5)..=(y.round() as usize + 5) {
+            for column in (x.round() as usize - 5)..=(x.round() as usize + 5) {
+                let weight = f64::from(image.data[row * image.width + column] - sky).max(0.0);
+                sum += weight;
+                sx += weight * column as f64;
+                sy += weight * row as f64;
+            }
+        }
+        total += (sx / sum - x).hypot(sy / sum - y);
+        count += 1;
+    }
+    assert!(count >= 5, "{count} stars measured");
+    total / count as f64
+}
+
+/// A binned stack drizzles each frame's sensor pixels, a binned pixel's
+/// part across, so a drizzle by the bin factor lands the stars where the
+/// sensor's full resolution puts them.
+#[test]
+fn a_binned_stack_drizzles_to_the_sensor_s_resolution() {
     let directory = tempfile::tempdir().unwrap();
-    let frames = field(directory.path(), 3, None);
-    let (stacker, _) = stack(&frames, binned(2));
-    let error = stacker
-        .reintegrate_drizzled(
-            &BatchStackOptions::default(),
-            &crate::DrizzleOptions {
-                scale: 2,
-                drop_shrink: None,
-            },
-            |_, _, _| {},
-        )
-        .unwrap_err();
-    assert!(error.to_string().contains("full resolution"), "{error}");
+    let frames = field(directory.path(), 5, Some(3));
+    let options = BatchStackOptions::default();
+    let (native, _) = stack(&frames, binned(1));
+    let native = native.reintegrate(&options, |_, _, _| {}).unwrap().snapshot;
+    let native_error = star_misplacement(&native.image, frames[0].1);
+    for bin_factor in [2, 4] {
+        let (stacker, _) = stack(&frames, binned(bin_factor));
+        let (_, drizzled) = stacker
+            .reintegrate_drizzled(
+                &options,
+                &crate::DrizzleOptions {
+                    scale: bin_factor,
+                    drop_shrink: None,
+                },
+                |_, _, _| {},
+            )
+            .unwrap();
+        assert_eq!(
+            (drizzled.image.width, drizzled.image.height),
+            (WIDTH, HEIGHT)
+        );
+        let error = star_misplacement(&drizzled.image, frames[0].1);
+        assert!(
+            error < native_error + 0.05 * f64::from(bin_factor),
+            "bin {bin_factor}: stars {error:.3}px off, against {native_error:.3}px at full resolution"
+        );
+    }
 }
 
 /// Prepared pixels are binned too, so a host pushes what its sensor took.
@@ -452,4 +542,179 @@ fn prepared_pixels_are_binned_as_files_are() {
             .collect::<Vec<_>>()
     };
     assert!(bits(&from_pixels) == bits(&from_files));
+}
+
+/// Raw RGGB lights of [`field`]'s stars, coloured, on a coloured sky.
+fn bayer_field(
+    directory: &Path,
+    count: usize,
+    flipped: Option<usize>,
+) -> Vec<(PathBuf, SimilarityTransform)> {
+    const SKY: [f32; 3] = [400.0, 600.0, 300.0];
+    const COLOUR: [f32; 3] = [1.0, 0.8, 0.6];
+    field(directory, count, flipped)
+        .into_iter()
+        .map(|(path, pose)| {
+            let frame = FitsFrame::open(&path).unwrap();
+            let data = frame
+                .image
+                .data
+                .iter()
+                .enumerate()
+                .map(|(index, &value)| {
+                    let (x, y) = (index % WIDTH, index / WIDTH);
+                    let channel = [[0, 1], [1, 2]][y & 1][x & 1];
+                    // `field`'s sky is 500; its stars and noise ride on it.
+                    SKY[channel] + COLOUR[channel] * (value - 500.0)
+                })
+                .collect::<Vec<_>>();
+            let cards = [seiza_fits::WriteHeaderCard::new(
+                "BAYERPAT",
+                HeaderValue::String("RGGB".into()),
+            )];
+            write_f32_image(&path, WIDTH, HEIGHT, F32ImageData::Mono(&data), &cards).unwrap();
+            (path, pose)
+        })
+        .collect()
+}
+
+/// The mean offset, over the brightest isolated stars, of the red
+/// centroid from the blue in `image`, a stack on frame `reference`'s grid
+/// binned by `bin_factor`.
+fn red_from_blue(
+    image: &LinearImage,
+    reference: SimilarityTransform,
+    bin_factor: u32,
+) -> (f64, f64) {
+    let factor = f64::from(bin_factor);
+    let offset = (factor - 1.0) / 2.0;
+    let median = |channel: usize| {
+        let mut values = image
+            .data
+            .iter()
+            .skip(channel)
+            .step_by(3)
+            .copied()
+            .filter(|value| value.is_finite())
+            .collect::<Vec<_>>();
+        values.sort_by(f32::total_cmp);
+        values[values.len() / 2]
+    };
+    let sky = [median(0), median(1), median(2)];
+    let centroid = |x: f64, y: f64, channel: usize| {
+        let (mut sum, mut sx, mut sy) = (0.0, 0.0, 0.0);
+        for row in (y.round() as isize - 3)..=(y.round() as isize + 3) {
+            for column in (x.round() as isize - 3)..=(x.round() as isize + 3) {
+                let value =
+                    image.data[(row as usize * image.width + column as usize) * 3 + channel];
+                let weight = f64::from(value - sky[channel]).max(0.0);
+                sum += weight;
+                sx += weight * column as f64;
+                sy += weight * row as f64;
+            }
+        }
+        (sx / sum, sy / sum)
+    };
+    // The same stars `field` drew, where the reference frame put them.
+    let mut seed = 0x0b1e_u64;
+    let mut random = move || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (seed >> 33) as f64 / (1u64 << 31) as f64
+    };
+    let margin = 60.0;
+    let stars = (0..WIDTH * HEIGHT / 220)
+        .map(|_| {
+            (
+                -margin + random() * (WIDTH as f64 + 2.0 * margin),
+                -margin + random() * (HEIGHT as f64 + 2.0 * margin),
+                150.0 + 9000.0 * random().powi(3),
+            )
+        })
+        .collect::<Vec<_>>();
+    let placed = stars
+        .iter()
+        .map(|&(x, y, peak)| {
+            let (x, y) = reference.apply(x, y);
+            ((x - offset) / factor, (y - offset) / factor, peak)
+        })
+        .collect::<Vec<_>>();
+    let (mut total_x, mut total_y, mut count) = (0.0, 0.0, 0);
+    for &(x, y, peak) in &placed {
+        let isolated = placed
+            .iter()
+            .filter(|&&(u, v, _)| (u - x).hypot(v - y) < 3.0 + 4.0 / factor)
+            .count()
+            == 1;
+        let inside =
+            x > 8.0 && y > 8.0 && x < image.width as f64 - 9.0 && y < image.height as f64 - 9.0;
+        if peak > 2000.0 && isolated && inside {
+            let (red, blue) = (centroid(x, y, 0), centroid(x, y, 2));
+            total_x += red.0 - blue.0;
+            total_y += red.1 - blue.1;
+            count += 1;
+        }
+    }
+    assert!(count >= 5, "{count} stars measured");
+    (total_x / count as f64, total_y / count as f64)
+}
+
+/// A superpixel stack bins by 2 as it debayers, and resamples each colour
+/// from where its photosite lies, so its red and blue line up where the
+/// cells hold them half a sensor pixel apart, a meridian flip included; it
+/// reintegrates at full resolution through VNG.
+#[test]
+fn a_superpixel_stack_lines_its_colours_up() {
+    let directory = tempfile::tempdir().unwrap();
+    let frames = bayer_field(directory.path(), 5, Some(3));
+    for bin_factor in [2, 4] {
+        let options = StackOptions {
+            demosaic: crate::Demosaic::Superpixel,
+            ..binned(bin_factor)
+        };
+        let (stacker, _) = stack(&frames, options);
+        let factor = bin_factor as usize;
+        let snapshot = stacker.snapshot().unwrap();
+        assert_eq!(
+            (
+                snapshot.image.width,
+                snapshot.image.height,
+                snapshot.image.channels
+            ),
+            (WIDTH / factor, HEIGHT / factor, 3)
+        );
+        let bin = stacker
+            .reference_headers()
+            .iter()
+            .find(|(key, _)| key == "SEIZABIN")
+            .and_then(|(_, value)| value.as_f64());
+        assert_eq!(bin, Some(f64::from(bin_factor)));
+        let (dx, dy) = red_from_blue(&snapshot.image, frames[0].1, bin_factor);
+        // Read from the pixel centres, red sat 0.29 binned pixels right of
+        // and below blue at 2: a sensor pixel, less the flipped frame's.
+        let limit = 0.15 / f64::from(bin_factor);
+        assert!(
+            dx.abs() < limit && dy.abs() < limit,
+            "bin {bin_factor}: red is ({dx:.3}, {dy:.3}) from blue"
+        );
+        let full = stacker
+            .reintegrate_full_resolution(&BatchStackOptions::default(), true, |_, _, _| {})
+            .unwrap();
+        assert_eq!(full.refined_frames, 4);
+        assert_eq!(
+            (
+                full.result.snapshot.image.width,
+                full.result.snapshot.image.height
+            ),
+            (WIDTH, HEIGHT)
+        );
+    }
+    for bin_factor in [1, 3] {
+        let options = StackOptions {
+            demosaic: crate::Demosaic::Superpixel,
+            ..binned(bin_factor)
+        };
+        assert!(options.validate().is_err(), "{bin_factor}");
+    }
 }

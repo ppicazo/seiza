@@ -29,9 +29,8 @@ use seiza_stacking::{
     StackOptions, StackSnapshot as RustStackSnapshot, build_master_from_fits,
     build_master_from_fits_with_scratch, checkpoint_depths as rust_checkpoint_depths, combine_lrgb,
     combine_narrowband, combine_narrowband_matrix, combine_rgb, combine_super_lrgb,
-    combine_super_rgb, crop_report, measure_depth as rust_measure_depth, path_identity,
-    paths_refer_to_same_file, write_color_fits_f32, write_fits_f32, write_master_fits_f32,
-    write_stack_export_fits_f32,
+    combine_super_rgb, crop_report, path_identity, paths_refer_to_same_file, write_color_fits_f32,
+    write_fits_f32, write_master_fits_f32, write_stack_export_fits_f32,
 };
 use seiza_stretch::{
     ImageShape, ResolvedSampleDomain, SampleDomain, StretchAnalysis, StretchConfig, StretchStack,
@@ -3268,7 +3267,8 @@ pub unsafe extern "C" fn seiza_stack_detect_defects_json(
 /// masters. A positive `dark_exposure_seconds` overrides the dark metadata; zero
 /// uses the metadata. Pass null or empty `options_json` for defaults; its
 /// fields are `seiza_stacking::StackOptions`'s, so a host can choose, for
-/// example, `"demosaic": "vng" | "mhc" | "bilinear"`,
+/// example, `"demosaic": "vng" | "mhc" | "bilinear" | "superpixel"` (which
+/// needs `"bin_factor": 2` or `4`),
 /// `"interpolation": "bilinear" | "lanczos3"`,
 /// `"normalization": {"mode": "local-background", "options": {"tile_size": 256}}`,
 /// `"weighting": {"mode": "inverse-noise-variance"}`,
@@ -4695,6 +4695,10 @@ pub unsafe extern "C" fn seiza_live_stacker_reintegrate(
 /// onto a grid `scale` (1 to 4) times finer than the reference, as
 /// PixInsight's DrizzleIntegration follows ImageIntegration.
 ///
+/// A binned stack (see [`seiza_live_stacker_bin_factor`]) drops each
+/// frame's sensor pixels, so a `scale` of its bin factor gives the sensor's
+/// resolution, with rejection decided on the binned grid.
+///
 /// During the final pass each frame is read once more from its source file
 /// and calibrated, but not debayered or resampled. Every source pixel,
 /// shrunk to a drop `drop_shrink` of a pixel on a side, is carried through
@@ -4823,10 +4827,11 @@ pub unsafe extern "C" fn seiza_live_stacker_bin_factor(stacker: *const SeizaLive
 /// the binned grid. With `refine`, a single field detects every frame's
 /// stars at full resolution, as it does the reference frame's, and refits
 /// each transform from that seed; a frame whose stars do not pair keeps the
-/// carried one. An expanded canvas has no full-resolution reference to
-/// refine against, so its frames keep their carried transforms. The
-/// snapshot's reference headers carry the reference's WCS to the finer grid,
-/// with its binning and pixel-size cards the sensor's again.
+/// carried one. An expanded canvas refits each frame against the canvas the
+/// other frames build at full resolution; a frame warped onto its panel keeps
+/// its carried warp. The snapshot's reference headers carry the reference's
+/// WCS to the finer grid, with its binning and pixel-size cards the sensor's
+/// again.
 ///
 /// When non-null, `refined_frames_out` receives how many frames were
 /// refined, and `registration_rms_out` the median registration RMS of the
@@ -4834,8 +4839,9 @@ pub unsafe extern "C" fn seiza_live_stacker_bin_factor(stacker: *const SeizaLive
 /// for every other frame the RMS the binned pass measured, which its carried
 /// transform is expected to keep (a host may warn on a canvas). It is NaN
 /// when no frame's is known, as for a stack reopened from a context and not
-/// refined. The refit reads each frame once, and `progress` hears it as
-/// pass 0 for each frame in turn before the reintegration's own progress.
+/// refined. The refit reads each frame once (twice on a canvas), and
+/// `progress` hears each read as pass 0 for each frame in turn before the
+/// reintegration's own progress.
 /// `low_sigma`, `high_sigma`, `cancel`, `progress` and `context` work as in
 /// [`seiza_live_stacker_reintegrate`], and memory is reintegration's on the
 /// finer grid.
@@ -9059,6 +9065,15 @@ mod tests {
         .unwrap();
         let options = stack_options(documented.as_ptr()).unwrap();
         assert_eq!(options.demosaic, seiza_stacking::Demosaic::Bilinear);
+        let superpixel =
+            std::ffi::CString::new(r#"{"demosaic": "superpixel", "bin_factor": 2}"#).unwrap();
+        assert_eq!(
+            stack_options(superpixel.as_ptr()).unwrap().demosaic,
+            seiza_stacking::Demosaic::Superpixel
+        );
+        // A superpixel bins by 2, so it needs an even bin factor.
+        let odd = std::ffi::CString::new(r#"{"demosaic": "superpixel"}"#).unwrap();
+        assert!(stack_options(odd.as_ptr()).is_err());
         assert_eq!(
             options.interpolation,
             seiza_stacking::Interpolation::Lanczos3
@@ -15382,6 +15397,10 @@ pub struct SeizaSnrSample {
     pub channel_count: usize,
     /// Per-channel noise.
     pub channel_noise: [f64; SEIZA_SNR_MAX_CHANNELS],
+    /// The factor the stack's lights were binned by, which lowers each
+    /// pixel's noise about as much: compare noise and SNR only between
+    /// readings of one bin factor.
+    pub bin_factor: u32,
 }
 
 /// Read how deep a live stack is, without copying the accumulator.
@@ -15418,7 +15437,7 @@ pub unsafe extern "C" fn seiza_live_stacker_measure_depth(
         if sample.is_null() {
             return Err("sample is required".into());
         }
-        let Some(measured) = rust_measure_depth(stacker.stacker.view()) else {
+        let Some(measured) = stacker.stacker.measure_depth() else {
             return Ok(0);
         };
         let mut channel_noise = [0.0f64; SEIZA_SNR_MAX_CHANNELS];
@@ -15433,6 +15452,7 @@ pub unsafe extern "C" fn seiza_live_stacker_measure_depth(
                 snr: measured.snr(),
                 channel_count,
                 channel_noise,
+                bin_factor: measured.bin_factor,
             };
         }
         Ok(1)
