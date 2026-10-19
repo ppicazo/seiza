@@ -151,7 +151,7 @@ impl FrameWeighting {
 
 /// Everything that governs how frames are aligned, matched, rejected, and
 /// admitted into a stack.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StackOptions {
     /// Star-matching and transform-fitting options.
@@ -215,6 +215,55 @@ pub struct StackOptions {
         with = "crate::calibration::light_gate"
     )]
     pub match_tolerances: seiza_calibration::MatchTolerances,
+    /// Area-mean bin each light `bin_factor` by `bin_factor`, from 1 to 4,
+    /// after calibration, defect repair, the cosmetic filter and debayering,
+    /// and before star detection. Registration, resampling, normalization,
+    /// rejection and integration then work on a quarter of the pixels at 2
+    /// and a sixteenth at 4, and the stack's grid is the binned reference's.
+    /// [`LiveStacker::reintegrate_full_resolution`] later reintegrates the
+    /// same frames at the sensor's own resolution without searching for
+    /// their transforms again.
+    ///
+    /// Every pixel-valued option keeps its meaning in the sensor's pixels at
+    /// any factor (the match tolerance, drift floor, registration RMS gate
+    /// and local normalization tile), and registration RMS and drift are
+    /// reported in them. Each frame's mapping, transform and the stack's
+    /// outputs are on the binned grid. [`CfaIntegration::BayerDrizzle`]
+    /// needs single photosites, so it is refused above 1. The default, 1, is
+    /// not serialized, so existing options, fingerprints and contexts keep
+    /// their exact bytes.
+    #[serde(
+        default = "native_bin_factor",
+        skip_serializing_if = "is_native_bin_factor"
+    )]
+    pub bin_factor: u32,
+}
+
+impl Default for StackOptions {
+    fn default() -> Self {
+        Self {
+            registration: RegistrationOptions::default(),
+            normalization: NormalizationMode::default(),
+            rejection: RejectionMode::default(),
+            acceptance: FrameAcceptanceCriteria::default(),
+            cosmetic: None,
+            defects: None,
+            weighting: FrameWeighting::default(),
+            cfa_integration: CfaIntegration::default(),
+            interpolation: crate::Interpolation::default(),
+            demosaic: crate::Demosaic::default(),
+            match_tolerances: seiza_calibration::MatchTolerances::default(),
+            bin_factor: native_bin_factor(),
+        }
+    }
+}
+
+fn native_bin_factor() -> u32 {
+    1
+}
+
+fn is_native_bin_factor(bin_factor: &u32) -> bool {
+    *bin_factor == 1
 }
 
 /// How a Bayer frame's colors reach the accumulator. Registration and
@@ -305,7 +354,57 @@ impl StackOptions {
             return Err(Error::Stack("invalid frame acceptance criteria".into()));
         }
         crate::calibration::check_tolerances(&self.match_tolerances)?;
+        if !(1..=4).contains(&self.bin_factor) {
+            return Err(Error::Stack(format!(
+                "bin factor must be 1, 2, 3 or 4, not {}",
+                self.bin_factor
+            )));
+        }
+        if self.bin_factor > 1 && self.cfa_integration == CfaIntegration::BayerDrizzle {
+            return Err(Error::Stack(
+                "Bayer drizzle integrates single photosites, which binning averages away; \
+                 use a bin factor of 1"
+                    .into(),
+            ));
+        }
+        if self.demosaic == crate::Demosaic::Superpixel && !self.bin_factor.is_multiple_of(2) {
+            return Err(Error::Stack(
+                "a superpixel demosaic bins by 2 as it debayers, so it needs a bin factor of \
+                 2 or 4"
+                    .into(),
+            ));
+        }
         Ok(())
+    }
+
+    /// Where each channel of a light prepared from `cfa` samples the sky:
+    /// off its pixels' centres after a superpixel demosaic, and on them
+    /// otherwise.
+    pub(crate) fn channel_sites(
+        &self,
+        cfa: Option<BayerLayout>,
+    ) -> Option<crate::registration::ChannelSites> {
+        self.channel_sites_at(cfa, self.bin_factor)
+    }
+
+    /// [`Self::channel_sites`] of a light binned by `bin_factor` in place of
+    /// the stack's own.
+    pub(crate) fn channel_sites_at(
+        &self,
+        cfa: Option<BayerLayout>,
+        bin_factor: u32,
+    ) -> Option<crate::registration::ChannelSites> {
+        if self.demosaic != crate::Demosaic::Superpixel || !bin_factor.is_multiple_of(2) {
+            return None;
+        }
+        Some(crate::registration::ChannelSites::superpixel(
+            cfa?, bin_factor,
+        ))
+    }
+
+    /// How pixel-valued options and constants read on the working grid.
+    pub(crate) fn scale(&self) -> crate::binning::Scale {
+        crate::binning::Scale::new(self.bin_factor)
     }
 
     /// Repair a calibrated light's sensor defects, then filter its
@@ -366,9 +465,11 @@ pub struct FrameDiagnostics {
     pub transform: SimilarityTransform,
     /// Star pairs supporting the registration.
     pub matched_stars: usize,
-    /// Registration RMS residual, in pixels.
+    /// Registration RMS residual, in the sensor's pixels at any
+    /// [`StackOptions::bin_factor`].
     pub registration_rms_pixels: f64,
-    /// Frame-center displacement under the transform, in pixels.
+    /// Frame-center displacement under the transform, in the sensor's
+    /// pixels.
     pub registration_drift_pixels: f64,
     /// Mean normalization gain applied.
     pub normalization_mean_gain: f32,
@@ -479,6 +580,30 @@ pub enum FrameDisposition {
     Accepted(FrameDiagnostics),
     /// The frame was turned away; carries why.
     Rejected(FrameRejectionReason),
+}
+
+/// A binned stack reintegrated at the sensor's full resolution by
+/// [`LiveStacker::reintegrate_full_resolution`].
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct FullResolutionStack {
+    /// The reintegrated stack, on a grid [`StackOptions::bin_factor`] times
+    /// as fine as the binned stack's, and each frame's statistics.
+    pub result: crate::BatchStackResult,
+    /// The reference frame's headers for that grid: its WCS carried there,
+    /// its binning and pixel-size cards the sensor's again, and no
+    /// `SEIZABIN`.
+    pub reference_headers: Vec<(String, HeaderValue)>,
+    /// Admitted frames whose transform was refined against stars detected
+    /// at full resolution, or against the canvas the other frames build
+    /// there: none without `refine`.
+    pub refined_frames: usize,
+    /// The median registration RMS of the admitted frames, in the sensor's
+    /// pixels: a refined frame's own refit, and for every other frame the
+    /// RMS the binned pass measured, which its carried transform is expected
+    /// to keep. `None` when no frame's is known, as for a stack reopened
+    /// from a context and not refined.
+    pub registration_rms_pixels: Option<f64>,
 }
 
 /// A full copy of the current stack estimate and its coverage masks.
@@ -677,8 +802,17 @@ impl LiveStacker {
         mut rejected: impl FnMut(usize, &FrameRejectionReason),
     ) -> std::result::Result<(Self, usize), E> {
         options.validate()?;
-        let (alignment, _) = reference.into_prepared_with_layout(options.demosaic)?;
-        let registrar = Registrar::new(&alignment.image, options.registration.clone())?;
+        // The external image is debayered and binned as the lights are, so
+        // that registration finds them at the scale it expects, and its
+        // colours line up as theirs will.
+        let (mut alignment, cfa) = develop(reference, &options, options.bin_factor)?;
+        alignment.image = co_site(
+            alignment.image,
+            options.channel_sites(cfa),
+            options.interpolation,
+        )?;
+        let registrar =
+            Registrar::at_scale(&alignment.image, &options.registration, options.scale())?;
         // Use the regular registration gates, with no photometric comparison
         // to the external image. This image is a target, not an observation.
         let geometry_options = StackOptions {
@@ -693,7 +827,7 @@ impl LiveStacker {
             let channel_reference = channel_reference?;
             tried += 1;
             let metadata = channel_reference.metadata();
-            let (channel, _) = prepare_light(
+            let (channel, channel_cfa) = prepare_light(
                 channel_reference,
                 &calibration,
                 &options.match_tolerances,
@@ -715,7 +849,7 @@ impl LiveStacker {
                 &geometry_options,
                 &[],
                 channel.image,
-                None,
+                channel_cfa,
                 None,
             )? {
                 PreparedFrame::Ready(ready) => {
@@ -792,9 +926,11 @@ impl LiveStacker {
         options.acceptance.maximum_rotation_degrees = 180.0;
         let plan = crate::expand::plan(paths, &calibration, &options, maximum_samples, progress)?;
         // Panels bound each registration's search; the canvas diagonal bounds
-        // any frame's displacement from its center.
-        options.registration.maximum_drift_pixels =
-            (plan.image.width as f64).hypot(plan.image.height as f64);
+        // any frame's displacement from its center. Options keep sensor
+        // pixels, and the canvas is on the binned grid.
+        options.registration.maximum_drift_pixels = options
+            .scale()
+            .native_length((plan.image.width as f64).hypot(plan.image.height as f64));
         let mut stacker = Self::from_prepared(
             plan.image,
             plan.headers,
@@ -876,19 +1012,212 @@ impl LiveStacker {
             .map_or(&[], |canvas| canvas.planning_notes())
     }
 
-    /// The largest frame displacement registration accepts, in reference
+    /// The largest frame displacement registration accepts, in the sensor's
     /// pixels: on an expanded canvas, its diagonal.
     pub fn effective_maximum_drift_pixels(&self) -> f64 {
-        self.options
-            .registration
-            .effective_maximum_drift_pixels(self.reference.width, self.reference.height)
+        let scale = self.options.scale();
+        scale.native_length(
+            scale
+                .registration(&self.options.registration)
+                .effective_maximum_drift_pixels(self.reference.width, self.reference.height),
+        )
+    }
+
+    /// How deep this stack is: [`crate::measure_depth`] of its
+    /// [`Self::view`], with the bin factor its lights took.
+    pub fn measure_depth(&self) -> Option<crate::SnrSample> {
+        crate::measure_depth(self.view()).map(|sample| crate::SnrSample {
+            bin_factor: self.options.bin_factor,
+            ..sample
+        })
+    }
+
+    /// The factor each light is binned by: [`StackOptions::bin_factor`].
+    /// The reference, snapshots and every frame's mapping are on the binned
+    /// grid; see [`Self::reintegrate_full_resolution`].
+    pub fn bin_factor(&self) -> u32 {
+        self.options.bin_factor
+    }
+
+    /// [`Self::reintegrate`] at the sensor's full resolution: every admitted
+    /// frame of a binned stack read again unbinned and integrated, with
+    /// three-pass leave-one-out rejection, onto a grid
+    /// [`Self::bin_factor`] times as fine as this stack's. At a bin factor of
+    /// 1 it is [`Self::reintegrate`].
+    ///
+    /// No admission decision is revisited, and no transform is searched for
+    /// again: each frame's mapping is carried exactly from the binned grid
+    /// (see [`RegisteredFrameMapping::rebinned`]), with its weight and
+    /// normalization. With `refine`, a single field then detects each
+    /// frame's stars at full resolution, as it does the reference frame's,
+    /// read again from its source, and refits the frame's similarity from
+    /// that seed without searching, and the registration model's warp
+    /// around it. Binning costs registration little at 2 and up to a few
+    /// tenths of a pixel at 4 on tight stars, which the refit recovers. A
+    /// frame whose stars do not pair, or whose refit fails the registration
+    /// RMS gate, keeps its carried mapping.
+    ///
+    /// An expanded canvas has no full-resolution reference, so it builds
+    /// one: every frame is carried onto the finer canvas through its
+    /// carried mapping and summed, and each frame's similarity is then
+    /// refit against the stars of the canvas the other frames make over its
+    /// footprint. A frame warped onto its panel, by the registration model
+    /// or a lens, keeps its carried warp, as does one whose refit would move
+    /// a corner further than the match tolerance, as a narrow overlap could
+    /// pull it. [`FullResolutionStack`] reports the median RMS, refined or
+    /// carried, in the sensor's pixels, so a host can warn.
+    ///
+    /// The refit reads each frame once, twice on a canvas, keeping its
+    /// registered image in [`crate::BatchStackOptions::scratch_directory`]
+    /// for the integration that follows; `progress` hears each read as
+    /// [`crate::BatchStackPass::Estimate`] for each frame in turn, before the
+    /// reintegration's own progress. The
+    /// live stack is left as it was. Its frames are refused as
+    /// [`Self::reintegrate`] refuses them, and memory is reintegration's on
+    /// the finer grid.
+    pub fn reintegrate_full_resolution(
+        &self,
+        options: &crate::BatchStackOptions,
+        refine: bool,
+        mut progress: impl FnMut(crate::BatchStackPass, usize, usize),
+    ) -> Result<FullResolutionStack> {
+        if let Some(reason) = self.reintegration_unavailable() {
+            return Err(Error::Stack(reason));
+        }
+        let live = self.ledger.registration_rms();
+        if self.options.bin_factor == 1 {
+            return Ok(FullResolutionStack {
+                result: self.reintegrate(options, progress)?,
+                reference_headers: self.reference_headers.clone(),
+                refined_frames: 0,
+                registration_rms_pixels: median_registration_rms(&live, &[]),
+            });
+        }
+        let (full, refined) = self.full_resolution(options, refine, &mut progress)?;
+        let result = full.reintegrate(options, &mut progress)?;
+        Ok(FullResolutionStack {
+            result,
+            reference_headers: full.reference_headers,
+            refined_frames: refined.iter().flatten().count(),
+            registration_rms_pixels: median_registration_rms(&live, &refined),
+        })
+    }
+
+    /// This binned stack at the sensor's full resolution, ready to
+    /// reintegrate: every frame's mapping carried there exactly, and
+    /// refined when `refine` asks, with each refined frame's RMS. See
+    /// [`Self::reintegrate_full_resolution`].
+    pub(crate) fn full_resolution(
+        &self,
+        options: &crate::BatchStackOptions,
+        refine: bool,
+        progress: &mut dyn FnMut(crate::BatchStackPass, usize, usize),
+    ) -> Result<(Self, Vec<Option<f64>>)> {
+        let bin = self.options.bin_factor;
+        let factor = bin as usize;
+        let (width, height, channels) = (
+            self.reference.width * factor,
+            self.reference.height * factor,
+            self.reference.channels,
+        );
+        let full_reference = if refine && self.canvas_registrar.is_none() {
+            self.full_resolution_reference()?
+                .map(|image| {
+                    image.crop(ReferenceRegion {
+                        x: 0,
+                        y: 0,
+                        width,
+                        height,
+                    })
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let registrar = full_reference
+            .as_ref()
+            .map(|reference| Registrar::new(reference, self.options.registration.clone()))
+            .transpose()?;
+        // A grid of the finer size: the reference frame itself where it was
+        // read again, which the replay reads only for its shape.
+        let reference = match full_reference {
+            Some(reference) => reference,
+            None => LinearImage::new(
+                width,
+                height,
+                channels,
+                vec![f32::NAN; width * height * channels],
+            )?,
+        };
+        let mut full = Self {
+            options: StackOptions {
+                bin_factor: 1,
+                // A superpixel is a bin of 2; full resolution demosaics.
+                demosaic: match self.options.demosaic {
+                    crate::Demosaic::Superpixel => crate::Demosaic::Vng,
+                    demosaic => demosaic,
+                },
+                ..self.options.clone()
+            },
+            calibration: self.calibration.clone(),
+            reference,
+            reference_metadata: self.reference_metadata.clone(),
+            registrar: registrar.clone().unwrap_or_else(|| self.registrar.clone()),
+            alignment_reference: None,
+            planned_registrations: Default::default(),
+            // Replay reads only whether there is one, to resample each frame
+            // over its footprint.
+            canvas_registrar: self.canvas_registrar.clone(),
+            reference_noise: self.reference_noise.clone(),
+            accumulator: Accumulator::new(0, !self.options.weighting.is_equal()),
+            reference_headers: crate::fits::rebinned_headers(&self.reference_headers, bin, 1),
+            accepted_frames: self.accepted_frames,
+            rejected_frames: self.rejected_frames,
+            input_paths: self.input_paths.clone(),
+            input_mode: self.input_mode,
+            configuration_fingerprint: self.configuration_fingerprint.clone(),
+            ledger: self.ledger.rebinned(1)?,
+            frame_cache: None,
+            reference_cfa: None,
+            reference_is_integrated: self.reference_is_integrated,
+            reference_image_path: self.reference_image_path.clone(),
+        };
+        let refined = match &registrar {
+            Some(registrar) => {
+                full.frame_cache = full.full_resolution_cache(options.scratch_directory.as_deref());
+                full.refine_full_resolution(registrar, options.cancel.as_ref(), progress)?
+            }
+            None if refine && full.canvas_registrar.is_some() => {
+                full.frame_cache = full.full_resolution_cache(options.scratch_directory.as_deref());
+                full.refine_canvas_full_resolution(options.cancel.as_ref(), progress)?
+            }
+            None => Vec::new(),
+        };
+        Ok((full, refined))
+    }
+
+    /// The reference frame at the sensor's full resolution, read again: the
+    /// integrated reference frame's source, or the external reference
+    /// image. `None` for an external image held only in memory.
+    fn full_resolution_reference(&self) -> Result<Option<LinearImage>> {
+        if self.reference_is_integrated {
+            return self.read_full_resolution(0).map(Some);
+        }
+        let Some(path) = &self.reference_image_path else {
+            return Ok(None);
+        };
+        let (frame, _) = develop(FitsFrame::open(path)?, &self.options, 1)?;
+        Ok(Some(frame.image))
     }
 
     /// Start a stack from an already-prepared linear reference, with no
     /// calibration and no header metadata. Every later frame must use
-    /// [`Self::push_linear`].
+    /// [`Self::push_linear`]. The reference, and every frame pushed, is
+    /// binned by [`StackOptions::bin_factor`].
     pub fn from_linear(reference: LinearImage, options: StackOptions) -> Result<Self> {
+        options.validate()?;
         let reference_metadata = FrameMetadata::from_image(&reference, &[]);
+        let reference = reference.into_binned(options.bin_factor)?;
         Self::from_prepared(
             reference,
             Vec::new(),
@@ -906,14 +1235,17 @@ impl LiveStacker {
     /// This is the extension point for bounded corrections that must run
     /// between ordinary calibration and registration. A raw CFA frame is
     /// rejected so it cannot bypass preparation by mistake. Every later frame
-    /// must use [`Self::push_linear`].
+    /// must use [`Self::push_linear`]. The reference, and every frame pushed,
+    /// is binned by [`StackOptions::bin_factor`].
     pub fn from_prepared_frame(reference: FitsFrame, options: StackOptions) -> Result<Self> {
         if reference.bayer.is_some() {
             return Err(Error::Stack(
                 "an already-prepared reference frame must not retain a Bayer layout".into(),
             ));
         }
+        options.validate()?;
         let reference_metadata = reference.metadata();
+        let reference = reference.binned(options.bin_factor)?;
         Self::from_prepared(
             reference.image,
             reference.headers,
@@ -946,7 +1278,7 @@ impl LiveStacker {
                 (registrar, noise, None, None)
             }
             ReferenceContribution::Integrated(cfa) => (
-                Registrar::new(&reference, options.registration.clone())?,
+                Registrar::at_scale(&reference, &options.registration, options.scale())?,
                 if options.weighting.is_equal() {
                     Vec::new()
                 } else {
@@ -960,6 +1292,18 @@ impl LiveStacker {
                 registrar,
                 noise,
             } => (*registrar, noise, None, Some(image)),
+        };
+        // A reference whose colours sample the sky off its pixels' centres
+        // is resampled onto them once, as every later frame is when it is
+        // registered; its stars and noise were taken as the lights' are.
+        let reference = if reference_is_integrated {
+            co_site(
+                reference,
+                options.channel_sites(reference_cfa),
+                options.interpolation,
+            )?
+        } else {
+            reference
         };
         let mut accumulator =
             Accumulator::new(reference.sample_count(), !options.weighting.is_equal());
@@ -995,6 +1339,8 @@ impl LiveStacker {
         } else {
             crate::replay::Ledger::empty()
         };
+        ledger.set_bin_factor(options.bin_factor);
+        ledger.set_reference_channel_sites(options.channel_sites(reference_cfa));
         if !reference_noise.is_empty() {
             ledger.set_reference_weighting(&reference_noise);
         }
@@ -1155,21 +1501,27 @@ impl LiveStacker {
                     restored.expanded_panel_stars,
                     restored.expanded_lens,
                     &restored.options.registration,
+                    restored.options.scale(),
                 )
             })
             .transpose()
             .map_err(read_error)?;
         let registrar = match &canvas_registrar {
             Some(canvas) => canvas.anchor_registrar(),
-            None => Registrar::new(
+            None => Registrar::at_scale(
                 restored
                     .alignment_reference
                     .as_ref()
                     .unwrap_or(&restored.reference),
-                restored.options.registration.clone(),
+                &restored.options.registration,
+                restored.options.scale(),
             )
             .map_err(read_error)?,
         };
+        // A context's compact ledger leaves each mapping's bin factor out;
+        // the options carry it.
+        let mut ledger = restored.ledger.unwrap_or_else(crate::replay::Ledger::empty);
+        ledger.set_bin_factor(restored.options.bin_factor);
         let configuration_fingerprint = stack_configuration_fingerprint(
             &restored.options,
             &restored.calibration,
@@ -1198,7 +1550,7 @@ impl LiveStacker {
             input_paths: restored.input_paths,
             input_mode: restored.input_mode,
             configuration_fingerprint,
-            ledger: restored.ledger.unwrap_or_else(crate::replay::Ledger::empty),
+            ledger,
             frame_cache: None,
             reference_cfa: None,
             reference_is_integrated: restored.reference_is_integrated,
@@ -1474,8 +1826,15 @@ impl LiveStacker {
     }
 
     /// Register, normalize, and try to integrate an already-prepared linear
-    /// frame, applying every admission gate.
+    /// frame, applying every admission gate. It is binned by
+    /// [`StackOptions::bin_factor`] first.
     pub fn push_linear(&mut self, frame: LinearImage) -> Result<FrameDisposition> {
+        let frame = match frame.into_binned(self.options.bin_factor) {
+            Ok(frame) => frame,
+            Err(error) => {
+                return Ok(self.reject(FrameRejectionReason::IncompatibleImage(error.to_string())));
+            }
+        };
         // A frame with no source file cannot be replayed, so none is kept.
         let prepared = prepare_frame(
             &self.reference,
@@ -1616,7 +1975,12 @@ impl LiveStacker {
     /// frame. Callers can persist this beside mappings returned for later
     /// frames and use one extraction path for the whole stack.
     pub fn reference_mapping(&self) -> RegisteredFrameMapping {
-        RegisteredFrameMapping::identity(&self.reference)
+        let mut mapping = RegisteredFrameMapping::identity(&self.reference);
+        mapping.set_bin_factor(self.options.bin_factor);
+        if self.reference_is_integrated {
+            mapping.set_channel_sites(self.ledger.reference_channel_sites());
+        }
+        mapping
     }
 
     /// Consume the live state and move its full-frame buffers into a final
@@ -1791,8 +2155,8 @@ pub(crate) enum LightFailure {
     Calibration(Error),
     /// Repairing its defects or filtering its impulses failed.
     Repair(Error),
-    /// Debayering failed.
-    Debayer(Error),
+    /// Debayering or binning failed.
+    Image(Error),
 }
 
 impl LightFailure {
@@ -1805,7 +2169,7 @@ impl LightFailure {
             Self::Calibration(error) | Self::Repair(error) => {
                 FrameRejectionReason::Calibration(error.to_string())
             }
-            Self::Debayer(error) => FrameRejectionReason::IncompatibleImage(error.to_string()),
+            Self::Image(error) => FrameRejectionReason::IncompatibleImage(error.to_string()),
         }
     }
 
@@ -1814,7 +2178,7 @@ impl LightFailure {
     /// closure's `?` infer its error type.
     pub(crate) fn into_error(self) -> Error {
         match self {
-            Self::Calibration(error) | Self::Repair(error) | Self::Debayer(error) => error,
+            Self::Calibration(error) | Self::Repair(error) | Self::Image(error) => error,
         }
     }
 }
@@ -1838,17 +2202,94 @@ pub(crate) fn calibrate_light(
 }
 
 /// Prepare a light read from a file, as every path that stacks, plans or
-/// replays one does: [`calibrate_light`], then debayer.
+/// replays one does: [`calibrate_light`], then debayer, then bin by
+/// [`StackOptions::bin_factor`].
 pub(crate) fn prepare_light(
-    mut frame: FitsFrame,
+    frame: FitsFrame,
     calibration: &CalibrationMasters,
     tolerances: &seiza_calibration::MatchTolerances,
     options: &StackOptions,
 ) -> std::result::Result<(FitsFrame, Option<BayerLayout>), LightFailure> {
+    prepare_light_at(frame, calibration, tolerances, options, options.bin_factor)
+}
+
+/// [`prepare_light`], binned by `bin_factor` in place of the stack's own: 1
+/// for the sensor's full resolution.
+pub(crate) fn prepare_light_at(
+    mut frame: FitsFrame,
+    calibration: &CalibrationMasters,
+    tolerances: &seiza_calibration::MatchTolerances,
+    options: &StackOptions,
+    bin_factor: u32,
+) -> std::result::Result<(FitsFrame, Option<BayerLayout>), LightFailure> {
     calibrate_light(&mut frame, calibration, tolerances, options)?;
-    frame
-        .into_prepared_with_layout(options.demosaic)
-        .map_err(LightFailure::Debayer)
+    develop(frame, options, bin_factor).map_err(LightFailure::Image)
+}
+
+/// Debayer a calibrated frame as `options` say, and bin it by `bin_factor`
+/// in all: a superpixel demosaic is the first 2x2 of an even bin, and at an
+/// odd one, such as the sensor's full resolution, VNG stands in for it.
+/// Returns the frame and the Bayer layout it was debayered from.
+pub(crate) fn develop(
+    frame: FitsFrame,
+    options: &StackOptions,
+    bin_factor: u32,
+) -> Result<(FitsFrame, Option<BayerLayout>)> {
+    let superpixel = options.demosaic == crate::Demosaic::Superpixel;
+    let demosaic = if superpixel && !bin_factor.is_multiple_of(2) {
+        crate::Demosaic::Vng
+    } else {
+        options.demosaic
+    };
+    let (frame, cfa) = frame.into_prepared_with_layout(demosaic)?;
+    let binned = if cfa.is_some() && demosaic == crate::Demosaic::Superpixel {
+        2
+    } else {
+        1
+    };
+    Ok((frame.binned(bin_factor / binned)?, cfa))
+}
+
+/// `image`, whose channels sample the sky at `sites`, resampled so every
+/// channel samples its pixels' centres, as registration carries every frame
+/// it resamples; `image` itself without sites.
+pub(crate) fn co_site(
+    image: LinearImage,
+    sites: Option<crate::registration::ChannelSites>,
+    interpolation: crate::Interpolation,
+) -> Result<LinearImage> {
+    if sites.is_none() {
+        return Ok(image);
+    }
+    crate::registration::resample_region_sited(
+        &image,
+        image.width,
+        image.height,
+        ReferenceRegion {
+            x: 0,
+            y: 0,
+            width: image.width,
+            height: image.height,
+        },
+        crate::registration::FrameGeometry::Similarity(SimilarityTransform::IDENTITY),
+        interpolation.into(),
+        sites,
+    )
+}
+
+/// The median of each admitted frame's registration RMS: its `refined` one
+/// where there is one, and its `live` one otherwise, where known.
+fn median_registration_rms(live: &[Option<f64>], refined: &[Option<f64>]) -> Option<f64> {
+    let mut values = live
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &live)| refined.get(index).copied().flatten().or(live))
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(f64::total_cmp);
+    Some(values[values.len() / 2])
 }
 
 /// Measure noise before any registration resampling changes its variance.
@@ -2079,10 +2520,14 @@ pub(crate) fn prepare_frame(
         }
     };
     let criteria = options.acceptance;
-    if registration.rms_error_pixels > criteria.maximum_registration_rms_pixels {
+    // Registration measures in working pixels; gates and reports read the
+    // sensor's own.
+    let scale = options.scale();
+    let rms_pixels = scale.native_length(registration.rms_error_pixels);
+    if rms_pixels > criteria.maximum_registration_rms_pixels {
         return Ok(PreparedFrame::Rejected(
             FrameRejectionReason::RegistrationRms {
-                measured: registration.rms_error_pixels,
+                measured: rms_pixels,
                 maximum: criteria.maximum_registration_rms_pixels,
             },
         ));
@@ -2126,13 +2571,14 @@ pub(crate) fn prepare_frame(
             height: reference.height,
         },
     };
-    let mut registered = crate::registration::resample_region_geometry(
+    let mut registered = crate::registration::resample_region_sited(
         &frame,
         reference.width,
         reference.height,
         region,
         geometry,
         options.interpolation.into(),
+        options.channel_sites(cfa),
     )?;
     let finite_samples = registered
         .data
@@ -2159,7 +2605,7 @@ pub(crate) fn prepare_frame(
     let normalization = match NormalizationMap::estimate_with_gains(
         reference,
         Placed::on(&registered, region, reference),
-        options.normalization,
+        scale.normalization(options.normalization),
         matches!(
             options.normalization,
             NormalizationMode::LocalBackground { .. }
@@ -2294,13 +2740,15 @@ pub(crate) fn prepare_frame(
         normalization,
     )?;
     mapping.set_warp(registration.warp.clone())?;
+    mapping.set_bin_factor(options.bin_factor);
+    mapping.set_channel_sites(options.channel_sites(cfa));
     Ok(PreparedFrame::Ready(Box::new(ReadyFrame {
         registered,
         region,
         transform: registration.transform,
         matched_stars: registration.matched_stars,
-        registration_rms_pixels: registration.rms_error_pixels,
-        registration_drift_pixels: registration.drift_pixels,
+        registration_rms_pixels: rms_pixels,
+        registration_drift_pixels: scale.native_length(registration.drift_pixels),
         normalization_mean_gain,
         normalization_mean_offset,
         mapping: Box::new(mapping),
@@ -2431,6 +2879,7 @@ impl IntegrationHalf<'_> {
             },
             self.options.match_tolerances,
         );
+        self.ledger.record_registration_rms(registration_rms_pixels);
         if let Some(cache) = &mut self.frame_cache {
             cache.admit(staged);
         }
@@ -3011,6 +3460,10 @@ pub(crate) fn rotation_deviation_degrees(rotation_radians: f64) -> f64 {
 #[cfg(test)]
 #[path = "stack_canvas_tests.rs"]
 mod canvas_tests;
+
+#[cfg(test)]
+#[path = "stack_binned_tests.rs"]
+mod binned_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3823,6 +4276,7 @@ mod tests {
                 None,
                 Some(crate::lens::LensDistortion::none(160, 128)),
                 &stacker.options.registration,
+                crate::binning::Scale::NATIVE,
             )
             .unwrap(),
         );

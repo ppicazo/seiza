@@ -519,6 +519,7 @@ class StackOptions:
     maximum_drift_fraction: float
     defects: DefectMap | None
     match_tolerances: MatchTolerances
+    bin_factor: int
     def __init__(
         self,
         *,
@@ -551,6 +552,7 @@ class StackOptions:
         registration_model: str = "similarity",
         weighting: str = "equal",
         defects: DefectMap | None = None,
+        bin_factor: int = 1,
     ) -> None: ...
 
 class FrameDisposition:
@@ -616,6 +618,8 @@ class SnrSample:
     def signal(self) -> float: ...
     @property
     def channel_noise(self) -> list[float]: ...
+    @property
+    def bin_factor(self) -> int: ...
     @property
     def snr(self) -> float: ...
 
@@ -720,11 +724,15 @@ class LiveStacker:
     @property
     def rejected_frames(self) -> int: ...
     @property
+    def bin_factor(self) -> int: ...
+    @property
     def reference_integrated(self) -> bool: ...
     @property
     def reference_noise(self) -> list[float]: ...
     @property
-    def reference_mapping(self) -> dict[str, Any]: ...
+    def reference_mapping(self) -> dict[str, Any]:
+        """Processing provenance; superpixel maps include RGB channel_sites offsets."""
+        ...
     def compatible_calibration(
         self,
         light: FrameSignature,
@@ -784,6 +792,14 @@ class LiveStacker:
         sigma_high: float = 3.0,
         scratch_directory: str | Path | None = None,
     ) -> tuple[StackSnapshot, DrizzleResult]: ...
+    def reintegrate_full_resolution(
+        self,
+        *,
+        refine: bool = True,
+        sigma_low: float = 3.0,
+        sigma_high: float = 3.0,
+        scratch_directory: str | Path | None = None,
+    ) -> tuple[StackSnapshot, int, float | None]: ...
     def finish(self, output: str | Path | None = None) -> StackSnapshot: ...
 
 class PipelineReport:

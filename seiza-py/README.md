@@ -384,7 +384,9 @@ frame's noise, the unit of the weights; under equal weighting they are empty.
 `seiza.frame_noise(image)` measures any linear array the same way. Each
 accepted frame's `mapping`, and `LiveStacker.reference_mapping` for the
 reference, is a dict of its registration and normalization, to keep beside
-the frame.
+the frame. Superpixel mappings include `channel_sites`, three `[x, y]`
+offsets in source pixels in RGB order. Saved contexts retain these offsets,
+so crop extraction from equally prepared source frames keeps colours aligned.
 
 `LiveStacker.open_prepared_fits(path)` opens a stack from a frame already
 calibrated and debayered, keeping its FITS header cards, so you can correct a
@@ -609,6 +611,37 @@ Each of those reads every frame from its file and prepares it again. Calling
 frames keeps each admitted frame's registered image on disk as it is stacked,
 about four bytes per pixel per channel for each frame, so a reintegration reads
 that instead and gives the same result sooner.
+
+`StackOptions(bin_factor=2)` (or 3, or 4) area-mean bins each light after it is
+calibrated, repaired and debayered, before registration, so a large sensor or a
+mosaic stacks quickly and in a quarter (or a sixteenth) of the memory. Pixel
+options keep their meaning in the sensor's pixels, and `registration_rms_pixels`
+reports in them; the live view, snapshots and each frame's mapping (which then
+carries `"bin_factor"`) are on the binned grid, and `measure_depth()` says what
+the stack was binned by, since binning lowers each pixel's noise. Bayer drizzle
+needs single photosites, so it is refused with a bin factor above 1. With an even
+bin factor, `demosaic="superpixel"` makes each 2x2 cell of a colour sensor one
+pixel, about ten times faster than VNG; registration reads each colour from where
+its photosite lies, so the stack's colours line up. When the session is done,
+reintegrate the same frames at full resolution without registering them again:
+
+```python
+options = seiza.StackOptions(bin_factor=2, normalization="local-background")
+stacker = seiza.LiveStacker("light-001.fits", options=options)
+...                                         # push the rest as usual
+full, refined, rms = stacker.reintegrate_full_resolution()
+full.write_fits("stack-full.fits")          # WCS carried to the sensor's grid
+```
+
+Each frame's transform is carried exactly from the binned grid, and with
+`refine=True` (the default) a single field refits it against stars detected at
+full resolution, as registration would find them there; a mosaic refits each
+frame against the canvas the other frames build at full resolution. `refined`
+counts the frames refitted and `rms` is the median registration RMS in the
+sensor's pixels, or None when no frame's is known. A superpixel stack is
+demosaiced with VNG at full resolution. For a quicker look,
+`reintegrate_drizzled(scale=2)` on a stack binned by 2 drops each frame's sensor
+pixels onto the sensor's grid, with rejection decided at the binned resolution.
 
 Frames calibrated, registered and normalized somewhere else, one size on one
 pixel grid with uncovered samples as NaN, take the same rejection through

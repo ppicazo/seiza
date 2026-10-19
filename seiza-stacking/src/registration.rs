@@ -1,3 +1,4 @@
+use crate::binning::Scale;
 use crate::{Error, LinearImage, Result};
 use rayon::prelude::*;
 use seiza::{DetectBackend, DetectConfig, DetectedStar};
@@ -130,6 +131,22 @@ impl SimilarityTransform {
     pub fn displacement_at(self, x: f64, y: f64) -> f64 {
         let (mapped_x, mapped_y) = self.apply(x, y);
         (mapped_x - x).hypot(mapped_y - y)
+    }
+
+    /// This transform between source and reference grids each `scale` times
+    /// as fine, or `1 / b` for both binned by `b`: `C ∘ T ∘ C⁻¹` for the map
+    /// `C(x) = scale · x + c`, `c = (scale − 1) / 2`, that carries a pixel
+    /// centre to the finer grid. Scale and rotation stand, and the
+    /// translation becomes `scale · t + (I − sR)·(c, c)`.
+    pub(crate) fn rescaled(self, scale: f64) -> Self {
+        let offset = (scale - 1.0) / 2.0;
+        let cosine = self.rotation_radians.cos() * self.scale;
+        let sine = self.rotation_radians.sin() * self.scale;
+        Self {
+            translation_x: scale * self.translation_x + offset - (cosine - sine) * offset,
+            translation_y: scale * self.translation_y + offset - (sine + cosine) * offset,
+            ..self
+        }
     }
 }
 
@@ -485,6 +502,63 @@ impl PolynomialWarp {
         }
     }
 
+    /// This warp between grids each `scale` times as fine, as
+    /// [`SimilarityTransform::rescaled`] carries a similarity: its centre
+    /// moves to the finer grid and its scale stretches with it, its constant
+    /// terms carry through the same map and the others stretch by `scale`,
+    /// and its lens moves with it. Exact for every order.
+    pub(crate) fn rescaled(&self, scale: f64) -> Self {
+        let offset = (scale - 1.0) / 2.0;
+        let carry = |coefficients: &[f64]| {
+            coefficients
+                .iter()
+                .enumerate()
+                .map(|(term, &value)| {
+                    if term == 0 {
+                        scale * value + offset
+                    } else {
+                        scale * value
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        Self {
+            order: self.order,
+            center_x: scale * self.center_x + offset,
+            center_y: scale * self.center_y + offset,
+            scale: scale * self.scale,
+            x: carry(&self.x),
+            y: carry(&self.y),
+            distortion: self.distortion.map(|distortion| distortion.rescaled(scale)),
+        }
+    }
+
+    /// This warp to a source grid `scale` times as fine, the reference grid
+    /// as it is: the source side alone of [`Self::rescaled`], `C ∘ W`, its
+    /// lens moving with the source.
+    pub(crate) fn source_rescaled(&self, scale: f64) -> Self {
+        let offset = (scale - 1.0) / 2.0;
+        let carry = |coefficients: &[f64]| {
+            coefficients
+                .iter()
+                .enumerate()
+                .map(|(term, &value)| {
+                    if term == 0 {
+                        scale * value + offset
+                    } else {
+                        scale * value
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        Self {
+            x: carry(&self.x),
+            y: carry(&self.y),
+            distortion: self.distortion.map(|distortion| distortion.rescaled(scale)),
+            ..self.clone()
+        }
+    }
+
     /// This polynomial read as reaching undistorted source positions, which
     /// `distortion` carries onto the source's pixels.
     pub(crate) fn with_distortion(self, distortion: crate::lens::LensDistortion) -> Self {
@@ -656,6 +730,11 @@ const DISTORTION_STARS: usize = 2_000;
 /// How far a star may sit from its partner under the similarity transform
 /// to be paired for the polynomial fit.
 const DISTORTION_PAIR_PIXELS: f64 = 2.0;
+/// [`DISTORTION_PAIR_PIXELS`] on a grid binned at `scale`, at least a pixel.
+fn distortion_pair_pixels(scale: Scale) -> f64 {
+    scale.floored_length(DISTORTION_PAIR_PIXELS, 1.0)
+}
+
 /// Paired stars needed per polynomial term before a frame takes the
 /// polynomial rather than its similarity.
 const DISTORTION_PAIRS_PER_TERM: usize = 5;
@@ -757,25 +836,42 @@ pub struct Registrar {
     dense_stars: Vec<DetectedStar>,
     dense_index: StarSpatialIndex,
     maximum_drift_pixels: f64,
+    /// In working pixels; see [`Self::at_scale`].
     options: RegistrationOptions,
+    /// The bin factor of the frames it registers.
+    scale: Scale,
 }
 
 impl Registrar {
     /// Detect stars in the reference frame and prepare the matching index.
     pub fn new(reference: &LinearImage, options: RegistrationOptions) -> Result<Self> {
+        Self::at_scale(reference, &options, Scale::NATIVE)
+    }
+
+    /// [`Self::new`] for a reference binned at `scale`, with `options` in
+    /// native pixels as a host writes them: they, and every pixel constant
+    /// registration uses, are read on the binned grid.
+    pub(crate) fn at_scale(
+        reference: &LinearImage,
+        options: &RegistrationOptions,
+        scale: Scale,
+    ) -> Result<Self> {
         options.validate()?;
-        let stars = detect(reference, &options, options.dense_star_count());
-        Self::from_stars(reference.width, reference.height, stars, options)
+        let options = scale.registration(options);
+        let stars = detect(reference, &options, options.dense_star_count(), scale);
+        Self::from_stars(reference.width, reference.height, stars, options, scale)
     }
 
     /// A registrar for a `width` by `height` reference whose stars were
     /// detected already, brightest first, as [`Self::detected_stars`] gives
-    /// them back.
+    /// them back. `options` are in working pixels, as
+    /// [`Scale::registration`] gives them, for frames binned at `scale`.
     pub(crate) fn from_stars(
         width: usize,
         height: usize,
         stars: Vec<DetectedStar>,
         options: RegistrationOptions,
+        scale: Scale,
     ) -> Result<Self> {
         options.validate()?;
         // Saved panel detections enter here without passing through the
@@ -805,7 +901,7 @@ impl Registrar {
             reference_stars.truncate(options.maximum_stars);
             dense
         };
-        let dense_index = StarSpatialIndex::new(&dense_stars, DISTORTION_PAIR_PIXELS);
+        let dense_index = StarSpatialIndex::new(&dense_stars, distortion_pair_pixels(scale));
         if reference_stars.len() < options.minimum_matches.max(3) {
             return Err(Error::Registration(format!(
                 "reference frame has only {} usable stars; need at least {}",
@@ -832,6 +928,7 @@ impl Registrar {
             dense_index,
             maximum_drift_pixels,
             options,
+            scale,
         })
     }
 
@@ -861,7 +958,12 @@ impl Registrar {
     /// Detect a source frame's stars once, to register it against several
     /// references with [`Self::register_stars`].
     pub(crate) fn detect_source_stars(&self, source: &LinearImage) -> Vec<DetectedStar> {
-        detect(source, &self.options, self.options.dense_star_count())
+        detect(
+            source,
+            &self.options,
+            self.options.dense_star_count(),
+            self.scale,
+        )
     }
 
     /// [`Self::register`] with the source's stars already detected.
@@ -1001,15 +1103,15 @@ impl Registrar {
         source_stars: &[DetectedStar],
     ) -> Option<(PolynomialWarp, usize, f64)> {
         let order = self.options.model.polynomial_order()?.max(seed.order());
-        let index = StarSpatialIndex::new(source_stars, DISTORTION_PAIR_PIXELS);
+        let pairing = distortion_pair_pixels(self.scale);
+        let index = StarSpatialIndex::new(source_stars, pairing);
         let mut seen = std::collections::HashSet::new();
         let pairs = self
             .dense_stars
             .iter()
             .filter_map(|reference| {
                 let (x, y) = seed.apply(reference.x, reference.y);
-                let (matched, _) =
-                    index.nearest_within(x, y, source_stars, DISTORTION_PAIR_PIXELS)?;
+                let (matched, _) = index.nearest_within(x, y, source_stars, pairing)?;
                 if !seen.insert(matched) {
                     return None;
                 }
@@ -1039,7 +1141,7 @@ impl Registrar {
                     x,
                     y,
                     &self.dense_stars,
-                    DISTORTION_PAIR_PIXELS,
+                    distortion_pair_pixels(self.scale),
                 )?;
                 let reference = &self.dense_stars[index];
                 Some(((reference.x, reference.y), (star.x, star.y)))
@@ -1067,7 +1169,7 @@ impl Registrar {
                 };
             let mut residuals = pairs.iter().map(residual).collect::<Vec<_>>();
             residuals.sort_by(f64::total_cmp);
-            let limit = 3.0 * residuals[residuals.len() / 2] + 0.05;
+            let limit = 3.0 * residuals[residuals.len() / 2] + self.scale.length(0.05);
             pairs.retain(|pair| residual(pair) <= limit);
             warp = Some(fitted);
             if pairs.len() < minimum {
@@ -1133,7 +1235,7 @@ impl Registrar {
 /// and a narrow overlap holds many, so stars within a few pixels of an edge
 /// or of an undefined reference sample are left out. `None` when fewer than
 /// the minimum matches pair up. Up to `stars` of the brightest on each side
-/// take part.
+/// take part. `options` are in working pixels, for images binned at `scale`.
 pub(crate) fn refine_similarity(
     reference: &LinearImage,
     source: &LinearImage,
@@ -1141,12 +1243,13 @@ pub(crate) fn refine_similarity(
     initial: SimilarityTransform,
     options: &RegistrationOptions,
     stars: usize,
+    scale: Scale,
 ) -> Option<RegistrationResult> {
-    const MARGIN: isize = 6;
+    let margin = scale.centroid_margin(6);
     let defined = |image: &LinearImage, star: &DetectedStar| {
         let (cx, cy) = (star.x.round() as isize, star.y.round() as isize);
-        (cy - MARGIN..=cy + MARGIN).all(|y| {
-            (cx - MARGIN..=cx + MARGIN).all(|x| {
+        (cy - margin..=cy + margin).all(|y| {
+            (cx - margin..=cx + margin).all(|x| {
                 x >= 0
                     && y >= 0
                     && (x as usize) < image.width
@@ -1156,7 +1259,7 @@ pub(crate) fn refine_similarity(
             })
         })
     };
-    let reference_stars = detect(reference, options, stars)
+    let reference_stars = detect(reference, options, stars, scale)
         .into_iter()
         .filter(|star| defined(reference, star))
         .collect::<Vec<_>>();
@@ -1582,6 +1685,125 @@ impl From<Interpolation> for Sampling {
             Interpolation::Lanczos3 => Self::Lanczos3,
         }
     }
+}
+
+/// Where each channel of a frame samples the sky, relative to its pixel's
+/// centre, in its own pixels: red, green and blue.
+///
+/// A [`crate::Demosaic::Superpixel`] pixel takes its red and blue from one
+/// photosite each, half a sensor pixel from the 2x2 cell's centre
+/// diagonally, and its green from the two greens either side of it, whose
+/// mean lies at the centre. Binning on by the rest of the bin factor keeps
+/// those offsets in sensor pixels, so in the frame's own they are
+/// `±0.5 / bin_factor`.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct ChannelSites(pub(crate) [(f64, f64); 3]);
+
+impl ChannelSites {
+    pub(crate) fn validate(self) -> Result<()> {
+        if self
+            .0
+            .iter()
+            .any(|&(x, y)| !x.is_finite() || !y.is_finite() || x.abs() > 0.5 || y.abs() > 0.5)
+        {
+            return Err(Error::Registration(
+                "channel sites must be finite offsets within half a pixel".into(),
+            ));
+        }
+        Ok(())
+    }
+    pub(crate) fn rescaled(self, scale: f64) -> Self {
+        Self(self.0.map(|(x, y)| (x * scale, y * scale)))
+    }
+
+    /// The sites of a superpixel frame of `layout`, binned by `bin_factor`
+    /// in all.
+    pub(crate) fn superpixel(layout: crate::BayerLayout, bin_factor: u32) -> Self {
+        let mut sites = [(0.0, 0.0); 3];
+        for (x, y) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            let channel = layout.channel_at(x, y);
+            if channel != 1 {
+                sites[channel] = (
+                    (x as f64 - 0.5) / f64::from(bin_factor),
+                    (y as f64 - 0.5) / f64::from(bin_factor),
+                );
+            }
+        }
+        Self(sites)
+    }
+}
+
+/// [`resample_region_geometry`] for a frame whose channels sample the sky
+/// at `sites`: each output pixel takes every channel from where that
+/// channel's samples put the pixel's centre, so its colours line up.
+/// Without sites it is [`resample_region_geometry`] itself.
+pub(crate) fn resample_region_sited(
+    source: &LinearImage,
+    reference_width: usize,
+    reference_height: usize,
+    region: ReferenceRegion,
+    geometry: FrameGeometry<'_>,
+    sampling: Sampling,
+    sites: Option<ChannelSites>,
+) -> Result<LinearImage> {
+    let Some(ChannelSites(sites)) = sites.filter(|_| source.channels == 3) else {
+        return resample_region_geometry(
+            source,
+            reference_width,
+            reference_height,
+            region,
+            geometry,
+            sampling,
+        );
+    };
+    if let Sampling::NearestPhotosite(_) = sampling {
+        return Err(Error::Registration(
+            "photosite sampling takes no channel sites".into(),
+        ));
+    }
+    // A channel sampled at its site `d` holds the sky at `x + d` at pixel
+    // `x`, so the sky at source position `p` is its sample at `p − d`.
+    let channels = sites
+        .iter()
+        .enumerate()
+        .map(|(channel, &(dx, dy))| {
+            let source = source.channel(channel)?;
+            let shifted = |(x, y): (f64, f64)| (x - dx, y - dy);
+            match geometry {
+                FrameGeometry::Similarity(transform) => {
+                    transform.validate()?;
+                    let inverse = transform.inverse_map();
+                    resample_region_with_inverse(
+                        &source,
+                        reference_width,
+                        reference_height,
+                        region,
+                        |x, y| shifted(inverse(x, y)),
+                        sampling,
+                    )
+                }
+                FrameGeometry::Warp(warp) => {
+                    warp.validate()?;
+                    resample_region_with_inverse(
+                        &source,
+                        reference_width,
+                        reference_height,
+                        region,
+                        |x, y| shifted(warp.apply(x, y)),
+                        sampling,
+                    )
+                }
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut data = vec![0.0_f32; region.width * region.height * 3];
+    data.par_chunks_mut(3).enumerate().for_each(|(pixel, rgb)| {
+        for (value, channel) in rgb.iter_mut().zip(&channels) {
+            *value = channel.data[pixel];
+        }
+    });
+    LinearImage::new(region.width, region.height, 3, data)
 }
 
 /// How a resampled sample is formed from the source.
@@ -2073,28 +2295,30 @@ fn retain_scored_transform(
 }
 
 /// Up to `max_stars` of an image's brightest stars, as registration
-/// detects them.
+/// detects them in an image binned at `scale`.
 pub(crate) fn detect_stars(
     image: &LinearImage,
     options: &RegistrationOptions,
     max_stars: usize,
+    scale: Scale,
 ) -> Vec<DetectedStar> {
-    detect(image, options, max_stars)
+    detect(image, options, max_stars, scale)
 }
 
 fn detect(
     image: &LinearImage,
     options: &RegistrationOptions,
     max_stars: usize,
+    scale: Scale,
 ) -> Vec<DetectedStar> {
     let mut luma = image.luminance();
     normalize_for_detection(&mut luma);
-    let config = DetectConfig {
+    let config = scale.detection(DetectConfig {
         backend: DetectBackend::F32,
         sigma: options.detection_sigma,
         max_stars,
         ..DetectConfig::default()
-    };
+    });
     seiza::detect_stars_luma_f32(&luma, image.width as u32, image.height as u32, &config)
 }
 
@@ -2590,6 +2814,7 @@ mod tests {
                 model: RegistrationModel::Quadratic,
                 ..RegistrationOptions::default()
             },
+            Scale::NATIVE,
         )
         .unwrap();
         let old = registrar.warp_stars(SimilarityTransform::IDENTITY, &source);
@@ -3044,6 +3269,99 @@ mod tests {
         )
         .unwrap();
         assert!(sparse.fit_warp(2, quadratic.transform, &[]).is_none());
+    }
+
+    /// A superpixel frame's red and blue sit half a sensor pixel off the
+    /// cell's centre, and resampling from those sites gives every channel
+    /// the same sky: on a plane, which bilinear interpolation follows
+    /// exactly, the three channels agree everywhere both reach, through a
+    /// shift and a half turn alike.
+    #[test]
+    fn resampling_from_channel_sites_lines_colours_up() {
+        let rggb = crate::BayerLayout {
+            pattern: seiza_fits::BayerPattern::Rggb,
+            x_offset: 0,
+            y_offset: 0,
+        };
+        let sites = ChannelSites::superpixel(rggb, 2);
+        assert_eq!(sites.0, [(-0.25, -0.25), (0.0, 0.0), (0.25, 0.25)]);
+        let gbrg = crate::BayerLayout {
+            pattern: seiza_fits::BayerPattern::Gbrg,
+            x_offset: 0,
+            y_offset: 0,
+        };
+        assert_eq!(
+            ChannelSites::superpixel(gbrg, 4).0,
+            [(-0.125, 0.125), (0.0, 0.0), (0.125, -0.125)]
+        );
+        // A plane on the sensor, superpixelled: each colour holds the plane
+        // where its photosite lies.
+        let plane = |x: f64, y: f64| (100.0 + 3.0 * x - 2.0 * y) as f32;
+        let (width, height) = (64, 48);
+        let mosaic = (0..width * height)
+            .map(|index| plane((index % width) as f64, (index / width) as f64))
+            .collect();
+        let frame = LinearImage::new(width, height, 1, mosaic)
+            .unwrap()
+            .debayer_with(rggb, crate::Demosaic::Superpixel)
+            .unwrap();
+        let (w, h) = (frame.width, frame.height);
+        let region = ReferenceRegion {
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+        };
+        for transform in [
+            SimilarityTransform::IDENTITY,
+            SimilarityTransform {
+                translation_x: 1.3,
+                translation_y: -0.6,
+                ..SimilarityTransform::IDENTITY
+            },
+            SimilarityTransform {
+                scale: 1.0,
+                rotation_radians: std::f64::consts::PI,
+                translation_x: (w - 1) as f64,
+                translation_y: (h - 1) as f64,
+            },
+        ] {
+            let sited = resample_region_sited(
+                &frame,
+                w,
+                h,
+                region,
+                FrameGeometry::Similarity(transform),
+                Sampling::Bilinear,
+                Some(sites),
+            )
+            .unwrap();
+            let unsited = resample_region_sited(
+                &frame,
+                w,
+                h,
+                region,
+                FrameGeometry::Similarity(transform),
+                Sampling::Bilinear,
+                None,
+            )
+            .unwrap();
+            let mut compared = 0;
+            for (pixel, unsited) in sited.data.chunks_exact(3).zip(unsited.data.chunks_exact(3)) {
+                if pixel.iter().all(|value| value.is_finite()) {
+                    assert!((pixel[0] - pixel[1]).abs() < 1e-3, "{pixel:?}");
+                    assert!((pixel[2] - pixel[1]).abs() < 1e-3, "{pixel:?}");
+                    // Green sits at the centre, where it was already.
+                    assert_eq!(pixel[1], unsited[1]);
+                    compared += 1;
+                }
+            }
+            assert!(compared > w * h / 2, "{transform:?}");
+            // Read from the pixel centres, red and blue differ by a sensor
+            // pixel of the plane's slope in each axis.
+            let first = &unsited.data[(h / 2 * w + w / 2) * 3..][..3];
+            assert!((first[2] - first[0]).abs() > 0.5, "{first:?}");
+        }
     }
 
     #[test]

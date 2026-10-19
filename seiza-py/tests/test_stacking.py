@@ -55,6 +55,11 @@ def test_stack_options_choose_the_demosaic():
     assert seiza.StackOptions().demosaic == "vng"
     for method in ["vng", "mhc", "bilinear"]:
         assert seiza.StackOptions(demosaic=method).demosaic == method
+    options = seiza.StackOptions(demosaic="superpixel", bin_factor=2)
+    assert options.demosaic == "superpixel"
+    # A superpixel bins each 2x2 cell, so it needs an even bin factor.
+    with pytest.raises(ValueError, match="superpixel"):
+        seiza.StackOptions(demosaic="superpixel")
 
 
 def test_live_stacker_accepts_numpy_and_returns_owned_snapshot():
@@ -913,6 +918,55 @@ def test_snapshots_write_with_the_reference_headers(tmp_path):
         assert hdus[0].header["CRVAL1"] == 83.8
 
 
+def test_binned_stack_reintegrates_at_full_resolution(tmp_path):
+    image, paths = lights_with_a_header(tmp_path)
+    assert seiza.StackOptions().bin_factor == 1
+    with pytest.raises(ValueError, match="bin factor"):
+        seiza.StackOptions(bin_factor=5)
+    options = seiza.StackOptions(normalization="none", rejection="none", bin_factor=2)
+    assert options.bin_factor == 2
+    stacker = seiza.LiveStacker(paths[0], options=options)
+    assert stacker.bin_factor == 2
+    assert stacker.reference_mapping["bin_factor"] == 2
+    for path in paths[1:]:
+        disposition = stacker.push_fits(path)
+        assert disposition.accepted
+        assert disposition.mapping["bin_factor"] == 2
+
+    # The live stack is on the binned grid, its WCS with it.
+    binned_output = tmp_path / "binned.fits"
+    stacker.snapshot().write_fits(binned_output)
+    with fits.open(binned_output) as hdus:
+        assert hdus[0].data.shape == (64, 80)
+        assert hdus[0].header["CRPIX1"] == 40.5
+        assert hdus[0].header["CDELT1"] == pytest.approx(-0.0006)
+        assert hdus[0].header["SEIZABIN"] == 2
+
+    full, refined, rms = stacker.reintegrate_full_resolution()
+    assert full.image.shape == image.shape
+    assert refined == 2
+    assert rms is not None and 0.0 <= rms < 1.0
+    np.testing.assert_allclose(full.image, image, rtol=0.0, atol=1.0e-2)
+    full_output = tmp_path / "full.fits"
+    full.write_fits(full_output)
+    with fits.open(full_output) as hdus:
+        assert hdus[0].header["CRPIX1"] == pytest.approx(80.5)
+        assert hdus[0].header["CDELT1"] == pytest.approx(-0.0003)
+        assert "SEIZABIN" not in hdus[0].header
+
+    unrefined, refined, _ = stacker.reintegrate_full_resolution(refine=False)
+    assert refined == 0
+    assert unrefined.image.shape == image.shape
+    # A drizzle by the bin factor drops each frame's sensor pixels back onto
+    # the sensor's grid.
+    _, drizzled = stacker.reintegrate_drizzled(scale=2)
+    assert drizzled.image.shape == image.shape
+    # A depth reading says what the stack was binned by.
+    depth = stacker.measure_depth()
+    if depth is not None:
+        assert depth.bin_factor == 2
+
+
 def test_live_stacker_state_describes_the_stack(tmp_path):
     _, paths = lights_with_a_header(tmp_path, count=2)
     stacker = seiza.LiveStacker(paths[0], options=no_adjustment_options())
@@ -1161,3 +1215,24 @@ def test_defects_are_learned_from_dithered_lights_and_repaired(tmp_path):
         seiza.DefectMap(4, 4, [16])
     with pytest.raises(seiza.StackError, match="persistence"):
         seiza.detect_defects(lights, persistence=2.0)
+
+
+@pytest.mark.parametrize("bin_factor", [2, 4])
+def test_superpixel_mapping_channel_sites_survive_context(tmp_path, bin_factor):
+    image = synthetic_star_field(height=256, width=320)
+    paths = [tmp_path / f"sites-{i}.fits" for i in range(2)]
+    for path in paths:
+        fits.writeto(path, image, header=fits.Header({"BAYERPAT": "RGGB"}))
+    options = seiza.StackOptions(demosaic="superpixel", bin_factor=bin_factor,
+                                 normalization="none", rejection="none")
+    stacker = seiza.LiveStacker(paths[0], options=options)
+    d = 0.5 / bin_factor
+    sites = [[-d, -d], [0.0, 0.0], [d, d]]
+    assert stacker.reference_mapping["channel_sites"] == sites
+    disposition = stacker.push_fits(paths[1])
+    assert disposition.accepted
+    assert disposition.mapping["channel_sites"] == sites
+    context = tmp_path / "sites.seiza"
+    stacker.save_context(context)
+    reopened = seiza.LiveStacker.open_context(context)
+    assert reopened.reference_mapping["channel_sites"] == sites

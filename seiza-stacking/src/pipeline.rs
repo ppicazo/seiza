@@ -243,6 +243,22 @@ impl PoolPipelineMemory {
         }
     }
 
+    /// [`Self::for_reference`] for a stack whose lights are binned by
+    /// `bin_factor`, from its binned `reference`: each worker decodes,
+    /// calibrates and debayers a frame at the sensor's size before binning
+    /// it, while integration holds a binned one.
+    pub(crate) fn for_binned_reference(reference: &crate::LinearImage, bin_factor: u32) -> Self {
+        let area = (bin_factor as usize).pow(2);
+        let binned = Self::for_reference(reference.pixel_count(), reference.sample_count());
+        Self {
+            integration_bytes: binned.integration_bytes,
+            ..Self::for_reference(
+                reference.pixel_count().saturating_mul(area),
+                reference.sample_count().saturating_mul(area),
+            )
+        }
+    }
+
     /// Total frame estimate for a resolved worker count, or zero for no work.
     pub fn in_flight_bytes(self, workers: usize) -> usize {
         if workers == 0 {
@@ -276,10 +292,10 @@ fn timed<T>(work: impl FnOnce() -> T) -> (T, Duration) {
 fn resolve_pool_workers(
     options: &PipelineOptions,
     reference: &crate::LinearImage,
+    bin_factor: u32,
     pool: &rayon::ThreadPool,
 ) -> Result<usize> {
-    let memory =
-        PoolPipelineMemory::for_reference(reference.pixel_count(), reference.sample_count());
+    let memory = PoolPipelineMemory::for_binned_reference(reference, bin_factor);
     let affordable = options
         .max_in_flight_bytes
         .saturating_sub(memory.integration_bytes)
@@ -482,9 +498,15 @@ impl LiveStacker {
             return Ok(PoolPipelineReport::default());
         }
 
-        let frame_bytes = self.reference.data.len() * std::mem::size_of::<f32>();
+        // Each light is decoded and prepared at the sensor's size, before
+        // any binning.
+        let frame_bytes = self.reference.data.len()
+            * std::mem::size_of::<f32>()
+            * (self.options.bin_factor as usize).pow(2);
         let workers = match compute.0 {
-            Some(pool) => resolve_pool_workers(options, &self.reference, pool)?,
+            Some(pool) => {
+                resolve_pool_workers(options, &self.reference, self.options.bin_factor, pool)?
+            }
             None => options.resolve_workers(frame_bytes),
         }
         .min(paths.len());
@@ -538,9 +560,9 @@ impl LiveStacker {
         let (preparation, mut integration) = self.split_for_pipeline();
         let mut report = PoolPipelineReport {
             workers,
-            estimated_in_flight_bytes: PoolPipelineMemory::for_reference(
-                preparation.reference.pixel_count(),
-                preparation.reference.sample_count(),
+            estimated_in_flight_bytes: PoolPipelineMemory::for_binned_reference(
+                preparation.reference,
+                preparation.options.bin_factor,
             )
             .in_flight_bytes(workers),
             ..PoolPipelineReport::default()
@@ -665,9 +687,9 @@ impl LiveStacker {
         let preparation = &preparation;
         let mut report = PoolPipelineReport {
             workers,
-            estimated_in_flight_bytes: PoolPipelineMemory::for_reference(
-                preparation.reference.pixel_count(),
-                preparation.reference.sample_count(),
+            estimated_in_flight_bytes: PoolPipelineMemory::for_binned_reference(
+                preparation.reference,
+                preparation.options.bin_factor,
             )
             .in_flight_bytes(workers),
             ..PoolPipelineReport::default()
@@ -745,9 +767,9 @@ impl LiveStacker {
         let mut report = PoolPipelineReport {
             workers: 1,
             execution: PipelineExecution::SequentialRayonFallback,
-            estimated_in_flight_bytes: PoolPipelineMemory::for_reference(
-                self.reference.pixel_count(),
-                self.reference.sample_count(),
+            estimated_in_flight_bytes: PoolPipelineMemory::for_binned_reference(
+                &self.reference,
+                self.options.bin_factor,
             )
             .sequential_bytes,
             ..PoolPipelineReport::default()

@@ -241,6 +241,66 @@ impl LinearImage {
         Self::new(region.width, region.height, self.channels, data)
     }
 
+    /// The image binned by `factor`: each output sample is the mean of the
+    /// finite samples of its channel in a `factor` by `factor` block, and
+    /// `NaN` where none is finite. Rows and columns past the last whole
+    /// block are dropped, so the output is `width / factor` by
+    /// `height / factor` and output pixel `x` is centred on input pixel
+    /// `factor · x + (factor − 1) / 2`.
+    ///
+    /// A mean rather than a sum keeps samples on their input scale, so
+    /// saturation levels and declared ranges mean what they did. A factor of
+    /// 1 returns a copy.
+    pub fn binned(&self, factor: u32) -> Result<Self> {
+        let factor = factor as usize;
+        if factor == 0 || factor > self.width || factor > self.height {
+            return Err(Error::InvalidImage(format!(
+                "cannot bin a {}x{} image by {factor}",
+                self.width, self.height
+            )));
+        }
+        if factor == 1 {
+            return Ok(self.clone());
+        }
+        let (width, height, channels) = (self.width / factor, self.height / factor, self.channels);
+        let mut data = vec![0.0_f32; width * height * channels];
+        data.par_chunks_mut(width * channels)
+            .enumerate()
+            .for_each(|(row, output)| {
+                for (column, pixel) in output.chunks_exact_mut(channels).enumerate() {
+                    for (channel, value) in pixel.iter_mut().enumerate() {
+                        let (mut sum, mut count) = (0.0_f64, 0_u32);
+                        for y in row * factor..(row + 1) * factor {
+                            let start = (y * self.width + column * factor) * channels + channel;
+                            for &sample in self.data[start..=start + (factor - 1) * channels]
+                                .iter()
+                                .step_by(channels)
+                            {
+                                if sample.is_finite() {
+                                    sum += f64::from(sample);
+                                    count += 1;
+                                }
+                            }
+                        }
+                        *value = if count == 0 {
+                            f32::NAN
+                        } else {
+                            (sum / f64::from(count)) as f32
+                        };
+                    }
+                }
+            });
+        Self::new(width, height, channels, data)
+    }
+
+    /// [`Self::binned`], keeping this image itself at a factor of 1.
+    pub(crate) fn into_binned(self, factor: u32) -> Result<Self> {
+        if factor == 1 {
+            return Ok(self);
+        }
+        self.binned(factor)
+    }
+
     /// One luminance value per pixel: the sample itself for mono, Rec.709 luma
     /// for RGB.
     pub fn luminance(&self) -> Vec<f32> {
@@ -258,12 +318,16 @@ impl LinearImage {
         self.debayer_with(layout, Demosaic::default())
     }
 
-    /// Debayer a one-channel CFA frame with the given method.
+    /// Debayer a one-channel CFA frame with the given method. A
+    /// [`Demosaic::Superpixel`] frame comes back half the size on each side.
     pub(crate) fn debayer_with(self, layout: BayerLayout, demosaic: Demosaic) -> Result<Self> {
         if self.channels != 1 {
             return Err(Error::InvalidImage(
                 "only a one-channel CFA image can be debayered".into(),
             ));
+        }
+        if demosaic == Demosaic::Superpixel {
+            return self.superpixel(layout);
         }
         // VNG estimates each missing colour from colour differences, which
         // assumes white-balanced channels; raw sensor channels are not (on an
@@ -317,7 +381,7 @@ impl LinearImage {
                     Demosaic::Mhc => {
                         malvar_he_cutler_rows(&balanced, width, height, layout, first_row, rows)
                     }
-                    Demosaic::Bilinear => {}
+                    Demosaic::Bilinear | Demosaic::Superpixel => {}
                 }
                 for (band_row, out_row) in rows.chunks_exact_mut(row_samples).enumerate() {
                     let y = first_row + band_row;
@@ -326,6 +390,65 @@ impl LinearImage {
                 }
             });
         Self::new(width, height, 3, rgb)
+    }
+
+    /// [`Demosaic::Superpixel`]: each 2x2 cell of the mosaic, from the top
+    /// left, becomes one RGB pixel, of its red photosite, the mean of its
+    /// finite greens, and its blue photosite. A last odd row or column is
+    /// dropped. Nothing is interpolated, and every cell is one each of red
+    /// and blue and two greens on a diagonal, whatever the pattern's phase.
+    fn superpixel(&self, layout: BayerLayout) -> Result<Self> {
+        let (width, height) = (self.width / 2, self.height / 2);
+        if width == 0 || height == 0 {
+            return Err(Error::InvalidImage(format!(
+                "a {}x{} mosaic has no whole 2x2 cell to superpixel",
+                self.width, self.height
+            )));
+        }
+        let cell = |channel: usize| {
+            [(0, 0), (1, 0), (0, 1), (1, 1)]
+                .into_iter()
+                .filter(move |&(x, y)| layout.channel_at(x, y) == channel)
+        };
+        let red = cell(0).next().expect("a Bayer cell holds a red photosite");
+        let blue = cell(2).next().expect("a Bayer cell holds a blue photosite");
+        let mut greens = cell(1);
+        let greens = [
+            greens.next().expect("a Bayer cell holds two greens"),
+            greens.next().expect("a Bayer cell holds two greens"),
+        ];
+        let mut rgb = vec![0.0_f32; width * height * 3];
+        rgb.par_chunks_mut(width * 3)
+            .enumerate()
+            .for_each(|(row, out)| {
+                let at = |column: usize, (x, y): (usize, usize)| {
+                    self.data[(2 * row + y) * self.width + 2 * column + x]
+                };
+                for (column, pixel) in out.chunks_exact_mut(3).enumerate() {
+                    let (first, second) = (at(column, greens[0]), at(column, greens[1]));
+                    pixel[0] = at(column, red);
+                    pixel[1] = match (first.is_finite(), second.is_finite()) {
+                        (true, true) => (first + second) * 0.5,
+                        (true, false) => first,
+                        (false, true) => second,
+                        (false, false) => f32::NAN,
+                    };
+                    pixel[2] = at(column, blue);
+                }
+            });
+        Self::new(width, height, 3, rgb)
+    }
+
+    /// Channel `channel` alone, as a one-channel image.
+    pub(crate) fn channel(&self, channel: usize) -> Result<Self> {
+        let data = self
+            .data
+            .iter()
+            .skip(channel)
+            .step_by(self.channels)
+            .copied()
+            .collect();
+        Self::new(self.width, self.height, 1, data)
     }
 }
 
@@ -445,6 +568,17 @@ pub enum Demosaic {
     /// The mean of each colour's neighbours: fastest and softest, and it
     /// pulls each colour's centroid toward its own photosites.
     Bilinear,
+    /// Each 2x2 cell of the mosaic becomes one RGB pixel: its red and blue
+    /// photosites and the mean of its two greens, with nothing
+    /// interpolated. It halves each side, so it is a bin of 2 as much as a
+    /// demosaic: a stack takes it only with an even
+    /// [`crate::StackOptions::bin_factor`], in place of the first 2x2 of the
+    /// bin, about ten times faster than VNG and a binned VNG frame's
+    /// interpolation. A pixel's red and blue lie half a sensor pixel from its
+    /// centre, diagonally; registration resamples each colour from where it
+    /// lies, so a stack's colours line up rather than fringing its stars. A
+    /// reintegration at full resolution demosaics with VNG.
+    Superpixel,
 }
 
 impl Demosaic {
@@ -853,6 +987,80 @@ pub(crate) fn rec709_luma(red: f32, green: f32, blue: f32) -> f32 {
 mod tests {
     use super::*;
 
+    /// Each 2x2 cell gives its red, its greens' mean and its blue, whatever
+    /// the pattern and its phase.
+    #[test]
+    fn superpixel_takes_each_cell_s_photosites() {
+        // 5x4: the last column has no whole cell.
+        let mosaic = |nan: bool| {
+            let mut data = (0..20).map(|value| value as f32).collect::<Vec<_>>();
+            if nan {
+                data[1] = f32::NAN;
+            }
+            LinearImage::new(5, 4, 1, data).unwrap()
+        };
+        let layouts = [
+            (BayerPattern::Rggb, 0, 0, [0, 1, 5, 6]),
+            (BayerPattern::Bggr, 0, 0, [6, 1, 5, 0]),
+            (BayerPattern::Grbg, 0, 0, [1, 0, 6, 5]),
+            (BayerPattern::Gbrg, 0, 0, [5, 0, 6, 1]),
+            // RGGB from the second column is GRBG.
+            (BayerPattern::Rggb, 1, 0, [1, 0, 6, 5]),
+        ];
+        for (pattern, x_offset, y_offset, [red, green, other_green, blue]) in layouts {
+            let layout = BayerLayout {
+                pattern,
+                x_offset,
+                y_offset,
+            };
+            let rgb = mosaic(false)
+                .debayer_with(layout, Demosaic::Superpixel)
+                .unwrap();
+            assert_eq!((rgb.width, rgb.height, rgb.channels), (2, 2, 3));
+            let greens = (green + other_green) as f32 * 0.5;
+            assert_eq!(
+                rgb.data[..3],
+                [red as f32, greens, blue as f32],
+                "{pattern:?}"
+            );
+            // The second cell along is two photosites on.
+            assert_eq!(rgb.data[3], red as f32 + 2.0, "{pattern:?}");
+            // A green that is not finite leaves the other.
+            if green == 1 {
+                let rgb = mosaic(true)
+                    .debayer_with(layout, Demosaic::Superpixel)
+                    .unwrap();
+                assert_eq!(rgb.data[1], other_green as f32);
+            }
+        }
+        let single = LinearImage::new(1, 4, 1, vec![1.0; 4]).unwrap();
+        assert!(single.debayer_with(rggb(), Demosaic::Superpixel).is_err());
+    }
+
+    #[test]
+    fn binning_averages_finite_samples_and_drops_the_remainder() {
+        let nan = f32::NAN;
+        #[rustfmt::skip]
+        let image = LinearImage::new(5, 3, 1, vec![
+            1.0, 2.0, 3.0, 4.0, 99.0,
+            5.0, 6.0, nan, 8.0, 99.0,
+            77.0, 77.0, 77.0, 77.0, 77.0,
+        ])
+        .unwrap();
+        let binned = image.binned(2).unwrap();
+        assert_eq!((binned.width, binned.height, binned.channels), (2, 1, 1));
+        assert_eq!(binned.data, vec![3.5, 5.0]);
+        let empty = LinearImage::new(2, 2, 1, vec![nan; 4]).unwrap();
+        assert!(empty.binned(2).unwrap().data[0].is_nan());
+        // Each channel of a colour image is binned on its own.
+        let rgb = LinearImage::new(2, 2, 3, (0..12).map(|value| value as f32).collect()).unwrap();
+        assert_eq!(rgb.binned(2).unwrap().data, vec![4.5, 5.5, 6.5]);
+        // A factor of 1 copies, and one the image cannot hold is refused.
+        assert_eq!(image.binned(1).unwrap().width, 5);
+        assert!(image.binned(0).is_err());
+        assert!(image.binned(4).is_err());
+    }
+
     /// `vng_rows` as it was before same-colour pixels ran as vector lanes:
     /// one pixel at a time, skipping the directions it drops.
     fn vng_rows_per_pixel(
@@ -1175,7 +1383,7 @@ mod tests {
                 Demosaic::Mhc => {
                     malvar_he_cutler_rows(&balanced, width, height, layout, first_row, rows)
                 }
-                Demosaic::Bilinear => {}
+                Demosaic::Bilinear | Demosaic::Superpixel => {}
             }
             for (band_row, out_row) in rows.chunks_exact_mut(row_samples).enumerate() {
                 let y = first_row + band_row;

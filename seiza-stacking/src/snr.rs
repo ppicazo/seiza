@@ -86,6 +86,19 @@ pub struct SnrSample {
     /// Worth looking at on colour data, where one channel is often noisier
     /// than the others.
     pub channel_noise: Vec<f64>,
+    /// The factor the stack's lights were binned by (see
+    /// [`crate::StackOptions::bin_factor`]). Binning by `b` averages
+    /// `b²` samples into each pixel, so its noise falls by about `b`: noise
+    /// and SNR compare only between readings of one bin factor, while the
+    /// shape of the depth curve compares across them.
+    /// [`crate::LiveStacker::measure_depth`] gives the stack's; [`measure_depth`]
+    /// of a bare [`StackView`] cannot know it, and gives 1.
+    #[serde(default = "native_bin_factor")]
+    pub bin_factor: u32,
+}
+
+fn native_bin_factor() -> u32 {
+    1
 }
 
 impl SnrSample {
@@ -228,6 +241,7 @@ pub fn measure_depth(view: StackView<'_>) -> Option<SnrSample> {
         background: mean(&channel_background),
         signal: mean(&channel_signal),
         channel_noise,
+        bin_factor: native_bin_factor(),
     })
 }
 

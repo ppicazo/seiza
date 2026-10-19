@@ -29,9 +29,8 @@ use seiza_stacking::{
     StackOptions, StackSnapshot as RustStackSnapshot, build_master_from_fits,
     build_master_from_fits_with_scratch, checkpoint_depths as rust_checkpoint_depths, combine_lrgb,
     combine_narrowband, combine_narrowband_matrix, combine_rgb, combine_super_lrgb,
-    combine_super_rgb, crop_report, measure_depth as rust_measure_depth, path_identity,
-    paths_refer_to_same_file, write_color_fits_f32, write_fits_f32, write_master_fits_f32,
-    write_stack_export_fits_f32,
+    combine_super_rgb, crop_report, path_identity, paths_refer_to_same_file, write_color_fits_f32,
+    write_fits_f32, write_master_fits_f32, write_stack_export_fits_f32,
 };
 use seiza_stretch::{
     ImageShape, ResolvedSampleDomain, SampleDomain, StretchAnalysis, StretchConfig, StretchStack,
@@ -3268,7 +3267,8 @@ pub unsafe extern "C" fn seiza_stack_detect_defects_json(
 /// masters. A positive `dark_exposure_seconds` overrides the dark metadata; zero
 /// uses the metadata. Pass null or empty `options_json` for defaults; its
 /// fields are `seiza_stacking::StackOptions`'s, so a host can choose, for
-/// example, `"demosaic": "vng" | "mhc" | "bilinear"`,
+/// example, `"demosaic": "vng" | "mhc" | "bilinear" | "superpixel"` (which
+/// needs `"bin_factor": 2` or `4`),
 /// `"interpolation": "bilinear" | "lanczos3"`,
 /// `"normalization": {"mode": "local-background", "options": {"tile_size": 256}}`,
 /// `"weighting": {"mode": "inverse-noise-variance"}`,
@@ -4040,7 +4040,9 @@ pub unsafe extern "C" fn seiza_live_stacker_reference_noise_json(
 #[unsafe(no_mangle)]
 /// Returns the reference frame's mapping onto the stack grid, the identity,
 /// as owned JSON in the same versioned form as each pushed frame's
-/// `diagnostics.mapping`, so a host can keep one record per frame, the
+/// `diagnostics.mapping`, including optional `channel_sites` for superpixel
+/// sources (three `[x, y]` offsets in source pixels, in RGB order), so a host
+/// can keep one record per frame, the
 /// reference included. Free it, or an `error_out` string, with
 /// [`seiza_string_free`].
 ///
@@ -4695,6 +4697,10 @@ pub unsafe extern "C" fn seiza_live_stacker_reintegrate(
 /// onto a grid `scale` (1 to 4) times finer than the reference, as
 /// PixInsight's DrizzleIntegration follows ImageIntegration.
 ///
+/// A binned stack (see [`seiza_live_stacker_bin_factor`]) drops each
+/// frame's sensor pixels, so a `scale` of its bin factor gives the sensor's
+/// resolution, with rejection decided on the binned grid.
+///
 /// During the final pass each frame is read once more from its source file
 /// and calibrated, but not debayered or resampled. Every source pixel,
 /// shrunk to a drop `drop_shrink` of a pixel on a side, is carried through
@@ -4794,6 +4800,130 @@ pub unsafe extern "C" fn seiza_live_stacker_reintegrate_drizzled(
     })
     .map_or(ptr::null_mut(), |drizzled| {
         Box::into_raw(Box::new(drizzled))
+    })
+}
+
+#[unsafe(no_mangle)]
+/// The factor every light of this stack is binned by after calibration and
+/// before registration (the `"bin_factor"` of its stack options JSON), 1 to
+/// 4: the live view, snapshots and each frame's mapping are on the binned
+/// grid. 0 for a null stacker.
+///
+/// # Safety
+/// `stacker` must be null or a live `SeizaLiveStacker` pointer.
+pub unsafe extern "C" fn seiza_live_stacker_bin_factor(stacker: *const SeizaLiveStacker) -> u32 {
+    unsafe {
+        stacker
+            .as_ref()
+            .map_or(0, |stacker| stacker.stacker.bin_factor())
+    }
+}
+
+#[unsafe(no_mangle)]
+/// [`seiza_live_stacker_reintegrate`] at the sensor's full resolution: every
+/// admitted frame of a binned stack read again unbinned and integrated onto
+/// a grid [`seiza_live_stacker_bin_factor`] times as fine. At a bin factor
+/// of 1 it is [`seiza_live_stacker_reintegrate`].
+///
+/// No transform is searched for again: each frame's is carried exactly from
+/// the binned grid. With `refine`, a single field detects every frame's
+/// stars at full resolution, as it does the reference frame's, and refits
+/// each transform from that seed; a frame whose stars do not pair keeps the
+/// carried one. An expanded canvas refits each frame against the canvas the
+/// other frames build at full resolution; a frame warped onto its panel keeps
+/// its carried warp. The snapshot's reference headers carry the reference's
+/// WCS to the finer grid, with its binning and pixel-size cards the sensor's
+/// again.
+///
+/// When non-null, `refined_frames_out` receives how many frames were
+/// refined, and `registration_rms_out` the median registration RMS of the
+/// admitted frames in the sensor's pixels: each refined frame's refit, and
+/// for every other frame the RMS the binned pass measured, which its carried
+/// transform is expected to keep (a host may warn on a canvas). It is NaN
+/// when no frame's is known, as for a stack reopened from a context and not
+/// refined. The refit reads each frame once (twice on a canvas), and
+/// `progress` hears each read as pass 0 for each frame in turn before the
+/// reintegration's own progress.
+/// `low_sigma`, `high_sigma`, `cancel`, `progress` and `context` work as in
+/// [`seiza_live_stacker_reintegrate`], and memory is reintegration's on the
+/// finer grid.
+///
+/// # Safety
+/// As for [`seiza_live_stacker_reintegrate`]. When non-null,
+/// `refined_frames_out` and `registration_rms_out` must each point to
+/// writable storage for one value.
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn seiza_live_stacker_reintegrate_full_resolution(
+    stacker: *const SeizaLiveStacker,
+    refine: bool,
+    low_sigma: f32,
+    high_sigma: f32,
+    cancel: *const SeizaCancelSignal,
+    progress: SeizaStackReintegrateProgressCallback,
+    context: *mut c_void,
+    refined_frames_out: *mut usize,
+    registration_rms_out: *mut f64,
+    error_out: *mut *mut c_char,
+) -> *mut SeizaStackSnapshot {
+    clear_error(error_out);
+    if !refined_frames_out.is_null() {
+        unsafe { *refined_frames_out = 0 };
+    }
+    if !registration_rms_out.is_null() {
+        unsafe { *registration_rms_out = f64::NAN };
+    }
+    // Raw pointers are not UnwindSafe; the callback runs on this thread and
+    // the context's lifetime is the caller's promise.
+    let context = context as usize;
+    let refined_frames_out = refined_frames_out as usize;
+    let registration_rms_out = registration_rms_out as usize;
+    ffi_result(error_out, || {
+        let stacker = unsafe { required_live_stacker(stacker)? };
+        let sigma = |value: f32| {
+            if value.is_finite() && value > 0.0 {
+                value
+            } else {
+                3.0
+            }
+        };
+        let options = seiza_stacking::BatchStackOptions {
+            rejection: seiza_stacking::MasterRejectionOptions {
+                low_sigma: sigma(low_sigma),
+                high_sigma: sigma(high_sigma),
+            },
+            cancel: unsafe { cancel.as_ref() }
+                .map(|signal| CancelSignal::from(Arc::clone(&signal.cancelled))),
+            ..seiza_stacking::BatchStackOptions::default()
+        };
+        let full = stacker
+            .stacker
+            .reintegrate_full_resolution(&options, refine, |pass, index, count| {
+                if let Some(callback) = progress {
+                    let pass = match pass {
+                        seiza_stacking::BatchStackPass::Estimate => 0,
+                        seiza_stacking::BatchStackPass::Refine => 1,
+                        seiza_stacking::BatchStackPass::Integrate => 2,
+                    };
+                    unsafe { callback(pass, index, count, context as *mut c_void) };
+                }
+            })
+            .map_err(|error| error.to_string())?;
+        let refined_frames_out = refined_frames_out as *mut usize;
+        if !refined_frames_out.is_null() {
+            unsafe { *refined_frames_out = full.refined_frames };
+        }
+        let registration_rms_out = registration_rms_out as *mut f64;
+        if !registration_rms_out.is_null() {
+            unsafe { *registration_rms_out = full.registration_rms_pixels.unwrap_or(f64::NAN) };
+        }
+        Ok(SeizaStackSnapshot {
+            snapshot: full.result.snapshot,
+            reference_headers: full.reference_headers,
+            input_paths: stacker.stacker.protected_paths(),
+        })
+    })
+    .map_or(ptr::null_mut(), |snapshot| {
+        Box::into_raw(Box::new(snapshot))
     })
 }
 
@@ -8937,6 +9067,15 @@ mod tests {
         .unwrap();
         let options = stack_options(documented.as_ptr()).unwrap();
         assert_eq!(options.demosaic, seiza_stacking::Demosaic::Bilinear);
+        let superpixel =
+            std::ffi::CString::new(r#"{"demosaic": "superpixel", "bin_factor": 2}"#).unwrap();
+        assert_eq!(
+            stack_options(superpixel.as_ptr()).unwrap().demosaic,
+            seiza_stacking::Demosaic::Superpixel
+        );
+        // A superpixel bins by 2, so it needs an even bin factor.
+        let odd = std::ffi::CString::new(r#"{"demosaic": "superpixel"}"#).unwrap();
+        assert!(stack_options(odd.as_ptr()).is_err());
         assert_eq!(
             options.interpolation,
             seiza_stacking::Interpolation::Lanczos3
@@ -10025,6 +10164,51 @@ mod tests {
     }
 
     #[test]
+    fn stacking_cabi_superpixel_mapping_keeps_channel_sites() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sites.fits");
+        let (width, height) = (320, 256);
+        let image = LinearImage::new(width, height, 1, stacking_star_field(width, height)).unwrap();
+        seiza_stacking::write_processed_image_fits_f32(
+            &path,
+            &image,
+            &[],
+            &[seiza_fits::WriteHeaderCard::new(
+                "BAYERPAT",
+                HeaderValue::String("RGGB".into()),
+            )],
+        )
+        .unwrap();
+        let path = CString::new(path.to_str().unwrap()).unwrap();
+        let options = CString::new(
+            r#"{"demosaic":"superpixel","bin_factor":2,"normalization":{"mode":"none"}}"#,
+        )
+        .unwrap();
+        let mut error = ptr::null_mut();
+        let stacker = unsafe {
+            seiza_live_stacker_open_fits(
+                path.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                0.0,
+                options.as_ptr(),
+                &mut error,
+            )
+        };
+        assert!(!stacker.is_null());
+        assert!(error.is_null());
+        let mapping = owned_json_value(unsafe {
+            seiza_live_stacker_reference_mapping_json(stacker, &mut error)
+        });
+        assert_eq!(
+            mapping["channel_sites"],
+            serde_json::json!([[-0.25, -0.25], [0.0, 0.0], [0.25, 0.25]])
+        );
+        unsafe { seiza_live_stacker_free(stacker) };
+    }
+
+    #[test]
     fn stacking_cabi_pushes_views_snapshots_and_finishes_without_copying() {
         let (width, height) = (160, 128);
         let image = stacking_star_field(width, height);
@@ -10660,6 +10844,124 @@ mod tests {
                 &mut error,
             )
         });
+        unsafe { seiza_string_free(error) };
+    }
+
+    #[test]
+    fn binned_stacks_reintegrate_at_full_resolution_through_the_cabi() {
+        let (width, height) = (160, 128);
+        let clean = stacking_star_field(width, height);
+        let directory = tempfile::tempdir().unwrap();
+        let paths = (0..4)
+            .map(|index| {
+                let path = directory.path().join(format!("light-{index:03}.fits"));
+                let noisy = clean
+                    .iter()
+                    .enumerate()
+                    .map(|(sample, value)| value + ((sample * 7 + index * 13) % 5) as f32 * 0.1)
+                    .collect::<Vec<_>>();
+                seiza_stacking::write_processed_image_fits_f32(
+                    &path,
+                    &LinearImage::new(width, height, 1, noisy).unwrap(),
+                    &[],
+                    &[],
+                )
+                .unwrap();
+                path.to_str().unwrap().to_owned()
+            })
+            .collect::<Vec<_>>();
+        let reference_c = CString::new(paths[0].as_str()).unwrap();
+        let others_c = CString::new(serde_json::to_string(&paths[1..]).unwrap()).unwrap();
+        let config = CString::new(
+            r#"{
+                "normalization": {"mode": "none"},
+                "rejection": {"mode": "none"},
+                "bin_factor": 2
+            }"#,
+        )
+        .unwrap();
+        let mut error = ptr::null_mut();
+        let stacker = unsafe {
+            seiza_live_stacker_open_fits(
+                reference_c.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                0.0,
+                config.as_ptr(),
+                &mut error,
+            )
+        };
+        assert!(!stacker.is_null());
+        assert_eq!(unsafe { seiza_live_stacker_bin_factor(stacker) }, 2);
+        assert_eq!(unsafe { seiza_live_stacker_bin_factor(ptr::null()) }, 0);
+        let response = unsafe {
+            seiza_live_stacker_push_fits_pipelined_json(
+                stacker,
+                others_c.as_ptr(),
+                2,
+                0,
+                0.0,
+                &mut error,
+            )
+        };
+        assert!(!response.is_null());
+        let report: serde_json::Value =
+            serde_json::from_str(&unsafe { CStr::from_ptr(response) }.to_string_lossy()).unwrap();
+        unsafe { seiza_string_free(response) };
+        assert!(
+            report.to_string().contains("\"bin_factor\":2"),
+            "each frame's mapping carries the factor: {report}"
+        );
+        assert_eq!(unsafe { seiza_live_stacker_data_length(stacker) }, 80 * 64);
+        let (mut refined, mut rms) = (usize::MAX, 0.0_f64);
+        let snapshot = unsafe {
+            seiza_live_stacker_reintegrate_full_resolution(
+                stacker,
+                true,
+                0.0,
+                0.0,
+                ptr::null(),
+                None,
+                ptr::null_mut(),
+                &mut refined,
+                &mut rms,
+                &mut error,
+            )
+        };
+        assert!(!snapshot.is_null(), "{}", unsafe {
+            CStr::from_ptr(error).to_string_lossy()
+        });
+        assert_eq!(
+            unsafe {
+                (
+                    seiza_stack_snapshot_width(snapshot),
+                    seiza_stack_snapshot_height(snapshot),
+                )
+            },
+            (width, height)
+        );
+        assert_eq!(refined, 3);
+        assert!(rms.is_finite() && rms >= 0.0, "{rms}");
+        unsafe {
+            seiza_stack_snapshot_free(snapshot);
+            seiza_live_stacker_free(stacker);
+        }
+        // Bayer drizzle needs single photosites, which binning averages away.
+        let drizzled =
+            CString::new(r#"{"cfa_integration": "bayer_drizzle", "bin_factor": 2}"#).unwrap();
+        let refused = unsafe {
+            seiza_live_stacker_open_fits(
+                reference_c.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                0.0,
+                drizzled.as_ptr(),
+                &mut error,
+            )
+        };
+        assert!(refused.is_null());
         unsafe { seiza_string_free(error) };
     }
 
@@ -15142,6 +15444,10 @@ pub struct SeizaSnrSample {
     pub channel_count: usize,
     /// Per-channel noise.
     pub channel_noise: [f64; SEIZA_SNR_MAX_CHANNELS],
+    /// The factor the stack's lights were binned by, which lowers each
+    /// pixel's noise about as much: compare noise and SNR only between
+    /// readings of one bin factor.
+    pub bin_factor: u32,
 }
 
 /// Read how deep a live stack is, without copying the accumulator.
@@ -15178,7 +15484,7 @@ pub unsafe extern "C" fn seiza_live_stacker_measure_depth(
         if sample.is_null() {
             return Err("sample is required".into());
         }
-        let Some(measured) = rust_measure_depth(stacker.stacker.view()) else {
+        let Some(measured) = stacker.stacker.measure_depth() else {
             return Ok(0);
         };
         let mut channel_noise = [0.0f64; SEIZA_SNR_MAX_CHANNELS];
@@ -15193,6 +15499,7 @@ pub unsafe extern "C" fn seiza_live_stacker_measure_depth(
                 snr: measured.snr(),
                 channel_count,
                 channel_noise,
+                bin_factor: measured.bin_factor,
             };
         }
         Ok(1)

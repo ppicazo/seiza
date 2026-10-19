@@ -454,6 +454,12 @@ typedef struct {
    Per-channel noise.
    */
   double channel_noise[SEIZA_SNR_MAX_CHANNELS];
+  /*
+   The factor the stack's lights were binned by, which lowers each
+   pixel's noise about as much: compare noise and SNR only between
+   readings of one bin factor.
+   */
+  uint32_t bin_factor;
 } SeizaSnrSample;
 
 /*
@@ -1115,7 +1121,8 @@ char *seiza_stack_detect_defects_json(const char *paths_json,
  masters. A positive `dark_exposure_seconds` overrides the dark metadata; zero
  uses the metadata. Pass null or empty `options_json` for defaults; its
  fields are `seiza_stacking::StackOptions`'s, so a host can choose, for
- example, `"demosaic": "vng" | "mhc" | "bilinear"`,
+ example, `"demosaic": "vng" | "mhc" | "bilinear" | "superpixel"` (which
+ needs `"bin_factor": 2` or `4`),
  `"interpolation": "bilinear" | "lanczos3"`,
  `"normalization": {"mode": "local-background", "options": {"tile_size": 256}}`,
  `"weighting": {"mode": "inverse-noise-variance"}`,
@@ -1451,7 +1458,9 @@ char *seiza_live_stacker_reference_noise_json(const SeizaLiveStacker *stacker, c
 /*
  Returns the reference frame's mapping onto the stack grid, the identity,
  as owned JSON in the same versioned form as each pushed frame's
- `diagnostics.mapping`, so a host can keep one record per frame, the
+ `diagnostics.mapping`, including optional `channel_sites` for superpixel
+ sources (three `[x, y]` offsets in source pixels, in RGB order), so a host
+ can keep one record per frame, the
  reference included. Free it, or an `error_out` string, with
  [`seiza_string_free`].
 
@@ -1785,6 +1794,10 @@ SeizaStackSnapshot *seiza_live_stacker_reintegrate(const SeizaLiveStacker *stack
  onto a grid `scale` (1 to 4) times finer than the reference, as
  PixInsight's DrizzleIntegration follows ImageIntegration.
 
+ A binned stack (see [`seiza_live_stacker_bin_factor`]) drops each
+ frame's sensor pixels, so a `scale` of its bin factor gives the sensor's
+ resolution, with rejection decided on the binned grid.
+
  During the final pass each frame is read once more from its source file
  and calibrated, but not debayered or resampled. Every source pixel,
  shrunk to a drop `drop_shrink` of a pixel on a side, is carried through
@@ -1817,6 +1830,62 @@ SeizaDrizzleResult *seiza_live_stacker_reintegrate_drizzled(const SeizaLiveStack
                                                             void *context,
                                                             SeizaStackSnapshot **snapshot_out,
                                                             char **error_out);
+
+/*
+ The factor every light of this stack is binned by after calibration and
+ before registration (the `"bin_factor"` of its stack options JSON), 1 to
+ 4: the live view, snapshots and each frame's mapping are on the binned
+ grid. 0 for a null stacker.
+
+ # Safety
+ `stacker` must be null or a live `SeizaLiveStacker` pointer.
+ */
+uint32_t seiza_live_stacker_bin_factor(const SeizaLiveStacker *stacker);
+
+/*
+ [`seiza_live_stacker_reintegrate`] at the sensor's full resolution: every
+ admitted frame of a binned stack read again unbinned and integrated onto
+ a grid [`seiza_live_stacker_bin_factor`] times as fine. At a bin factor
+ of 1 it is [`seiza_live_stacker_reintegrate`].
+
+ No transform is searched for again: each frame's is carried exactly from
+ the binned grid. With `refine`, a single field detects every frame's
+ stars at full resolution, as it does the reference frame's, and refits
+ each transform from that seed; a frame whose stars do not pair keeps the
+ carried one. An expanded canvas refits each frame against the canvas the
+ other frames build at full resolution; a frame warped onto its panel keeps
+ its carried warp. The snapshot's reference headers carry the reference's
+ WCS to the finer grid, with its binning and pixel-size cards the sensor's
+ again.
+
+ When non-null, `refined_frames_out` receives how many frames were
+ refined, and `registration_rms_out` the median registration RMS of the
+ admitted frames in the sensor's pixels: each refined frame's refit, and
+ for every other frame the RMS the binned pass measured, which its carried
+ transform is expected to keep (a host may warn on a canvas). It is NaN
+ when no frame's is known, as for a stack reopened from a context and not
+ refined. The refit reads each frame once (twice on a canvas), and
+ `progress` hears each read as pass 0 for each frame in turn before the
+ reintegration's own progress.
+ `low_sigma`, `high_sigma`, `cancel`, `progress` and `context` work as in
+ [`seiza_live_stacker_reintegrate`], and memory is reintegration's on the
+ finer grid.
+
+ # Safety
+ As for [`seiza_live_stacker_reintegrate`]. When non-null,
+ `refined_frames_out` and `registration_rms_out` must each point to
+ writable storage for one value.
+ */
+SeizaStackSnapshot *seiza_live_stacker_reintegrate_full_resolution(const SeizaLiveStacker *stacker,
+                                                                   bool refine,
+                                                                   float low_sigma,
+                                                                   float high_sigma,
+                                                                   const SeizaCancelSignal *cancel,
+                                                                   SeizaStackReintegrateProgressCallback progress,
+                                                                   void *context,
+                                                                   size_t *refined_frames_out,
+                                                                   double *registration_rms_out,
+                                                                   char **error_out);
 
 /*
  # Safety

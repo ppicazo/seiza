@@ -656,6 +656,18 @@ impl NormalizationMap {
         Ok(())
     }
 
+    /// The same map on a grid `scale` times as fine: its tiles grow with it,
+    /// so the tile grid and every coefficient stand and each finer pixel
+    /// reads the weights of the coarse pixel it lies in.
+    pub(crate) fn rescaled(&self, scale: usize) -> Self {
+        Self {
+            width: self.width * scale,
+            height: self.height * scale,
+            tile_size: self.tile_size * scale,
+            ..self.clone()
+        }
+    }
+
     /// Width of the reference grid used to estimate this map.
     pub fn width(&self) -> usize {
         self.width

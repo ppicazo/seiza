@@ -118,6 +118,9 @@ struct ContextMetadata {
     /// refuse the field rather than replay frames under the wrong gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     frame_tolerances: Option<FrameTolerances>,
+    /// Superpixel offsets omitted by the compact ledger encoding.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    frame_channel_sites: Vec<Option<crate::registration::ChannelSites>>,
     /// Panel footprints an expanded canvas registers frames through.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     expanded_panels: Vec<ReferenceRegion>,
@@ -550,6 +553,11 @@ pub(crate) fn read(path: &Path) -> Result<RestoredContext> {
                 .attach_warps(warps)
                 .map_err(|message| context_read_error(path, message))?;
         }
+        if !metadata.frame_channel_sites.is_empty() {
+            ledger
+                .attach_channel_sites(&metadata.frame_channel_sites)
+                .map_err(|error| context_read_error(path, error.to_string()))?;
+        }
         if let Some(tolerances) = metadata.frame_tolerances.clone() {
             ledger
                 .attach_tolerances(tolerances)
@@ -741,6 +749,11 @@ impl ContextMetadata {
             } else {
                 None
             },
+            frame_channel_sites: if schema_version >= LEDGER_FORMAT_VERSION {
+                state.ledger.channel_sites()
+            } else {
+                Vec::new()
+            },
             expanded_panels: state.expanded_panels.to_vec(),
             expanded_lens: state.expanded_lens,
             expanded_panel_stars: !state.expanded_panel_stars.is_empty(),
@@ -756,6 +769,9 @@ impl ContextMetadata {
         }
         if self.frame_tolerances.is_some() && self.schema_version < LEDGER_FORMAT_VERSION {
             return Err("context holds frame match tolerances but no admitted-frame ledger".into());
+        }
+        if !self.frame_channel_sites.is_empty() && self.schema_version < LEDGER_FORMAT_VERSION {
+            return Err("context holds channel sites but no admitted-frame ledger".into());
         }
         self.options.validate().map_err(|error| error.to_string())?;
         let weighted = !self.options.weighting.is_equal();

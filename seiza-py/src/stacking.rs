@@ -9,9 +9,9 @@ use seiza_stacking::{
     ImpulseFilterOptions, LinearImage, LiveStacker, MasterBuildOptions, MasterDark,
     MasterFrameKind, MasterRejectionOptions, NormalizationMode, PipelineOptions, PipelineReport,
     RegistrationModel, RejectionMode, SnrSample, StackOptions, StackSnapshot,
-    build_master_from_fits, build_master_from_fits_with_scratch, checkpoint_depths, measure_depth,
-    path_identity, paths_refer_to_same_file, write_drizzle_fits_f32, write_fits_f32,
-    write_master_fits_f32, write_stack_export_fits_f32,
+    build_master_from_fits, build_master_from_fits_with_scratch, checkpoint_depths, path_identity,
+    paths_refer_to_same_file, write_drizzle_fits_f32, write_fits_f32, write_master_fits_f32,
+    write_stack_export_fits_f32,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -176,7 +176,8 @@ impl PyStackOptions {
         match_tolerances=None,
         registration_model="similarity",
         weighting="equal",
-        defects=None
+        defects=None,
+        bin_factor=1
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -209,6 +210,7 @@ impl PyStackOptions {
         registration_model: &str,
         weighting: &str,
         defects: Option<PyRef<'_, PyDefectMap>>,
+        bin_factor: u32,
     ) -> PyResult<Self> {
         let weighting = match weighting {
             "equal" => FrameWeighting::Equal,
@@ -236,9 +238,10 @@ impl PyStackOptions {
             "vng" => Demosaic::Vng,
             "mhc" => Demosaic::Mhc,
             "bilinear" => Demosaic::Bilinear,
+            "superpixel" => Demosaic::Superpixel,
             value => {
                 return Err(PyValueError::new_err(format!(
-                    "demosaic must be 'vng', 'mhc', or 'bilinear', not {value:?}"
+                    "demosaic must be 'vng', 'mhc', 'bilinear', or 'superpixel', not {value:?}"
                 )));
             }
         };
@@ -299,6 +302,7 @@ impl PyStackOptions {
         inner.acceptance.minimum_integrated_fraction = minimum_integrated_fraction;
         inner.demosaic = demosaic;
         inner.match_tolerances = crate::calibration::tolerances_or_default(match_tolerances);
+        inner.bin_factor = bin_factor;
         inner
             .validate()
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
@@ -315,13 +319,16 @@ impl PyStackOptions {
         }
     }
 
-    /// How Bayer frames are demosaiced: "vng", "mhc", or "bilinear".
+    /// How Bayer frames are demosaiced: "vng", "mhc", "bilinear", or
+    /// "superpixel", which bins each 2x2 cell into one pixel and needs an
+    /// even ``bin_factor``.
     #[getter]
     fn demosaic(&self) -> &'static str {
         match self.inner.demosaic {
             Demosaic::Vng => "vng",
             Demosaic::Mhc => "mhc",
             Demosaic::Bilinear => "bilinear",
+            Demosaic::Superpixel => "superpixel",
         }
     }
 
@@ -373,6 +380,14 @@ impl PyStackOptions {
     #[getter]
     fn maximum_drift_fraction(&self) -> f64 {
         self.inner.registration.maximum_drift_fraction
+    }
+
+    /// The factor, 1 to 4, each light is area-mean binned by after
+    /// calibration and before registration. Pixel options keep their
+    /// meaning in the sensor's pixels.
+    #[getter]
+    fn bin_factor(&self) -> u32 {
+        self.inner.bin_factor
     }
 
     /// The sensor defects repaired in every light before debayering, as
@@ -545,7 +560,8 @@ impl PyFrameDisposition {
 
     /// How an accepted frame maps onto the reference grid, its
     /// registration and normalization, as a dict in the core's versioned
-    /// form; `None` for a rejected frame.
+    /// form; `None` for a rejected frame. Superpixel mappings include
+    /// ``channel_sites``: three [x, y] offsets in source pixels, in RGB order.
     #[getter]
     fn mapping(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         self.mapping_json
@@ -1457,6 +1473,14 @@ impl PyLiveStacker {
         Ok(self.active()?.view().rejected_frames)
     }
 
+    /// The factor every light is binned by after calibration, as
+    /// :attr:`StackOptions.bin_factor` set it: the live view, snapshots and
+    /// each frame's mapping are on the binned grid.
+    #[getter]
+    fn bin_factor(&self) -> PyResult<u32> {
+        Ok(self.active()?.bin_factor())
+    }
+
     /// False for a stack aligned to a separate reference image, which starts
     /// with no accepted frames.
     #[getter]
@@ -1585,7 +1609,7 @@ impl PyLiveStacker {
     fn measure_depth(&self, py: Python<'_>) -> PyResult<Option<PySnrSample>> {
         let stacker = self.active()?;
         Ok(py
-            .detach(|| measure_depth(stacker.view()))
+            .detach(|| stacker.measure_depth())
             .map(|sample| PySnrSample { inner: sample }))
     }
 
@@ -1747,8 +1771,10 @@ impl PyLiveStacker {
     /// DrizzleIntegration does. A pixel the integration rejected is left
     /// out; Bayer frames drop each photosite into its own colour.
     /// ``drop_shrink`` is each drop's side in source pixels, by default 0.9
-    /// for monochrome and 1.0 for Bayer frames. Returns the reintegrated
-    /// stack and the drizzled one.
+    /// for monochrome and 1.0 for Bayer frames. A stack binned by ``b`` (see
+    /// :attr:`bin_factor`) drops its frames' sensor pixels, so ``scale=b``
+    /// gives the sensor's resolution. Returns the reintegrated stack and the
+    /// drizzled one.
     #[pyo3(signature = (
         *,
         scale=1,
@@ -1783,6 +1809,42 @@ impl PyLiveStacker {
             input_paths: stacker.protected_paths(),
         };
         Ok((PyStackSnapshot::of(stacker, result.snapshot), drizzled))
+    }
+
+    /// :meth:`reintegrate` at the sensor's full resolution: every admitted
+    /// frame of a binned stack read again unbinned and integrated onto a
+    /// grid :attr:`bin_factor` times as fine. No transform is searched for
+    /// again; each is carried exactly from the binned grid. With ``refine``,
+    /// a single field detects every frame's stars at full resolution and
+    /// refits each transform from that seed, and an expanded canvas refits
+    /// each frame against the canvas the other frames build at full
+    /// resolution. Returns the stack, whose ``write_fits`` carries the WCS
+    /// to the finer grid; how many frames were refined; and the frames'
+    /// median registration RMS in the sensor's pixels, None when no frame's
+    /// is known.
+    #[pyo3(signature = (*, refine=true, sigma_low=3.0, sigma_high=3.0, scratch_directory=None))]
+    fn reintegrate_full_resolution(
+        &self,
+        py: Python<'_>,
+        refine: bool,
+        sigma_low: f32,
+        sigma_high: f32,
+        scratch_directory: Option<PathBuf>,
+    ) -> PyResult<(PyStackSnapshot, usize, Option<f64>)> {
+        let stacker = self.active()?;
+        let options = batch_options(sigma_low, sigma_high, scratch_directory)?;
+        let full = py
+            .detach(|| stacker.reintegrate_full_resolution(&options, refine, |_, _, _| {}))
+            .map_err(stack_error)?;
+        Ok((
+            PyStackSnapshot {
+                inner: full.result.snapshot,
+                reference_headers: full.reference_headers,
+                input_paths: stacker.protected_paths(),
+            },
+            full.refined_frames,
+            full.registration_rms_pixels,
+        ))
     }
 
     /// Consume the accumulator, optionally write a linear FITS file, and return its arrays.
@@ -2774,6 +2836,14 @@ impl PySnrSample {
     #[getter]
     fn channel_noise(&self) -> Vec<f64> {
         self.inner.channel_noise.clone()
+    }
+
+    /// The factor the stack's lights were binned by, which lowers each
+    /// pixel's noise about as much: compare noise and SNR only between
+    /// readings of one bin factor.
+    #[getter]
+    fn bin_factor(&self) -> u32 {
+        self.inner.bin_factor
     }
 
     /// This reading's signal against its own noise.

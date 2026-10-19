@@ -1,8 +1,9 @@
 # Binned stacking
 
-Status: designed, decisions taken (see [Decisions](#decisions)). Nothing is
-implemented; implementation waits on two branches in flight (see
-[Sequencing](#sequencing)).
+Status: phases 0, 1 and 2 implemented (#306, #313, and the PR that adds
+this line). Where they depart from this design, see
+[As built (phase 1)](#as-built-phase-1) and
+[As built (phase 2)](#as-built-phase-2).
 
 ## Summary
 
@@ -640,6 +641,81 @@ Taken on the recommendations above; reopen any of them in review.
    carries an optional `bin_factor`, omitted at 1, as `warp` is omitted
    when absent. Compact binary encodings keep their layout, and the stack's
    options carry the factor there.
+
+## As built (phase 1)
+
+Phase 1 follows the decisions above, with these differences:
+
+- **`rebinned` takes the target factor only.** A mapping records its own
+  bin factor (decision 8), so `RegisteredFrameMapping::rebinned(to)` carries
+  it from that factor to any that divides it. There is no
+  `Ledger::native_mapping`; the full-resolution pass rebins the whole ledger.
+- **`reintegrate_full_resolution` returns a `FullResolutionStack`**, not a
+  bare `BatchStackResult`: the result, the reference headers carried to the
+  finer grid (WCS rescaled, binning and pixel-size cards back to the
+  sensor's, no `SEIZABIN`), how many frames were refined, and the median
+  registration RMS in sensor pixels that decision 3 asks a canvas to report.
+  The C call returns the snapshot and gives the last two through out
+  parameters; Python returns a `(snapshot, refined, rms)` tuple. Each frame's
+  live registration RMS is recorded in the ledger for this, but a context does
+  not keep it, so a reopened stack that is not refined reports none.
+- **Drizzling a binned stack was refused** in phase 1; phase 2 adds it.
+- **Global normalization is reused, and it is noise-driven.** A global gain
+  is the ratio of the reference's dispersion to a resampled frame's, which
+  on a sparse sky is the noise's, and binning changes it: synthetic frames
+  took gains of 1.47 at full resolution and 1.36 binned by 2. The promoted
+  stack keeps the binned gains, as §3.3 says, so it differs from a native
+  stack by that much in its stars. With `LocalBackground` (photometric gains)
+  the promoted stack is within a fraction of one frame's sky noise of a
+  native one, and with no normalization a refined promotion matches the
+  native stack to the bit in at least 99% of its pixels.
+- **Not converted:** `ColorCrop::OFF_CENTER_PIXELS` (colour composition does
+  not know a stack's bin factor; its fractional bound dominates on large
+  frames). The pipeline's in-flight memory estimate counts native frames for
+  preparation and binned ones for integration. Phase 2 adds `SnrSample`'s
+  `bin_factor`.
+- **Detection's minimum area** uses the interim rule of §4 (3, 2 at b=2, 1
+  from 3), and `Scale::detection` says so; open question 1 still stands.
+
+## As built (phase 2)
+
+- **Superpixel.** `Demosaic::Superpixel` takes each 2x2 cell's red, the
+  mean of its greens and its blue, and needs an even bin factor: `develop`
+  debayers a superpixel frame and bins it on by `b / 2`, and at an odd
+  factor (the full-resolution pass, the native lens pass) uses VNG. Each
+  prepared frame's channel offsets (`ChannelSites`, `±0.5 / b` working
+  pixels for red and blue) follow from its Bayer layout. Mappings retain
+  them as `channel_sites` in JSON and in context metadata so public crop
+  extraction reproduces live registration. `resample_region_sited` reads each
+  channel from its own site, one channel at a time, wherever a frame is resampled: registration, replay,
+  and canvas placement. The integrated reference, an external reference and
+  a canvas's anchor are not otherwise resampled, so each is resampled once
+  through the identity onto its pixel centres; frames kept for
+  reintegration leave a superpixel reference out, and replay prepares it
+  the same way. Star detection still reads a frame's luminance at its raw
+  sites, a centroid shift of about `0.21 d_R + 0.07 d_B` that frames of one
+  orientation share and that a meridian flip doubles: 0.035 binned pixels
+  at a factor of 2. On synthetic RGGB frames with a flip, red and blue
+  centroids in the stack agree within 0.075 binned pixels; read from the
+  pixel centres they were 0.29 apart.
+- **Canvas refinement** does without the panel starts, which a context
+  does not keep. Every frame is carried onto the native canvas through its
+  converted mapping, scaled by its recorded gain and mean offset, and
+  summed; each frame is then refit by `refine_similarity` against the mean
+  of the other frames over its footprint (leave one out, so a panel of two
+  dithers does not refine against itself). A frame whose mapping holds a
+  warp, from the registration model or a lens, keeps it; so does one whose
+  refit would move a corner further than the match tolerance. On a
+  synthetic 2x1 mosaic binned by 2, the worst pairwise error against the
+  frames' true offsets fell from 0.052 to 0.042 native pixels.
+- **Drizzle of a binned stack** drops each frame's sensor pixels through
+  `RegisteredFrameMapping::sensor_sourced`, `T ∘ C⁻¹` with the warp `C ∘ W`,
+  so drops are a binned pixel's part across and a scale of `b` gives the
+  sensor's resolution; rejection stays on the binned grid. Its stars land
+  within 0.05·b pixels of where the full-resolution stack puts them.
+- **`SnrSample::bin_factor`** comes from a new `LiveStacker::measure_depth`,
+  which both bindings call; the free `measure_depth` of a bare `StackView`
+  cannot know the factor and gives 1.
 
 ## Still open
 

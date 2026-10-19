@@ -416,18 +416,18 @@ fn budget_caps_explicit_workers_and_includes_rgb_intermediates() {
     );
     let mut options = concurrent(11);
     options.max_in_flight_bytes = rgb_memory.in_flight_bytes(2);
-    assert_eq!(resolve_pool_workers(&options, &rgb, &pool).unwrap(), 2);
+    assert_eq!(resolve_pool_workers(&options, &rgb, 1, &pool).unwrap(), 2);
     assert_eq!(
         options.resolve_workers(120_000),
         11,
         "legacy explicit-worker contract stays unchanged"
     );
     options.max_in_flight_bytes = 1;
-    assert!(resolve_pool_workers(&options, &rgb, &pool).is_err());
+    assert!(resolve_pool_workers(&options, &rgb, 1, &pool).is_err());
     options.max_in_flight_bytes = usize::MAX;
     options.workers = Some(usize::MAX);
     assert_eq!(
-        resolve_pool_workers(&options, &rgb, &pool).unwrap(),
+        resolve_pool_workers(&options, &rgb, 1, &pool).unwrap(),
         MAXIMUM_WORKERS
     );
 }
