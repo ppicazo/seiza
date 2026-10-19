@@ -1233,11 +1233,12 @@ SeizaLiveStacker *seiza_live_stacker_open_fits_with_reference_image_candidates(c
  uses 256). A run peaks at about 40 bytes per sample. With
  `"registration": {"model": "quadratic"}` in `options_json`, a light lying
  mostly within one panel is warped onto it, which follows lens distortion
- across a meridian flip. For panels, set
- `"acceptance": {"minimum_overlap_fraction": 0.05}`, the CLI's default
- for `--reference expand`: panels planned for 10% overlap land nearer 9%,
- and the default of 0.60 joins none of them. Lights left off the canvas
- are counted in [`seiza_live_stacker_expansion_planning_notes_json`].
+ across a meridian flip. Unless `options_json` sets
+ `"acceptance": {"minimum_overlap_fraction": ...}`, a light joins sharing
+ 0.05 of its footprint with the canvas, as with the CLI's
+ `--reference expand`, rather than the 0.60 a fixed reference needs:
+ panels planned for 10% overlap land nearer 9%. Lights left off the
+ canvas are counted in [`seiza_live_stacker_expansion_planning_notes_json`].
  Bayer drizzle and drizzled reintegration are not supported on the canvas.
 
  The masters, `dark_exposure_seconds` and `options_json` are those of

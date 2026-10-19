@@ -444,9 +444,11 @@ pub struct FrameAcceptanceCriteria {
 }
 
 impl FrameAcceptanceCriteria {
-    /// The `minimum_overlap_fraction` suggested for a canvas expanded to hold
-    /// mosaic panels, where it is the fraction of the smaller footprint a
-    /// frame must share with the canvas to join it. Panels planned for 10%
+    /// The `minimum_overlap_fraction` for a canvas expanded to hold mosaic
+    /// panels, where it is the fraction of the smaller footprint a frame must
+    /// share with the canvas to join it. The CLI, the C ABI and Python use it
+    /// when the caller sets none; [`LiveStacker::with_expanding_reference`]
+    /// itself takes the options as they are. Panels planned for 10%
     /// overlap land short of 10%: on a real 2x2 mosaic planned that way, they
     /// overlapped by 0.088 to 0.094, and at 0.10 only the anchor's panel
     /// joined; at this fraction all four did, registering at a median 0.1px

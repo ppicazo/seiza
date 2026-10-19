@@ -5,13 +5,13 @@ use pyo3::prelude::*;
 use seiza_stacking::{
     BatchStackOptions, CalibrationMasters, CancelSignal, DarkLevelScreening,
     DefectDetectionOptions, DefectMap, DeltaSigmaOptions, Demosaic, DrizzleOptions, DrizzleResult,
-    FitsFrame, FlatStarMaskingOptions, FlatStarMaskingStatistics, FrameDisposition, FrameWeighting,
-    ImpulseFilterOptions, LinearImage, LiveStacker, MasterBuildOptions, MasterDark,
-    MasterFrameKind, MasterRejectionOptions, NormalizationMode, PipelineOptions, PipelineReport,
-    RegistrationModel, RejectionMode, SnrSample, StackOptions, StackSnapshot,
-    build_master_from_fits, build_master_from_fits_with_scratch, checkpoint_depths, path_identity,
-    paths_refer_to_same_file, write_drizzle_fits_f32, write_fits_f32, write_master_fits_f32,
-    write_stack_export_fits_f32,
+    FitsFrame, FlatStarMaskingOptions, FlatStarMaskingStatistics, FrameAcceptanceCriteria,
+    FrameDisposition, FrameWeighting, ImpulseFilterOptions, LinearImage, LiveStacker,
+    MasterBuildOptions, MasterDark, MasterFrameKind, MasterRejectionOptions, NormalizationMode,
+    PipelineOptions, PipelineReport, RegistrationModel, RejectionMode, SnrSample, StackOptions,
+    StackSnapshot, build_master_from_fits, build_master_from_fits_with_scratch, checkpoint_depths,
+    path_identity, paths_refer_to_same_file, write_drizzle_fits_f32, write_fits_f32,
+    write_master_fits_f32, write_stack_export_fits_f32,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -141,6 +141,23 @@ impl PyDefectMap {
 #[derive(Clone, Default)]
 pub(crate) struct PyStackOptions {
     inner: StackOptions,
+    /// The ``minimum_overlap`` the caller set, if any.
+    minimum_overlap: Option<f32>,
+}
+
+impl PyStackOptions {
+    /// These options for an expanded canvas: unless the caller set a
+    /// ``minimum_overlap``, a frame joins sharing
+    /// [`FrameAcceptanceCriteria::EXPANDED_MINIMUM_OVERLAP_FRACTION`] of its
+    /// footprint with the canvas, as with the CLI's `--reference expand`.
+    fn expanding(&self) -> StackOptions {
+        let mut options = self.inner.clone();
+        if self.minimum_overlap.is_none() {
+            options.acceptance.minimum_overlap_fraction =
+                FrameAcceptanceCriteria::EXPANDED_MINIMUM_OVERLAP_FRACTION;
+        }
+        options
+    }
 }
 
 #[pymethods]
@@ -168,7 +185,7 @@ impl PyStackOptions {
         maximum_registration_rms=2.0,
         maximum_scale_deviation=0.04,
         maximum_rotation_degrees=10.0,
-        minimum_overlap=0.60,
+        minimum_overlap=None,
         minimum_normalization_gain=0.25,
         maximum_normalization_gain=4.0,
         minimum_integrated_fraction=0.50,
@@ -201,7 +218,7 @@ impl PyStackOptions {
         maximum_registration_rms: f64,
         maximum_scale_deviation: f64,
         maximum_rotation_degrees: f64,
-        minimum_overlap: f32,
+        minimum_overlap: Option<f32>,
         minimum_normalization_gain: f32,
         maximum_normalization_gain: f32,
         minimum_integrated_fraction: f32,
@@ -296,7 +313,9 @@ impl PyStackOptions {
         inner.acceptance.maximum_registration_rms_pixels = maximum_registration_rms;
         inner.acceptance.maximum_scale_deviation = maximum_scale_deviation;
         inner.acceptance.maximum_rotation_degrees = maximum_rotation_degrees;
-        inner.acceptance.minimum_overlap_fraction = minimum_overlap;
+        if let Some(minimum_overlap) = minimum_overlap {
+            inner.acceptance.minimum_overlap_fraction = minimum_overlap;
+        }
         inner.acceptance.minimum_normalization_gain = minimum_normalization_gain;
         inner.acceptance.maximum_normalization_gain = maximum_normalization_gain;
         inner.acceptance.minimum_integrated_fraction = minimum_integrated_fraction;
@@ -306,7 +325,10 @@ impl PyStackOptions {
         inner
             .validate()
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            minimum_overlap,
+        })
     }
 
     #[getter]
@@ -1259,9 +1281,10 @@ impl PyLiveStacker {
     /// With ``registration_model="quadratic"`` in ``options``, a frame lying
     /// mostly within one panel is warped onto it, which follows lens
     /// distortion across a meridian flip; each panel's first frame keeps
-    /// its similarity. Use ``minimum_overlap=0.05`` for panels, the CLI's
-    /// default for ``--reference expand``: panels planned for 10% overlap
-    /// land nearer 9%, and the default of 0.60 joins none of them.
+    /// its similarity. Unless ``options`` set ``minimum_overlap``, a frame
+    /// joins sharing 0.05 of its footprint with the canvas, as with the
+    /// CLI's ``--reference expand``, rather than the 0.60 a fixed reference
+    /// needs: panels planned for 10% overlap land nearer 9%.
     /// ``expansion_planning_notes`` counts the lights left off the canvas.
     ///
     /// ``cancel``, a callable, is asked before each frame is read; Ctrl-C
@@ -1309,9 +1332,10 @@ impl PyLiveStacker {
             .checked_mul(1_000_000)
             .filter(|samples| *samples > 0)
             .ok_or_else(|| PyValueError::new_err("max_canvas_megasamples must be positive"))?;
-        let options = options
-            .as_ref()
-            .map_or_else(StackOptions::default, |options| options.inner.clone());
+        let options = options.as_deref().map_or_else(
+            || PyStackOptions::default().expanding(),
+            PyStackOptions::expanding,
+        );
         // Planning reads every light with the GIL released, taking it back
         // before each one to ask whether to stop.
         let raised: Mutex<Option<PyErr>> = Mutex::new(None);

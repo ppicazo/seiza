@@ -543,7 +543,7 @@ class StackOptions:
         maximum_registration_rms: float = 2.0,
         maximum_scale_deviation: float = 0.04,
         maximum_rotation_degrees: float = 10.0,
-        minimum_overlap: float = 0.60,
+        minimum_overlap: float | None = None,
         minimum_normalization_gain: float = 0.25,
         maximum_normalization_gain: float = 4.0,
         minimum_integrated_fraction: float = 0.50,

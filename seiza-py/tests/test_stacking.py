@@ -822,6 +822,21 @@ def test_expanding_stack_notes_lights_that_did_not_join(tmp_path):
     assert not stacker.push_fits(paths[0]).accepted
 
 
+def test_expanding_stack_defaults_to_the_expanded_minimum_overlap(tmp_path):
+    # Neighbours share 0.42 of their footprints: under the 0.60 a fixed
+    # reference needs, over the expanded canvas's 0.05.
+    paths = overlapping_panels(tmp_path)
+    order = [paths[1], paths[0], paths[2]]
+    for options in (None, seiza.StackOptions(normalization="none")):
+        stacker = seiza.LiveStacker.open_fits_expanding(order, options=options)
+        assert all(stacker.push_fits(path).accepted for path in order)
+    # Options that set the fixed reference's minimum keep it.
+    with pytest.raises(seiza.StackError, match="panel overlap 0.4"):
+        seiza.LiveStacker.open_fits_expanding(
+            order, options=seiza.StackOptions(minimum_overlap=0.6)
+        )
+
+
 def lens_panels(tmp_path, width=600, height=400, step=300):
     """Three panels stacked down one star field, a quarter of each
     overlapping the next, through a radial lens about an axis 30 pixels off

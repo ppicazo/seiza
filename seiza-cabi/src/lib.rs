@@ -21,12 +21,13 @@ use seiza_stacking::{
     CancelSignal, ChannelCoverage, ChannelSamples, ColorComposition, ColorCrop, ColorNormalization,
     ColorOptions, CropReport, DarkLevelScreening, ExternalParameterKind, ExternalParameterValue,
     ExternalToolRequest, ExternalToolSchema, FitsFrame, FlatStarMaskingOptions,
-    FlatStarMaskingStatistics, ForaxxOptions, FrameDiagnostics, FrameDisposition, FrameInputMode,
-    FrameSourceRole, ImpulseFilterOptions, LinearImage, LiveStacker, LrgbLuminance,
-    MasterBuildOptions, MasterDark, MasterFrame, MasterFrameKind, MasterRejectionOptions,
-    NarrowbandMatrix, NarrowbandMix, NarrowbandPalette, RcAstroCli, ReferenceRegion,
-    RegisteredFrameMapping, RgbLuminance, StackExportSnapshot as RustStackExportSnapshot,
-    StackOptions, StackSnapshot as RustStackSnapshot, build_master_from_fits,
+    FlatStarMaskingStatistics, ForaxxOptions, FrameAcceptanceCriteria, FrameDiagnostics,
+    FrameDisposition, FrameInputMode, FrameSourceRole, ImpulseFilterOptions, LinearImage,
+    LiveStacker, LrgbLuminance, MasterBuildOptions, MasterDark, MasterFrame, MasterFrameKind,
+    MasterRejectionOptions, NarrowbandMatrix, NarrowbandMix, NarrowbandPalette, RcAstroCli,
+    ReferenceRegion, RegisteredFrameMapping, RgbLuminance,
+    StackExportSnapshot as RustStackExportSnapshot, StackOptions,
+    StackSnapshot as RustStackSnapshot, build_master_from_fits,
     build_master_from_fits_with_scratch, checkpoint_depths as rust_checkpoint_depths, combine_lrgb,
     combine_narrowband, combine_narrowband_matrix, combine_rgb, combine_super_lrgb,
     combine_super_rgb, crop_report, path_identity, paths_refer_to_same_file, write_color_fits_f32,
@@ -3541,11 +3542,12 @@ fn open_with_reference_image(
 /// uses 256). A run peaks at about 40 bytes per sample. With
 /// `"registration": {"model": "quadratic"}` in `options_json`, a light lying
 /// mostly within one panel is warped onto it, which follows lens distortion
-/// across a meridian flip. For panels, set
-/// `"acceptance": {"minimum_overlap_fraction": 0.05}`, the CLI's default
-/// for `--reference expand`: panels planned for 10% overlap land nearer 9%,
-/// and the default of 0.60 joins none of them. Lights left off the canvas
-/// are counted in [`seiza_live_stacker_expansion_planning_notes_json`].
+/// across a meridian flip. Unless `options_json` sets
+/// `"acceptance": {"minimum_overlap_fraction": ...}`, a light joins sharing
+/// 0.05 of its footprint with the canvas, as with the CLI's
+/// `--reference expand`, rather than the 0.60 a fixed reference needs:
+/// panels planned for 10% overlap land nearer 9%. Lights left off the
+/// canvas are counted in [`seiza_live_stacker_expansion_planning_notes_json`].
 /// Bayer drizzle and drizzled reintegration are not supported on the canvas.
 ///
 /// The masters, `dark_exposure_seconds` and `options_json` are those of
@@ -3613,7 +3615,7 @@ pub unsafe extern "C" fn seiza_live_stacker_open_fits_expanding(
         let maximum_samples = megasamples
             .checked_mul(1_000_000)
             .ok_or_else(|| "max_canvas_megasamples is too large".to_string())?;
-        let options = stack_options(options_json)?;
+        let options = expanding_stack_options(options_json)?;
         let cancel = unsafe { cancel.as_ref() };
         let stacker = LiveStacker::open_fits_expanding(
             &paths,
@@ -7973,6 +7975,29 @@ fn background_config(config_json: *const c_char) -> Result<BackgroundConfig, Str
         .map_err(|error| format!("invalid background config JSON: {error}"))
 }
 
+/// [`stack_options`] for an expanded canvas: unless `options_json` sets
+/// `acceptance.minimum_overlap_fraction`, a frame joins sharing
+/// [`FrameAcceptanceCriteria::EXPANDED_MINIMUM_OVERLAP_FRACTION`] of its
+/// footprint with the canvas, as with the CLI's `--reference expand`.
+fn expanding_stack_options(options_json: *const c_char) -> Result<StackOptions, String> {
+    let mut options = stack_options(options_json)?;
+    let set = if options_json.is_null() {
+        false
+    } else {
+        serde_json::from_str::<serde_json::Value>(&required_str(
+            options_json,
+            "stack options JSON",
+        )?)
+        .ok()
+        .is_some_and(|json| json["acceptance"].get("minimum_overlap_fraction").is_some())
+    };
+    if !set {
+        options.acceptance.minimum_overlap_fraction =
+            FrameAcceptanceCriteria::EXPANDED_MINIMUM_OVERLAP_FRACTION;
+    }
+    Ok(options)
+}
+
 fn stack_options(options_json: *const c_char) -> Result<StackOptions, String> {
     let options = if options_json.is_null() {
         StackOptions::default()
@@ -9763,26 +9788,24 @@ mod tests {
         flat: Option<&str>,
         cancel: *const SeizaCancelSignal,
     ) -> Result<*mut SeizaLiveStacker, String> {
-        open_expanding_with(paths, flat, cancel, 0.1)
+        let options = json!({
+            "normalization": {"mode": "none"},
+            "rejection": {"mode": "none"},
+            "acceptance": {"minimum_overlap_fraction": 0.1},
+        });
+        open_expanding_with(paths, flat, cancel, Some(&options))
     }
 
+    /// An expanded stack planned with `options`, or with null options.
     fn open_expanding_with(
         paths: &Value,
         flat: Option<&str>,
         cancel: *const SeizaCancelSignal,
-        minimum_overlap_fraction: f32,
+        options: Option<&Value>,
     ) -> Result<*mut SeizaLiveStacker, String> {
         let paths = CString::new(paths.to_string()).unwrap();
         let flat = flat.map(|flat| CString::new(flat).unwrap());
-        let options = CString::new(
-            json!({
-                "normalization": {"mode": "none"},
-                "rejection": {"mode": "none"},
-                "acceptance": {"minimum_overlap_fraction": minimum_overlap_fraction},
-            })
-            .to_string(),
-        )
-        .unwrap();
+        let options = options.map(|options| CString::new(options.to_string()).unwrap());
         let mut error = ptr::null_mut();
         let stacker = unsafe {
             seiza_live_stacker_open_fits_expanding(
@@ -9791,7 +9814,9 @@ mod tests {
                 ptr::null(),
                 flat.as_ref().map_or(ptr::null(), |flat| flat.as_ptr()),
                 0.0,
-                options.as_ptr(),
+                options
+                    .as_ref()
+                    .map_or(ptr::null(), |options| options.as_ptr()),
                 0,
                 cancel,
                 &mut error,
@@ -9883,7 +9908,12 @@ mod tests {
         std::fs::copy(&paths[1], &again).unwrap();
         // Neighbours share 80 of their 192 columns, under half.
         let order = json!([&paths[1], &paths[0], again.to_str().unwrap(), &paths[2]]);
-        let stacker = open_expanding_with(&order, None, ptr::null(), 0.5).unwrap();
+        let options = json!({
+            "normalization": {"mode": "none"},
+            "rejection": {"mode": "none"},
+            "acceptance": {"minimum_overlap_fraction": 0.5},
+        });
+        let stacker = open_expanding_with(&order, None, ptr::null(), Some(&options)).unwrap();
         let notes = stacker_json(seiza_live_stacker_expansion_planning_notes_json, stacker);
         let note = notes[0].as_str().unwrap();
         assert!(
@@ -9896,6 +9926,48 @@ mod tests {
         );
         assert!(note.contains("below the minimum overlap of 0.5"), "{note}");
         unsafe { seiza_live_stacker_free(stacker) };
+    }
+
+    /// Unless the options set one, an expanded canvas admits panels by the
+    /// expanded canvas's minimum overlap, not the 0.60 a fixed reference
+    /// needs: these neighbours share 0.42 of their footprints.
+    #[test]
+    fn expanding_stack_cabi_defaults_to_the_expanded_minimum_overlap() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = overlapping_panels(directory.path());
+        let order = [&paths[1], &paths[0], &paths[2]];
+        assert_eq!(
+            expanding_stack_options(ptr::null())
+                .unwrap()
+                .acceptance
+                .minimum_overlap_fraction,
+            FrameAcceptanceCriteria::EXPANDED_MINIMUM_OVERLAP_FRACTION
+        );
+        // These panels' flat sky leaves the default normalization nothing to
+        // fit, so only normalization is set.
+        let options = json!({"normalization": {"mode": "none"}});
+        let stacker =
+            open_expanding_with(&json!(order), None, ptr::null(), Some(&options)).unwrap();
+        for path in order {
+            let path = CString::new(path.as_str()).unwrap();
+            let mut error = ptr::null_mut();
+            let json =
+                unsafe { seiza_live_stacker_push_fits_json(stacker, path.as_ptr(), &mut error) };
+            assert!(error.is_null());
+            let disposition: Value =
+                serde_json::from_str(unsafe { CStr::from_ptr(json) }.to_str().unwrap()).unwrap();
+            unsafe { seiza_string_free(json) };
+            assert_eq!(disposition["accepted"], true, "{disposition}");
+        }
+        unsafe { seiza_live_stacker_free(stacker) };
+        // Options that set the fixed reference's minimum keep it.
+        let options = json!({
+            "normalization": {"mode": "none"},
+            "acceptance": {"minimum_overlap_fraction": 0.6},
+        });
+        let error =
+            open_expanding_with(&json!(order), None, ptr::null(), Some(&options)).unwrap_err();
+        assert!(error.contains("panel overlap 0.4"), "{error}");
     }
 
     #[test]

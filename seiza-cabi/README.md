@@ -107,8 +107,10 @@ exposes the **superset** of what both apps need.
   `seiza_live_stacker_expanded_lens_json` gives the lens distortion planning
   undid, or `null`, and `..._expansion_planning_notes_json` what planning
   noted along the way, starting with how many lights did not join, if any,
-  and how close they came to `minimum_overlap_fraction`; 0.05 suits panels
-  planned for 10% overlap, which land nearer 9%. Array and path-based pushes
+  and how close they came to `minimum_overlap_fraction`. Unless the options
+  set that, a light joins sharing 0.05 of its footprint with the canvas, as
+  with the CLI's `--reference expand`: panels planned for 10% overlap land
+  nearer 9%. Array and path-based pushes
   return owned admission JSON. Borrowed
   mean/coverage/rejection views support copy-free live display, snapshots add
   variance, and `seiza_live_stacker_finish` moves the final accumulator into an

@@ -80,9 +80,10 @@ note. Filter and date changes are ignored. `expansion_planning_notes()` exposes
 these notes for newly planned stacks, first among them how many lights did not
 join the canvas and, for those that matched a panel but overlapped it too
 little, the largest overlap they reached against `minimum_overlap_fraction`;
-reopening a context does not rerun planning. For mosaic panels,
+reopening a context does not rerun planning.
 `FrameAcceptanceCriteria::EXPANDED_MINIMUM_OVERLAP_FRACTION` (0.05) is the
-suggested minimum overlap: panels planned for 10% overlap land nearer 9%. A lens-corrected
+minimum overlap the CLI, the C ABI and Python give an expanded canvas when the
+caller sets none: panels planned for 10% overlap land nearer 9%. A lens-corrected
 canvas drops the original WCS, including SIP: plate-solve its output to obtain
 astrometry for the undistorted grid. Without lens correction, the anchor WCS
 is retained with its reference pixel shifted. Bayer drizzle and
