@@ -24,6 +24,7 @@ use crate::{
 };
 use seiza::DetectedStar;
 use seiza_fits::HeaderValue;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -166,6 +167,28 @@ fn flipped(rotation_radians: f64) -> bool {
     (rotation_radians.to_degrees().rem_euclid(360.0) - 180.0).abs() <= PIER_FLIP_TOLERANCE_DEGREES
 }
 
+/// The canvas-to-creator geometry, before the shared lens is attached.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PanelProjection {
+    pub width: usize,
+    pub height: usize,
+    pub warp: PolynomialWarp,
+}
+
+impl PanelProjection {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.width == 0 || self.height == 0 || self.width.checked_mul(self.height).is_none() {
+            return Err(Error::Registration(
+                "panel projection has invalid sensor dimensions".into(),
+            ));
+        }
+        self.warp
+            .source_transformed(SimilarityTransform::IDENTITY)?;
+        Ok(())
+    }
+}
+
 /// One panel's footprint on the canvas, with the stars inside it.
 #[derive(Clone, Debug)]
 struct Window {
@@ -178,6 +201,8 @@ struct Window {
     /// Roughly independent transforms registration tries: translations
     /// within the search radius one tolerance apart, and triangle candidates.
     hypotheses: f64,
+    projection: Option<PanelProjection>,
+    creator: Option<Registrar>,
 }
 
 impl Window {
@@ -243,7 +268,98 @@ impl Window {
             maximum_stars,
             match_tolerance_pixels,
             hypotheses,
+            projection: None,
+            creator: None,
         })
+    }
+
+    fn with_projection(mut self, projection: Option<PanelProjection>) -> Result<Self> {
+        self.creator = match &projection {
+            Some(projection) => {
+                projection.validate()?;
+                Some(self.registrar.remapped_stars(
+                    projection.width,
+                    projection.height,
+                    |x, y| {
+                        projection
+                            .warp
+                            .apply(x + self.region.x as f64, y + self.region.y as f64)
+                    },
+                )?)
+            }
+            None => None,
+        };
+        self.projection = projection;
+        Ok(self)
+    }
+
+    /// Find the exposure on its panel's sensor plane, where a similarity
+    /// describes dithers and rotation; retain the canvas projection exactly.
+    fn register_projected(
+        &self,
+        stars: &[DetectedStar],
+        width: usize,
+        height: usize,
+    ) -> Result<(RegistrationResult, f64)> {
+        let projection = self
+            .projection
+            .as_ref()
+            .ok_or_else(|| Error::Registration("panel has no projection".into()))?;
+        let creator = self
+            .creator
+            .as_ref()
+            .ok_or_else(|| Error::Registration("panel has no creator registrar".into()))?;
+        if (width, height) != (projection.width, projection.height) {
+            return Err(Error::Registration(
+                "frame dimensions differ from the projected panel's sensor".into(),
+            ));
+        }
+        let found = creator.register_similarity_stars(stars)?;
+        let coverage = self.validate_match(
+            &found,
+            stars,
+            (width, height),
+            &creator.reference_star_positions(),
+            (projection.width, projection.height),
+        )?;
+        let matched = found.transform;
+        let (translation_x, translation_y) = matched.inverse_apply(0.0, 0.0);
+        let inverse = SimilarityTransform {
+            scale: 1.0 / matched.scale,
+            rotation_radians: -matched.rotation_radians,
+            translation_x,
+            translation_y,
+        };
+        let warp = projection.warp.source_transformed(inverse)?;
+        if coverage < WARP_COVERAGE {
+            return Err(Error::Registration(
+                "too little of the frame overlaps a projected panel to refine its geometry".into(),
+            ));
+        }
+        let mut source = Vec::new();
+        let mut canvas = Vec::new();
+        for row in 0..=8 {
+            for column in 0..=8 {
+                let x = self.region.x as f64 + (self.region.width - 1) as f64 * column as f64 / 8.0;
+                let y = self.region.y as f64 + (self.region.height - 1) as f64 * row as f64 / 8.0;
+                let (u, v) = warp.apply(x, y);
+                if u >= 0.0 && v >= 0.0 && u < width as f64 && v < height as f64 {
+                    source.push((u, v));
+                    canvas.push((x, y));
+                }
+            }
+        }
+        let transform = crate::lens::fit_similarity(&source, &canvas)
+            .ok_or_else(|| Error::Registration("projected panel has no usable footprint".into()))?;
+        let seed = RegistrationResult {
+            transform,
+            warp: Some(warp),
+            ..found
+        };
+        let result = self.refine_warp(seed, stars).ok_or_else(|| Error::Registration(
+            "projected registration has too few reliable stars to refine; frame was not integrated".into()
+        ))?;
+        Ok((result, coverage))
     }
 
     /// Register a `width` by `height` source's stars to this panel by
@@ -255,7 +371,34 @@ impl Window {
         width: usize,
         height: usize,
     ) -> Result<(RegistrationResult, f64)> {
+        if self.projection.is_some() {
+            return self.register_projected(stars, width, height);
+        }
         let mut result = self.registrar.register_similarity_stars(stars)?;
+        let coverage = self.validate_match(
+            &result,
+            stars,
+            (width, height),
+            &self.stars,
+            (self.region.width, self.region.height),
+        )?;
+        result.transform.translation_x += self.region.x as f64;
+        result.transform.translation_y += self.region.y as f64;
+        Ok((result, coverage))
+    }
+
+    /// Reject chance alignments and sparse sensor-fixed matches in the same
+    /// coordinate plane in which the similarity was measured.
+    fn validate_match(
+        &self,
+        result: &RegistrationResult,
+        stars: &[DetectedStar],
+        source_size: (usize, usize),
+        reference_positions: &[(f64, f64)],
+        reference_size: (usize, usize),
+    ) -> Result<f64> {
+        let (width, height) = source_size;
+        let (reference_width, reference_height) = reference_size;
         let transform = result.transform;
         let inside = |(x, y): (f64, f64), width: usize, height: usize| {
             x >= 0.0 && y >= 0.0 && x < width as f64 && y < height as f64
@@ -266,13 +409,12 @@ impl Window {
             .filter(|star| {
                 inside(
                     transform.apply(star.x, star.y),
-                    self.region.width,
-                    self.region.height,
+                    reference_width,
+                    reference_height,
                 )
             })
             .count();
-        let panel_shared = self
-            .stars
+        let panel_shared = reference_positions
             .iter()
             .filter(|&&(x, y)| inside(transform.inverse_apply(x, y), width, height))
             .count();
@@ -281,7 +423,7 @@ impl Window {
         // often as their density allows.
         let disc = std::f64::consts::PI * self.match_tolerance_pixels.powi(2);
         let panel_density =
-            self.stars.len() as f64 / (self.region.width * self.region.height) as f64;
+            reference_positions.len() as f64 / (reference_width * reference_height) as f64;
         let source_density = source_stars.len() as f64 / (width * height) as f64;
         let chance =
             (source_shared as f64 * panel_density).max(panel_shared as f64 * source_density) * disc;
@@ -306,39 +448,7 @@ impl Window {
                 result.matched_stars
             )));
         }
-        result.transform.translation_x += self.region.x as f64;
-        result.transform.translation_y += self.region.y as f64;
-        Ok((
-            result,
-            source_shared as f64 / source_stars.len().max(1) as f64,
-        ))
-    }
-
-    /// Refine a canvas similarity found elsewhere against this panel,
-    /// returning it with the fraction of the source's stars within the panel.
-    fn refine(
-        &self,
-        seed: SimilarityTransform,
-        stars: &[DetectedStar],
-    ) -> Result<(RegistrationResult, f64)> {
-        let mut local = seed;
-        local.translation_x -= self.region.x as f64;
-        local.translation_y -= self.region.y as f64;
-        let mut result = self.registrar.refine_similarity_stars(local, stars)?;
-        let source_stars = &stars[..stars.len().min(self.maximum_stars)];
-        let inside = source_stars
-            .iter()
-            .filter(|star| {
-                let (x, y) = result.transform.apply(star.x, star.y);
-                x >= 0.0
-                    && y >= 0.0
-                    && x < self.region.width as f64
-                    && y < self.region.height as f64
-            })
-            .count();
-        result.transform.translation_x += self.region.x as f64;
-        result.transform.translation_y += self.region.y as f64;
-        Ok((result, inside as f64 / source_stars.len().max(1) as f64))
+        Ok(source_shared as f64 / source_stars.len().max(1) as f64)
     }
 
     /// Fit the registration model's polynomial warp against this panel around
@@ -508,6 +618,42 @@ impl CanvasRegistrar {
             .collect()
     }
 
+    pub(crate) fn panel_projections(&self) -> Vec<Option<PanelProjection>> {
+        if self
+            .windows
+            .iter()
+            .all(|window| window.projection.is_none())
+        {
+            Vec::new()
+        } else {
+            self.windows
+                .iter()
+                .map(|window| window.projection.clone())
+                .collect()
+        }
+    }
+
+    pub(crate) fn with_projections(
+        mut self,
+        projections: Vec<Option<PanelProjection>>,
+    ) -> Result<Self> {
+        if projections.is_empty() {
+            return Ok(self);
+        }
+        if projections.len() != self.windows.len() {
+            return Err(Error::Stack(
+                "an expanded canvas saves a projection for every panel".into(),
+            ));
+        }
+        self.windows = self
+            .windows
+            .into_iter()
+            .zip(projections)
+            .map(|(window, projection)| window.with_projection(projection))
+            .collect::<Result<_>>()?;
+        Ok(self)
+    }
+
     /// The lens the canvas is undistorted from, if any.
     pub(crate) fn lens(&self) -> Option<LensDistortion> {
         self.lens
@@ -537,6 +683,16 @@ impl CanvasRegistrar {
     /// The best-matched registration among the panels, warped against that
     /// panel when the frame lies mostly within it.
     pub(crate) fn register(&self, source: &LinearImage) -> Result<RegistrationResult> {
+        if self.lens.is_some()
+            && self
+                .windows
+                .iter()
+                .all(|window| window.projection.is_none())
+        {
+            return Err(Error::Registration(
+                "this saved mosaic has no panel projections; rebuild the expanded reference from the original frames before adding exposures".into(),
+            ));
+        }
         let mut stars = self.windows[0].registrar.detect_source_stars(source);
         if let Some(lens) = &self.lens {
             stars = lens.undistort_stars(&stars);
@@ -544,6 +700,9 @@ impl CanvasRegistrar {
         let mut best: Option<(RegistrationResult, f64, &Window)> = None;
         let mut last_error = None;
         for window in &self.windows {
+            if self.lens.is_some() && window.projection.is_none() {
+                continue;
+            }
             match window.register(&stars, source.width, source.height) {
                 Ok((result, coverage)) => {
                     if best
@@ -559,7 +718,7 @@ impl CanvasRegistrar {
         let (mut best, coverage, window) = best.ok_or_else(|| {
             last_error.unwrap_or_else(|| Error::Registration("no panel matched".into()))
         })?;
-        if coverage >= WARP_COVERAGE {
+        if best.warp.is_none() && coverage >= WARP_COVERAGE {
             window.warp(&mut best, &stars);
         }
         let mut best = through_lens(best, self.lens);
@@ -1728,7 +1887,12 @@ impl Plan {
             translation_y: -top,
             ..SimilarityTransform::IDENTITY
         };
-        let warp = PolynomialWarp::from_similarity(transform).with_distortion(lens);
+        let projection = PanelProjection {
+            width: source.width,
+            height: source.height,
+            warp: PolynomialWarp::from_similarity(transform),
+        };
+        let warp = projection.warp.clone().with_distortion(lens);
         let region = ReferenceRegion {
             x: 0,
             y: 0,
@@ -1745,7 +1909,8 @@ impl Plan {
             sites,
         )?;
         drop(source);
-        let anchor = Window::new(&image, region, &options.registration, options.scale())?;
+        let anchor = Window::new(&image, region, &options.registration, options.scale())?
+            .with_projection(Some(projection))?;
         let mut headers = self.record.anchor_headers.clone();
         // These pixels are undistorted. Translating CRPIX cannot compose the
         // raw frame's WCS (including SIP) with this nonlinear mapping. Leave
@@ -2028,12 +2193,14 @@ impl Plan {
         }
         self.commit((width, height, dx, dy), region, &incoming, true)?;
         if start.creates_window {
-            self.windows.push(Window::from_pixels(
-                &incoming,
-                region,
-                &options.registration,
-                options.scale(),
-            )?);
+            self.windows.push(
+                Window::from_pixels(&incoming, region, &options.registration, options.scale())?
+                    .with_projection(Some(PanelProjection {
+                        width: source.width,
+                        height: source.height,
+                        warp: polynomial.translated(region_x, region_y),
+                    }))?,
+            );
         }
         self.registrations.insert(
             path_identity(&start.path),
@@ -2074,17 +2241,18 @@ impl Plan {
             translation_y: self.origin.1,
             ..SimilarityTransform::IDENTITY
         };
-        let refined = seed.and_then(|mut seed| {
+        let refined = if let Some(mut seed) = seed {
             seed.transform = seed.transform.then(origin);
             seed.warp = seed
                 .warp
                 .map(|warp| warp.translated(self.origin.0, self.origin.1));
-            if let Some(result) = self.windows[window].refine_warp(seed.clone(), &stars) {
-                return Some((admissible(result, options).ok()?, window, 1.0));
-            }
-            let (result, coverage) = self.windows[window].refine(seed.transform, &stars).ok()?;
-            Some((admissible(result, options).ok()?, window, coverage))
-        });
+            let result = self.windows[window].refine_warp(seed, &stars).ok_or_else(|| {
+                Error::Registration("projected registration has too few reliable stars to refine; frame was not integrated".into())
+            })?;
+            Some((admissible(result, options)?, window, 1.0))
+        } else {
+            None
+        };
         let (mut registration, window, coverage) = match refined {
             Some(refined) => refined,
             None => {
@@ -2128,6 +2296,9 @@ impl Plan {
         for window in &mut self.windows {
             window.region.x += dx;
             window.region.y += dy;
+            if let Some(projection) = &mut window.projection {
+                projection.warp = projection.warp.translated(dx as f64, dy as f64);
+            }
         }
         self.origin = (self.origin.0 + dx as f64, self.origin.1 + dy as f64);
         for registered in self
@@ -2420,6 +2591,274 @@ fn blank(width: usize, height: usize, channels: usize) -> Result<LinearImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn projected_window(count: usize) -> (Window, Vec<DetectedStar>, SimilarityTransform) {
+        let mut state = 191_u64;
+        let mut random = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (state >> 33) as f64 / (1_u64 << 31) as f64
+        };
+        let stars = (0..count)
+            .map(|_| DetectedStar {
+                x: 40.0 + 880.0 * random(),
+                y: 40.0 + 880.0 * random(),
+                flux: 1.0,
+                peak: 1.0,
+                area: 3,
+            })
+            .collect::<Vec<_>>();
+        let geometry = |x: f64, y: f64| (x + 0.00003 * x * y + 1e-8 * x * x * y, y + 0.01 * x);
+        let pairs = (0..9)
+            .flat_map(|row| {
+                (0..9).map(move |column| {
+                    let (x, y) = (column as f64 * 120.0, row as f64 * 120.0);
+                    ((x, y), geometry(x, y))
+                })
+            })
+            .collect::<Vec<_>>();
+        let region = ReferenceRegion {
+            x: 1500,
+            y: 1800,
+            width: 1000,
+            height: 1000,
+        };
+        let projection = PanelProjection {
+            width: 1000,
+            height: 1000,
+            warp: PolynomialWarp::fit(3, 1000, 1000, &pairs)
+                .unwrap()
+                .translated(region.x as f64, region.y as f64),
+        };
+        let dither = SimilarityTransform {
+            scale: 1.001,
+            rotation_radians: 0.004,
+            translation_x: 3.2,
+            translation_y: -2.1,
+        };
+        let source = stars
+            .iter()
+            .map(|star| {
+                let (x, y) = geometry(star.x, star.y);
+                let (x, y) = dither.apply(x, y);
+                DetectedStar { x, y, ..*star }
+            })
+            .collect();
+        let window = Window::from_stars(
+            region,
+            stars,
+            Window::options(region, &RegistrationOptions::default(), Scale::NATIVE),
+            Scale::NATIVE,
+        )
+        .unwrap()
+        .with_projection(Some(projection))
+        .unwrap();
+        (window, source, dither)
+    }
+
+    #[test]
+    fn projected_default_registration_retains_geometry_for_unplanned_exposures() {
+        let (window, source, dither) = projected_window(600);
+        let (registered, coverage) = window.register(&source, 1000, 1000).unwrap();
+        assert!(coverage > 0.95);
+        assert!(registered.matched_stars > 550);
+        assert!(registered.rms_error_pixels < 1e-8);
+        let fitted = registered.warp.unwrap();
+        assert_eq!(fitted.order(), 3);
+        let projection = window.projection.as_ref().unwrap();
+        for (x, y) in [(1501.2, 1803.4), (2438.1, 2737.3), (2017.4, 2312.8)] {
+            let (u, v) = projection.warp.apply(x, y);
+            let expected = dither.apply(u, v);
+            let actual = fitted.apply(x, y);
+            assert!((actual.0 - expected.0).hypot(actual.1 - expected.1) < 1e-8);
+        }
+    }
+
+    #[test]
+    fn projected_default_registration_retains_geometry_across_a_meridian_flip() {
+        let (window, source, dither) = projected_window(600);
+        // Pixel centres span 0..999, so a half-turn about the sensor centre
+        // sends (x, y) to (999 - x, 999 - y) in its undistorted plane.
+        let flip = SimilarityTransform {
+            rotation_radians: std::f64::consts::PI,
+            translation_x: 999.0,
+            translation_y: 999.0,
+            ..SimilarityTransform::IDENTITY
+        };
+        let flipped = source
+            .iter()
+            .map(|star| {
+                let (x, y) = flip.apply(star.x, star.y);
+                DetectedStar { x, y, ..*star }
+            })
+            .collect::<Vec<_>>();
+        let (registered, coverage) = window.register(&flipped, 1000, 1000).unwrap();
+        assert!(coverage > 0.95);
+        assert!(registered.matched_stars > 550);
+        assert!(registered.rms_error_pixels < 1e-8);
+        let fitted = registered.warp.unwrap();
+        assert_eq!(fitted.order(), 3);
+        let projection = window.projection.as_ref().unwrap();
+        let source_transform = dither.then(flip);
+        for (x, y) in [(1501.2, 1803.4), (2438.1, 2737.3), (2017.4, 2312.8)] {
+            let (u, v) = projection.warp.apply(x, y);
+            let expected = source_transform.apply(u, v);
+            let actual = fitted.apply(x, y);
+            assert!((actual.0 - expected.0).hypot(actual.1 - expected.1) < 1e-8);
+        }
+    }
+
+    #[test]
+    fn projected_registration_never_downgrades_when_too_few_stars_constrain_the_warp() {
+        let (window, source, _) = projected_window(20);
+        assert!(
+            window
+                .creator
+                .as_ref()
+                .unwrap()
+                .register_similarity_stars(&source)
+                .is_ok()
+        );
+        let error = window
+            .register(&source, 1000, 1000)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("too few reliable stars"), "{error}");
+        let mut plan = Plan {
+            image: blank(2500, 2800, 1).unwrap(),
+            finite: 0,
+            registrations: HashMap::new(),
+            headers: Vec::new(),
+            windows: vec![window.clone()],
+            last_window: 0,
+            lens: Some(LensDistortion::none(1000, 1000)),
+            origin: (0.0, 0.0),
+            record: Record::default(),
+        };
+        let joined = Joined {
+            path: "sparse.fits".into(),
+            stars: source,
+            size: (1000, 1000),
+            window: 0,
+            starts_panel: false,
+        };
+        let seed = RegistrationResult {
+            transform: SimilarityTransform::IDENTITY,
+            warp: Some(window.projection.unwrap().warp),
+            matched_stars: 20,
+            rms_error_pixels: 0.0,
+            drift_pixels: 0.0,
+        };
+        let error = plan
+            .register_through_lens(&joined, Some(seed), &StackOptions::default(), usize::MAX)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("too few reliable stars"), "{error}");
+    }
+
+    #[test]
+    fn projected_registration_rejects_sparse_sensor_fixed_matches() {
+        let (width, height) = (4000, 3000);
+        let mut state = 1517_u64;
+        let mut random = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (state >> 33) as f64 / (1_u64 << 31) as f64
+        };
+        let mut reference = Vec::<DetectedStar>::new();
+        while reference.len() < 800 {
+            let (x, y) = (40.0 + 3920.0 * random(), 40.0 + 2920.0 * random());
+            if reference
+                .iter()
+                .all(|star| (star.x - x).hypot(star.y - y) >= 8.0)
+            {
+                reference.push(DetectedStar {
+                    x,
+                    y,
+                    flux: if reference.len() < 20 { 2.0 } else { 1.0 },
+                    peak: 1.0,
+                    area: 3,
+                });
+            }
+        }
+        // Twenty bright detections are fixed to the sensor, not the sky.
+        // Every other source star belongs to an unrelated field, with no
+        // accidental correspondence near the identity transform.
+        let mut source = reference[..20].to_vec();
+        while source.len() < 800 {
+            let (x, y) = (40.0 + 3920.0 * random(), 40.0 + 2920.0 * random());
+            if reference
+                .iter()
+                .chain(&source)
+                .all(|star| (star.x - x).hypot(star.y - y) >= 8.0)
+            {
+                source.push(DetectedStar {
+                    x,
+                    y,
+                    flux: 1.0,
+                    peak: 1.0,
+                    area: 3,
+                });
+            }
+        }
+        let region = ReferenceRegion {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        let window = Window::from_stars(
+            region,
+            reference,
+            Window::options(region, &RegistrationOptions::default(), Scale::NATIVE),
+            Scale::NATIVE,
+        )
+        .unwrap()
+        .with_projection(Some(PanelProjection {
+            width,
+            height,
+            warp: PolynomialWarp::from_similarity(SimilarityTransform::IDENTITY),
+        }))
+        .unwrap();
+        let found = window
+            .creator
+            .as_ref()
+            .unwrap()
+            .register_similarity_stars(&source)
+            .unwrap();
+        assert_eq!(found.matched_stars, 20);
+        let seed = RegistrationResult {
+            warp: Some(PolynomialWarp::from_similarity(found.transform)),
+            ..found
+        };
+        // An affine warp requires only fifteen pairs; a tiny fitted RMS
+        // therefore does not establish that these images show the same sky.
+        let fitted = window.refine_warp(seed, &source).unwrap();
+        assert_eq!(fitted.matched_stars, 20);
+        assert!(fitted.rms_error_pixels < 1e-8);
+        let error = window
+            .register(&source, width, height)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("only 20 of the 800 stars"), "{error}");
+    }
+
+    #[test]
+    fn legacy_lens_canvas_requires_replanning_before_adding_frames() {
+        let (mut window, _, _) = projected_window(100);
+        window.projection = None;
+        window.creator = None;
+        let image = blank(2500, 2800, 1).unwrap();
+        let canvas = CanvasRegistrar::from_windows(
+            &image,
+            vec![window],
+            Some(LensDistortion::none(1000, 1000)),
+        );
+        assert!(canvas.panel_projections().is_empty());
+        let error = canvas
+            .register(&blank(1000, 1000, 1).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("rebuild the expanded reference"), "{error}");
+    }
 
     #[test]
     fn wide_panel_projection_uses_a_validated_cubic() {

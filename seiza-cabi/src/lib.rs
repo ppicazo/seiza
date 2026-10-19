@@ -3277,6 +3277,11 @@ pub unsafe extern "C" fn seiza_stack_detect_defects_json(
 /// every pushed light are judged under against the masters (tolerances left
 /// out keep their defaults). All files
 /// are fully read during this call and are not kept open afterward.
+/// Local-background offsets use median paired residuals after applying the
+/// gain, preserving shared nebular structure. Mosaic reintegration uses up
+/// to twenty of the best exposures covering each background sample.
+/// It retains their recorded spatial corrections and fits additive residuals,
+/// preserving their gains and shared sky structure.
 ///
 /// # Safety
 /// `reference_path` must be a valid NUL-terminated string. Optional paths and
@@ -4630,6 +4635,11 @@ pub type SeizaStackReintegrateProgressCallback =
 /// sample plus the bands of frames being read, at most 256 MiB, independent
 /// of the frame count; up to four frames are held whole at once while their
 /// normalization is fitted.
+/// These bounds require a working scratch cache. If the system temporary
+/// directory cannot hold it, replay may fall back to whole-frame processing
+/// with substantially greater memory use. To choose another disk for ordinary
+/// reintegration, retain frames in an existing writable directory before
+/// stacking with [`seiza_live_stacker_retain_frames_for_reintegration`].
 ///
 /// # Safety
 /// `stacker` must be a live `SeizaLiveStacker` pointer, externally
@@ -4841,7 +4851,9 @@ pub unsafe extern "C" fn seiza_live_stacker_bin_factor(stacker: *const SeizaLive
 /// for every other frame the RMS the binned pass measured, which its carried
 /// transform is expected to keep (a host may warn on a canvas). It is NaN
 /// when no frame's is known, as for a stack reopened from a context and not
-/// refined. The refit reads each frame once (twice on a canvas), and
+/// refined. The refit reads each frame once. On a canvas it reads every
+/// contributor once, then unwarped frames again; when every frame already
+/// has a warp, it skips the refit and its reads entirely. The
 /// `progress` hears each read as pass 0 for each frame in turn before the
 /// reintegration's own progress.
 /// `low_sigma`, `high_sigma`, `cancel`, `progress` and `context` work as in

@@ -483,6 +483,34 @@ impl PolynomialWarp {
         }
     }
 
+    /// Apply `transform` to this map's source coordinates exactly. A lens
+    /// must be attached only after composition in the undistorted plane.
+    pub(crate) fn source_transformed(&self, transform: SimilarityTransform) -> Result<Self> {
+        self.validate()?;
+        transform.validate()?;
+        if self.distortion.is_some() {
+            return Err(Error::Registration(
+                "cannot compose a panel projection with an attached lens".into(),
+            ));
+        }
+        let cosine = transform.rotation_radians.cos() * transform.scale;
+        let sine = transform.rotation_radians.sin() * transform.scale;
+        let mut composed = self.clone();
+        for ((x, y), (&a, &b)) in composed
+            .x
+            .iter_mut()
+            .zip(&mut composed.y)
+            .zip(self.x.iter().zip(&self.y))
+        {
+            *x = cosine * a - sine * b;
+            *y = sine * a + cosine * b;
+        }
+        composed.x[0] += transform.translation_x;
+        composed.y[0] += transform.translation_y;
+        composed.validate()?;
+        Ok(composed)
+    }
+
     /// The source position of a reference pixel.
     pub fn apply(&self, x: f64, y: f64) -> (f64, f64) {
         let terms = Self::terms(
@@ -942,6 +970,31 @@ impl Registrar {
         }
     }
 
+    /// Match on a panel creator's undistorted sensor plane instead of the
+    /// projected canvas. The pixel scale and matching budget stay unchanged.
+    pub(crate) fn remapped_stars(
+        &self,
+        width: usize,
+        height: usize,
+        map: impl Fn(f64, f64) -> (f64, f64),
+    ) -> Result<Self> {
+        let mut stars = Vec::new();
+        for star in self.detected_stars() {
+            let (x, y) = map(star.x, star.y);
+            if !x.is_finite() || !y.is_finite() {
+                return Err(Error::Registration(
+                    "panel projection produced non-finite stars".into(),
+                ));
+            }
+            if x >= 0.0 && y >= 0.0 && x < width as f64 && y < height as f64 {
+                stars.push(DetectedStar { x, y, ..*star });
+            }
+        }
+        let mut options = self.options.clone();
+        options.model = RegistrationModel::Similarity;
+        Self::from_stars(width, height, stars, options, self.scale)
+    }
+
     /// Positions of the reference frame's brightest stars, on its grid.
     pub(crate) fn reference_star_positions(&self) -> Vec<(f64, f64)> {
         self.reference_stars
@@ -1102,12 +1155,19 @@ impl Registrar {
         seed: &PolynomialWarp,
         source_stars: &[DetectedStar],
     ) -> Option<(PolynomialWarp, usize, f64)> {
-        let order = self.options.model.polynomial_order()?.max(seed.order());
+        // This seed already describes the canvas projection. Similarity
+        // limits an unseeded fit; it must not erase known mosaic geometry.
+        let order = self
+            .options
+            .model
+            .polynomial_order()
+            .unwrap_or(1)
+            .max(seed.order());
         let pairing = distortion_pair_pixels(self.scale);
         let index = StarSpatialIndex::new(source_stars, pairing);
         let mut seen = std::collections::HashSet::new();
         let pairs = self
-            .dense_stars
+            .detected_stars()
             .iter()
             .filter_map(|reference| {
                 let (x, y) = seed.apply(reference.x, reference.y);
@@ -2792,39 +2852,97 @@ mod tests {
         let reference = (0..1200)
             .map(|_| star(30.0 + 900.0 * random(), 30.0 + 900.0 * random()))
             .collect::<Vec<_>>();
-        let geometry = |x: f64, y: f64| (x + 0.02 * x + 0.00003 * x * y, y + 0.01 * x);
-        let source = reference
-            .iter()
-            .map(|s| {
-                let (x, y) = geometry(s.x, s.y);
-                star(x + 0.3, y - 0.2)
-            })
-            .collect::<Vec<_>>();
-        let pairs = reference
-            .iter()
-            .map(|s| ((s.x, s.y), geometry(s.x, s.y)))
-            .collect::<Vec<_>>();
-        let seed = PolynomialWarp::fit(2, 1000, 1000, &pairs).unwrap();
-        let registrar = Registrar::from_stars(
-            1000,
-            1000,
-            reference,
-            RegistrationOptions {
-                maximum_stars: 2000,
-                model: RegistrationModel::Quadratic,
-                ..RegistrationOptions::default()
-            },
-            Scale::NATIVE,
-        )
-        .unwrap();
-        let old = registrar.warp_stars(SimilarityTransform::IDENTITY, &source);
-        let (warp, count, rms) = registrar.warp_stars_seeded(&seed, &source).unwrap();
-        assert!(count > 1100 && rms < 1e-8, "{count} pairs at {rms}");
-        assert!(old.is_none_or(|(_, n, r)| n < count / 2 || r > 0.25));
-        for (x, y) in [(1.0, 2.0), (992.0, 998.0), (451.2, 179.3)] {
-            let expected = geometry(x, y);
-            let actual = warp.apply(x, y);
-            assert!((actual.0 - expected.0 - 0.3).hypot(actual.1 - expected.1 + 0.2) < 1e-8);
+        for order in [2, 3] {
+            let geometry = |x: f64, y: f64| {
+                let cubic = if order == 3 { 1.0e-8 * x * x * y } else { 0.0 };
+                (x + 0.02 * x + 0.00003 * x * y + cubic, y + 0.01 * x)
+            };
+            let source = reference
+                .iter()
+                .map(|s| {
+                    let (x, y) = geometry(s.x, s.y);
+                    star(x + 0.3, y - 0.2)
+                })
+                .collect::<Vec<_>>();
+            let pairs = reference
+                .iter()
+                .map(|s| ((s.x, s.y), geometry(s.x, s.y)))
+                .collect::<Vec<_>>();
+            let seed = PolynomialWarp::fit(order, 1000, 1000, &pairs).unwrap();
+            for model in [
+                RegistrationModel::Similarity,
+                RegistrationModel::Affine,
+                RegistrationModel::Quadratic,
+            ] {
+                let registrar = Registrar::from_stars(
+                    1000,
+                    1000,
+                    reference.clone(),
+                    RegistrationOptions {
+                        maximum_stars: 2000,
+                        model,
+                        ..RegistrationOptions::default()
+                    },
+                    Scale::NATIVE,
+                )
+                .unwrap();
+                let old = registrar.warp_stars(SimilarityTransform::IDENTITY, &source);
+                let (warp, count, rms) = registrar
+                    .warp_stars_seeded(&seed, &source)
+                    .unwrap_or_else(|| panic!("{model:?} discarded order-{order} geometry"));
+                assert_eq!(warp.order(), order, "{model:?}");
+                assert!(
+                    count > 1100 && rms < 1e-8,
+                    "{model:?}, order {order}: {count} pairs at {rms}"
+                );
+                assert!(old.is_none_or(|(_, n, r)| n < count / 2 || r > 0.25));
+                for (x, y) in [(1.0, 2.0), (992.0, 998.0), (451.2, 179.3)] {
+                    let expected = geometry(x, y);
+                    let actual = warp.apply(x, y);
+                    assert!(
+                        (actual.0 - expected.0 - 0.3).hypot(actual.1 - expected.1 + 0.2) < 1e-8,
+                        "{model:?}, order {order} at ({x}, {y})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn polynomial_source_composition_preserves_every_order_and_rejects_a_lens() {
+        let transform = SimilarityTransform {
+            scale: 1.03,
+            rotation_radians: 0.13,
+            translation_x: 7.2,
+            translation_y: -4.1,
+        };
+        for order in 1..=3 {
+            let pairs = (0..8)
+                .flat_map(|row| {
+                    (0..8).map(move |column| {
+                        let (x, y) = (column as f64 * 80.0, row as f64 * 80.0);
+                        let quadratic = if order >= 2 { 0.00003 * x * y } else { 0.0 };
+                        let cubic = if order == 3 { 1e-8 * x * x * y } else { 0.0 };
+                        ((x, y), (x + quadratic + cubic, y + 0.02 * x))
+                    })
+                })
+                .collect::<Vec<_>>();
+            let warp = PolynomialWarp::fit(order, 640, 640, &pairs)
+                .unwrap()
+                .translated(1800.0, 2700.0);
+            let composed = warp.source_transformed(transform).unwrap();
+            assert_eq!(composed.order(), order);
+            for (x, y) in [(1801.2, 2703.4), (2438.1, 3337.3), (2017.4, 3012.8)] {
+                let (u, v) = warp.apply(x, y);
+                let expected = transform.apply(u, v);
+                let actual = composed.apply(x, y);
+                assert!((actual.0 - expected.0).hypot(actual.1 - expected.1) < 1e-10);
+            }
+            assert!(
+                warp.with_distortion(crate::lens::LensDistortion::none(640, 640))
+                    .source_transformed(transform)
+                    .is_err()
+            );
         }
     }
 

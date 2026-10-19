@@ -172,10 +172,11 @@ fn run(pool: &rayon::ThreadPool, inputs: &Inputs) -> Vec<(&'static str, Vec<u32>
         scratch_directory: Some(scratch.to_path_buf()),
         ..BatchStackOptions::default()
     };
-    // Scratch that cannot be created, so reintegration reads every frame
-    // whole for each pass instead of in bands.
-    let whole_frames = BatchStackOptions {
-        scratch_directory: Some(lights[0].join("not-a-directory")),
+    // One-row bands exercise the smallest memory budget. Whole-frame
+    // equivalence is covered by the internal replay_with(false) tests.
+    let narrow_bands = BatchStackOptions {
+        scratch_directory: Some(scratch.to_path_buf()),
+        band_memory_bytes: 1,
         ..BatchStackOptions::default()
     };
     let drizzle = DrizzleOptions {
@@ -202,12 +203,12 @@ fn run(pool: &rayon::ThreadPool, inputs: &Inputs) -> Vec<(&'static str, Vec<u32>
             let depth = measure_depth(stacker.view()).unwrap();
             let live = stacker.snapshot().unwrap();
             let banded = stacker.reintegrate(&batch, |_, _, _| {}).unwrap();
-            let whole = stacker.reintegrate(&whole_frames, |_, _, _| {}).unwrap();
+            let whole = stacker.reintegrate(&narrow_bands, |_, _, _| {}).unwrap();
             let (_, drizzled) = stacker
                 .reintegrate_drizzled(&batch, &drizzle, |_, _, _| {})
                 .unwrap();
             let (_, whole_drizzled) = stacker
-                .reintegrate_drizzled(&whole_frames, &drizzle, |_, _, _| {})
+                .reintegrate_drizzled(&narrow_bands, &drizzle, |_, _, _| {})
                 .unwrap();
             assert_eq!(bits(&drizzled.image.data), bits(&whole_drizzled.image.data));
             let mut live_bits = snapshot_bits(&live);
@@ -268,7 +269,7 @@ fn run(pool: &rayon::ThreadPool, inputs: &Inputs) -> Vec<(&'static str, Vec<u32>
         };
         let (kept, read) = (stack(true), stack(false));
         let banded = kept.reintegrate(&batch, |_, _, _| {}).unwrap();
-        let whole = read.reintegrate(&whole_frames, |_, _, _| {}).unwrap();
+        let whole = read.reintegrate(&narrow_bands, |_, _, _| {}).unwrap();
         assert_eq!(
             snapshot_bits(&banded.snapshot),
             snapshot_bits(&whole.snapshot)
@@ -277,7 +278,7 @@ fn run(pool: &rayon::ThreadPool, inputs: &Inputs) -> Vec<(&'static str, Vec<u32>
             .reintegrate_drizzled(&batch, &drizzle, |_, _, _| {})
             .unwrap();
         let (_, whole_drizzle) = read
-            .reintegrate_drizzled(&whole_frames, &drizzle, |_, _, _| {})
+            .reintegrate_drizzled(&narrow_bands, &drizzle, |_, _, _| {})
             .unwrap();
         assert_eq!(
             bits(&banded_drizzle.image.data),

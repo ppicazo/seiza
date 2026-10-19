@@ -1258,7 +1258,7 @@ mod tests {
     }
 
     #[test]
-    fn reintegration_matches_with_and_without_the_frame_cache() {
+    fn reintegration_cleans_the_cache_and_refuses_invalid_scratch() {
         let (directory, paths) = trailed_reference_set();
         let mut stacker =
             LiveStacker::open_fits(&paths[0], None, None, None, None, StackOptions::default())
@@ -1282,12 +1282,19 @@ mod tests {
         let cached = reintegrate(scratch.clone());
         // The cache cleans up after itself.
         assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
-        // A directory that cannot hold the cache prepares every pass afresh.
-        let uncached = reintegrate(directory.path().join("missing"));
-        assert_eq!(
-            bits(&cached.snapshot.image.data),
-            bits(&uncached.snapshot.image.data)
-        );
+        // An explicitly selected unusable directory must not silently
+        // switch a large mosaic to the higher-memory whole-frame path.
+        let error = stacker
+            .reintegrate(
+                &crate::BatchStackOptions {
+                    scratch_directory: Some(directory.path().join("missing")),
+                    ..crate::BatchStackOptions::default()
+                },
+                |_, _, _| {},
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("scratch directory"), "{error}");
+        assert_eq!(cached.snapshot.accepted_frames, stacker.accepted_frames);
     }
 
     #[test]

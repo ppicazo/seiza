@@ -367,7 +367,13 @@ for frame in result.frames:
 
 `normalization` is `"none"`, `"global"` (the default), `"local"`, or
 `"local-background"`, which keeps one gain per channel and matches each tile's
-background to the reference's so frame edges leave no seams. `demosaic` chooses
+background to the reference's to reduce seams. Offsets use the median of
+differences at corresponding sky positions, after applying the gain, so
+shared nebular structure cancels before the background fit. Mosaic
+reintegration builds this reference from the best exposures covering each
+part of the sky, up to twenty per sample. It preserves their recorded spatial
+corrections and fits remaining additive differences, keeping the gains and
+shared sky structure. `demosaic` chooses
 how one-shot-colour frames are demosaiced: `"vng"` (the default) keeps each
 star's colour across its profile, `"mhc"` gives slightly sharper stars but rings
 around small ones, and `"bilinear"` is fastest. `registration_model` is
@@ -486,6 +492,12 @@ plan when the lens-corrected one failed. `cancel`, a callable, is
 asked before each light is planned, and Ctrl-C also stops planning. Drizzle is
 not supported on an expanded canvas. See the CLI documentation for how panels
 are matched and what the result looks like on real data.
+
+Lens-corrected mosaics preserve each panel's sky projection even with the
+default `registration_model="similarity"`, including new exposures added after
+planning or reopening a saved context. Older saved lens-corrected contexts
+without panel projections can still be replayed; replan from the source lights
+before adding new exposures.
 
 For live integration, construct from a FITS path or a C-contiguous mono/HWC
 RGB NumPy `float32` array. An array-based stacker accepts only already-linear,
@@ -612,6 +624,13 @@ frames keeps each admitted frame's registered image on disk as it is stacked,
 about four bytes per pixel per channel for each frame, so a reintegration reads
 that instead and gives the same result sooner.
 
+For large mosaics, pass an existing writable directory on a disk with room
+as `scratch_directory` to reintegration. An unusable explicit directory is
+an error. With the implicit system temporary directory, cache failure may
+fall back to reading whole frames and require substantially more RAM.
+Mosaic scratch images and their background sample files store only the
+registered footprints and intersecting sample tiles.
+
 `StackOptions(bin_factor=2)` (or 3, or 4) area-mean bins each light after it is
 calibrated, repaired and debayered, before registration, so a large sensor or a
 mosaic stacks quickly and in a quarter (or a sixteenth) of the memory. Pixel
@@ -635,8 +654,10 @@ full.write_fits("stack-full.fits")          # WCS carried to the sensor's grid
 
 Each frame's transform is carried exactly from the binned grid, and with
 `refine=True` (the default) a single field refits it against stars detected at
-full resolution, as registration would find them there; a mosaic refits each
-frame against the canvas the other frames build at full resolution. `refined`
+full resolution, as registration would find them there; a mosaic refits unwarped
+frames against the canvas the other frames build at full resolution. Frames
+with a panel warp keep it; when all frames have warps, the unnecessary refit
+and its input reads are skipped. `refined`
 counts the frames refitted and `rms` is the median registration RMS in the
 sensor's pixels, or None when no frame's is known. A superpixel stack is
 demosaiced with VNG at full resolution. For a quicker look,

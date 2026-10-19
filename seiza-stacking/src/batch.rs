@@ -30,10 +30,16 @@ pub struct BatchStackOptions {
     pub frame_weights: Option<Vec<Vec<f32>>>,
     /// Where [`crate::LiveStacker::reintegrate`] keeps each frame's prepared
     /// image between passes, or `None` for the system temporary directory.
-    /// It needs about four bytes per output sample per admitted frame (29 GB
+    /// An explicitly selected directory must exist and be writable; failure
+    /// to initialize or write it is an error rather than a silent switch to the
+    /// higher-memory whole-frame algorithm.
+    /// It needs up to four bytes per output sample per admitted frame (29 GB
     /// for 92 frames of a 26 MP colour sensor), so choose a disk with room:
     /// where `/tmp` is held in memory, the system default may be too small.
-    /// Without room, reintegration prepares each frame again on every pass.
+    /// If the system temporary directory runs out of room, reintegration
+    /// instead prepares each frame again on every pass, using more memory.
+    /// Mosaics keep each registered footprint and its intersecting background
+    /// sample tiles, rather than storing the uncovered canvas for every frame.
     /// A stack told to [`crate::LiveStacker::retain_frames_for_reintegration`]
     /// keeps its frames in the directory given there instead.
     pub scratch_directory: Option<std::path::PathBuf>,

@@ -1067,9 +1067,11 @@ impl LiveStacker {
     /// pull it. [`FullResolutionStack`] reports the median RMS, refined or
     /// carried, in the sensor's pixels, so a host can warn.
     ///
-    /// The refit reads each frame once, twice on a canvas, keeping its
-    /// registered image in [`crate::BatchStackOptions::scratch_directory`]
-    /// for the integration that follows; `progress` hears each read as
+    /// The refit reads each frame once on a single field. On a canvas it
+    /// first reads every frame, then reads the unwarped frames again; a
+    /// canvas with only warped frames needs no refit reads. Registered
+    /// images wait in [`crate::BatchStackOptions::scratch_directory`] for
+    /// the integration that follows; `progress` hears each refit read as
     /// [`crate::BatchStackPass::Estimate`] for each frame in turn, before the
     /// reintegration's own progress. The
     /// live stack is left as it was. Its frames are refused as
@@ -1113,6 +1115,9 @@ impl LiveStacker {
         refine: bool,
         progress: &mut dyn FnMut(crate::BatchStackPass, usize, usize),
     ) -> Result<(Self, Vec<Option<f64>>)> {
+        // Validate an explicitly chosen scratch directory before reading
+        // the native reference or allocating a full mosaic-sized grid.
+        let frame_cache = self.full_resolution_cache(options.scratch_directory.as_deref())?;
         let bin = self.options.bin_factor;
         let factor = bin as usize;
         let (width, height, channels) = (
@@ -1177,18 +1182,16 @@ impl LiveStacker {
             input_mode: self.input_mode,
             configuration_fingerprint: self.configuration_fingerprint.clone(),
             ledger: self.ledger.rebinned(1)?,
-            frame_cache: None,
+            frame_cache,
             reference_cfa: None,
             reference_is_integrated: self.reference_is_integrated,
             reference_image_path: self.reference_image_path.clone(),
         };
         let refined = match &registrar {
             Some(registrar) => {
-                full.frame_cache = full.full_resolution_cache(options.scratch_directory.as_deref());
                 full.refine_full_resolution(registrar, options.cancel.as_ref(), progress)?
             }
             None if refine && full.canvas_registrar.is_some() => {
-                full.frame_cache = full.full_resolution_cache(options.scratch_directory.as_deref());
                 full.refine_canvas_full_resolution(options.cancel.as_ref(), progress)?
             }
             None => Vec::new(),
@@ -1503,6 +1506,7 @@ impl LiveStacker {
                     &restored.options.registration,
                     restored.options.scale(),
                 )
+                .and_then(|canvas| canvas.with_projections(restored.expanded_panel_projections))
             })
             .transpose()
             .map_err(read_error)?;
@@ -1603,6 +1607,11 @@ impl LiveStacker {
                     .canvas_registrar
                     .as_ref()
                     .map(crate::expand::CanvasRegistrar::panel_stars)
+                    .unwrap_or_default(),
+                expanded_panel_projections: self
+                    .canvas_registrar
+                    .as_ref()
+                    .map(crate::expand::CanvasRegistrar::panel_projections)
                     .unwrap_or_default(),
                 expanded_lens: self
                     .canvas_registrar
@@ -4117,6 +4126,7 @@ mod tests {
                 ledger: &stacker.ledger,
                 expanded_panels: &[],
                 expanded_panel_stars: Vec::new(),
+                expanded_panel_projections: Vec::new(),
                 expanded_lens: None,
             },
         )
@@ -4239,6 +4249,7 @@ mod tests {
                 expanded_panels: &canvas.regions(),
                 // As written before panels kept their stars.
                 expanded_panel_stars: Vec::new(),
+                expanded_panel_projections: Vec::new(),
                 expanded_lens: None,
             },
         )

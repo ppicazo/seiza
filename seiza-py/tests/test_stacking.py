@@ -694,6 +694,22 @@ def test_reintegrate_and_drizzle_reject_a_reference_trail(tmp_path):
         stacker.reintegrate_drizzled(scale=5)
 
 
+@pytest.mark.parametrize("bin_factor", [1, 2])
+def test_reintegration_rejects_unusable_explicit_scratch(tmp_path, bin_factor):
+    path = tmp_path / "light.fits"
+    fits.writeto(path, synthetic_star_field())
+    stacker = seiza.LiveStacker(
+        path, options=seiza.StackOptions(bin_factor=bin_factor, normalization="none")
+    )
+    for scratch in [tmp_path / "missing", path]:
+        with pytest.raises(seiza.StackError, match="scratch directory"):
+            stacker.reintegrate(scratch_directory=scratch)
+        with pytest.raises(seiza.StackError, match="scratch directory"):
+            stacker.reintegrate_full_resolution(scratch_directory=scratch)
+    assert stacker.accepted_frames == 1
+    assert not (tmp_path / "missing").exists()
+
+
 def test_retained_frames_reintegrate_identically(tmp_path):
     clean = synthetic_star_field()
     paths = []
@@ -824,10 +840,13 @@ def lens_panels(tmp_path, width=600, height=400, step=300):
     return paths, axis
 
 
-def test_expanding_stack_measures_the_lens_across_panels(tmp_path):
+@pytest.mark.parametrize("model", ["similarity", "quadratic"])
+@pytest.mark.parametrize("bin_factor", [1, 2])
+def test_expanding_stack_measures_the_lens_across_panels(tmp_path, model, bin_factor):
     paths, axis = lens_panels(tmp_path)
     options = seiza.StackOptions(
-        normalization="none", minimum_overlap=0.1, registration_model="quadratic"
+        normalization="none", minimum_overlap=0.1, registration_model=model,
+        bin_factor=bin_factor,
     )
     stacker = seiza.LiveStacker.open_fits_expanding(paths, options=options)
     lens = stacker.expanded_lens
@@ -835,8 +854,19 @@ def test_expanding_stack_measures_the_lens_across_panels(tmp_path):
     assert np.hypot(lens["center_x"] - axis[0], lens["center_y"] - axis[1]) < 8.0
     assert lens["overlap_rms_pixels"] < 0.2 < lens["undistorted_overlap_rms_pixels"]
     assert lens["focal_length_pixels"] is None
-    for path in paths:
-        assert stacker.push_fits(path).accepted
+    assert stacker.push_fits(paths[0]).accepted
+    context = tmp_path / "projected-mosaic.seiza-stack"
+    stacker.save_context(context)
+    resumed = seiza.LiveStacker.open_context(context)
+    # Planning residual diagnostics are transient; the geometric model persists.
+    for key in ("center_x", "center_y", "k1", "k2", "focal_length_pixels"):
+        assert resumed.expanded_lens[key] == lens[key]
+    for path in paths[1:]:
+        planned = stacker.push_fits(path)
+        continued = resumed.push_fits(path)
+        assert planned.accepted, planned.reason
+        assert continued.accepted, continued.reason
+        assert continued.registration_rms_pixels < 0.3
 
 
 def test_expanding_stack_refuses_bad_inputs_and_honours_cancel(tmp_path):
