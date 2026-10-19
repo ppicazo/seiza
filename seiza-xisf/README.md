@@ -14,8 +14,9 @@ normal; little- or big-endian UInt8, UInt16, UInt32, UInt64, Float32, and
 Float64 samples; and compressed with zlib, LZ4, LZ4HC, or zstd, with or without
 byte shuffling and subblocks. A subblock as long as its data is stored
 uncompressed and copied as it is; every other subblock must decompress to
-exactly its stated length, or the block is invalid. CIELab images convert
-to RGB through the image's RGB working space. Complex32 and Complex64 images have their own reader,
+exactly its stated length, or the block is invalid. Subblocks decompress
+in parallel. CIELab images convert to RGB through the image's RGB working
+space. Complex32 and Complex64 images have their own reader,
 `read_complex_image`, because `FitsImage` has no complex type. FITS
 compatibility keywords and 2x2 Bayer color filter arrays are exposed through
 the same APIs used by `seiza-fits`. SHA-1, SHA-256, SHA-512, SHA3-256, and
@@ -78,8 +79,10 @@ uncompressed, so readers built on the original 2017 document can open the
 file. `write_f32_image_with_options` adds compression, where
 `WriteCompression::recommended()` is the zstd with byte shuffling the
 specification recommends, a checksum, carried metadata, and the `bounds` to
-declare. It stores a subblock that would not shrink uncompressed, and the
-whole block uncompressed when nothing shrinks. It cannot write LZ4HC, since `lz4_flex` has no LZ4HC encoder.
+declare. Like PixInsight, it compresses 4 MiB subblocks in parallel. It
+stores a subblock that would not shrink uncompressed, and the whole block
+uncompressed when nothing shrinks. It cannot write LZ4HC, since `lz4_flex`
+has no LZ4HC encoder.
 
 Declare the range the samples are meant to have, such as `(0.0, 1.0)` for
 normalized samples or `(0.0, 65535.0)` for 16-bit camera counts. PixInsight

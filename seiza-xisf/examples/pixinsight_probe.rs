@@ -23,6 +23,20 @@ fn sample_k(x: usize, y: usize, c: usize, seed: u64, mk: f64) -> f64 {
         as f64
 }
 
+/// Xorshift noise from `seed`, one 16-bit count per sample in storage
+/// order. `verify.js` computes the same sequence.
+fn noise_k(seed: u32, count: usize) -> Vec<f64> {
+    let mut state = seed;
+    (0..count)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            f64::from(state & 0xffff)
+        })
+        .collect()
+}
+
 fn main() {
     let args = std::env::args().collect::<Vec<_>>();
     let (from_pi, to_pi) = (Path::new(&args[1]), Path::new(&args[2]));
@@ -229,6 +243,69 @@ fn main() {
             .unwrap();
             let _ = writeln!(out_manifest, "{out}|{w}|{h}|{ch}|32|1|{seed}|");
         }
+    }
+    // Shuffled noise large enough for 4 MiB subblocks. Its low byte planes
+    // do not shrink, so they are stored uncompressed.
+    for (i, codec) in [
+        CompressionCodec::Zlib,
+        CompressionCodec::Lz4,
+        CompressionCodec::Zstd,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (w, h, seed) = (2048_usize, 2048_usize, 600 + i as u64);
+        let samples = noise_k(seed as u32, w * h)
+            .into_iter()
+            .map(|k| (k / 65535.0) as f32)
+            .collect::<Vec<_>>();
+        let options = WriteOptions {
+            compression: Some(WriteCompression {
+                codec,
+                byte_shuffle: true,
+                level: None,
+            }),
+            checksum: Some(ChecksumAlgorithm::Sha256),
+            metadata: None,
+            bounds: Some((0.0, 1.0)),
+        };
+        let out = format!("seiza_large_{}sh_1", format!("{codec:?}").to_lowercase());
+        let path = to_pi.join(format!("{out}.xisf"));
+        seiza_xisf::write_f32_image_with_options(
+            &path,
+            w,
+            h,
+            F32ImageData::Mono(&samples),
+            &[],
+            &options,
+        )
+        .unwrap();
+        let subblocks = seiza_xisf::read_image_at(&path, 0)
+            .unwrap()
+            .info
+            .compression
+            .map(|compression| compression.subblocks)
+            .unwrap_or_default();
+        let raw = subblocks
+            .iter()
+            .filter(|(stored, length)| stored == length)
+            .count();
+        // zlib's Huffman coding still shrinks these planes a little, so
+        // only the other codecs must store some uncompressed.
+        let ok = subblocks.len() == 4
+            && raw < subblocks.len()
+            && (raw > 0 || codec == CompressionCodec::Zlib);
+        if ok {
+            passed += 1
+        } else {
+            failed += 1
+        }
+        println!(
+            "{} {out:28} subblocks={} uncompressed={raw}",
+            if ok { "ok  " } else { "FAIL" },
+            subblocks.len()
+        );
+        let _ = writeln!(out_manifest, "{out}|{w}|{h}|1|32|1|{seed}||noise");
     }
     std::fs::write(to_pi.join("manifest.txt"), out_manifest).unwrap();
     println!("read checks: {passed} passed, {failed} failed");
