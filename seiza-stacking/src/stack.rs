@@ -443,6 +443,21 @@ pub struct FrameAcceptanceCriteria {
     pub minimum_integrated_fraction: f32,
 }
 
+impl FrameAcceptanceCriteria {
+    /// The `minimum_overlap_fraction` for a canvas expanded to hold mosaic
+    /// panels, where it is the fraction of the smaller footprint a frame must
+    /// share with the canvas to join it. The CLI, the C ABI and Python use it
+    /// when the caller sets none; [`LiveStacker::with_expanding_reference`]
+    /// itself takes the options as they are. Panels planned for 10%
+    /// overlap land short of 10%: on a real 2x2 mosaic planned that way, they
+    /// overlapped by 0.088 to 0.094, and at 0.10 only the anchor's panel
+    /// joined; at this fraction all four did, registering at a median 0.1px
+    /// RMS. Overlap does not guard against chance matches: a match must
+    /// pair more stars than chance would and a share of those the overlap
+    /// should hold, and pass the scale and residual checks.
+    pub const EXPANDED_MINIMUM_OVERLAP_FRACTION: f32 = 0.05;
+}
+
 impl Default for FrameAcceptanceCriteria {
     fn default() -> Self {
         Self {
@@ -1004,8 +1019,11 @@ impl LiveStacker {
             .and_then(crate::expand::CanvasRegistrar::lens_summary)
     }
 
-    /// Metadata compatibility notes from expansion planning. Empty for
-    /// ordinary stacks and reopened contexts, which do not rerun planning.
+    /// Notes from expansion planning: how many lights did not join the
+    /// canvas, and how close those that matched a panel came to the minimum
+    /// overlap; metadata conflicts that skipped the shared lens fit; and a
+    /// lens-corrected plan that failed. Empty for ordinary stacks and
+    /// reopened contexts, which do not rerun planning.
     pub fn expansion_planning_notes(&self) -> &[String] {
         self.canvas_registrar
             .as_ref()

@@ -4,8 +4,8 @@ use anyhow::{Context, Result};
 use clap::{Args, ValueEnum};
 use rayon::prelude::*;
 use seiza_stacking::{
-    CalibrationMasters, DeltaSigmaOptions, FitsFrame, FrameDisposition, NormalizationMode,
-    RegistrationOptions, RejectionMode, StackOptions,
+    CalibrationMasters, DeltaSigmaOptions, FitsFrame, FrameAcceptanceCriteria, FrameDisposition,
+    NormalizationMode, RegistrationOptions, RejectionMode, StackOptions,
 };
 use seiza_stacking::{Continue, PipelineOptions};
 use serde::Serialize;
@@ -207,8 +207,8 @@ pub(crate) struct StackArgs {
     max_registration_drift_fraction: f64,
     /// Minimum fraction of samples overlapping the reference. With
     /// --reference expand, the fraction of the smaller footprint a frame must
-    /// share with the canvas to join it [default: 0.60, or 0.10 with
-    /// --reference expand]
+    /// share with the canvas to join it; panels planned for 10% overlap land
+    /// nearer 9% [default: 0.60, or 0.05 with --reference expand]
     #[arg(long)]
     min_overlap: Option<f32>,
     /// Frames read and prepared at once. By default this follows
@@ -350,9 +350,11 @@ fn known_temperature(metadata: &seiza_stacking::FrameMetadata) -> Option<f64> {
 pub(crate) fn run(options: StackArgs) -> Result<()> {
     let expand = matches!(options.reference, ReferenceArg::Expand);
     let registration_model = options.registration_model;
-    let min_overlap = options
-        .min_overlap
-        .unwrap_or(if expand { 0.10 } else { 0.60 });
+    let min_overlap = options.min_overlap.unwrap_or(if expand {
+        FrameAcceptanceCriteria::EXPANDED_MINIMUM_OVERLAP_FRACTION
+    } else {
+        FrameAcceptanceCriteria::default().minimum_overlap_fraction
+    });
     if expand && options.reference_image.is_some() {
         anyhow::bail!("--reference expand cannot be combined with --reference-image");
     }

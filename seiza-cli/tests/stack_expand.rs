@@ -1,7 +1,7 @@
 use seiza_fits::{F32ImageData, HeaderValue, WriteHeaderCard, write_f32_image};
 use seiza_stacking::{
-    CalibrationMasters, Continue, FitsFrame, FrameDisposition, LiveStacker, NormalizationMode,
-    StackOptions,
+    CalibrationMasters, Continue, FitsFrame, FrameAcceptanceCriteria, FrameDisposition,
+    LiveStacker, NormalizationMode, StackOptions,
 };
 use std::{
     path::{Path, PathBuf},
@@ -264,13 +264,15 @@ fn expansion_refuses_a_chance_alignment_in_a_crowded_field() {
     let directory = tempfile::tempdir().unwrap();
     let frames = dense_mosaic(directory.path(), 512, 384);
     // Opposite corners share no sky, yet a dozen of their stars line up by
-    // chance under some translation.
+    // chance under some translation. Matching refuses it, not the minimum
+    // overlap, so the low one suggested for panels admits no coincidence.
     let paths = [frames[0].0.clone(), frames[2].0.clone()];
     let mut options = StackOptions {
         normalization: NormalizationMode::None,
         ..StackOptions::default()
     };
-    options.acceptance.minimum_overlap_fraction = 0.1;
+    options.acceptance.minimum_overlap_fraction =
+        FrameAcceptanceCriteria::EXPANDED_MINIMUM_OVERLAP_FRACTION;
     let error = LiveStacker::with_expanding_reference(
         &paths,
         CalibrationMasters::default(),
@@ -282,6 +284,7 @@ fn expansion_refuses_a_chance_alignment_in_a_crowded_field() {
     .unwrap()
     .to_string();
     assert!(error.contains("could not join"), "{error}");
+    assert!(!error.contains("panel overlap"), "{error}");
 }
 
 #[test]

@@ -471,7 +471,6 @@ anchor = seiza.choose_reference(panel_lights).reference_path
 order = [anchor] + [path for path in panel_lights if Path(path) != anchor]
 options = seiza.StackOptions(
     normalization="local-background",
-    minimum_overlap=0.1,
     registration_model="quadratic",  # warps frames across a meridian flip
 )
 stacker = seiza.LiveStacker.open_fits_expanding(
@@ -487,8 +486,14 @@ show one lens distortion bending them all, planning undoes it and
 `stacker.expanded_lens` describes it as a dict (its axis, coefficients,
 largest shift in pixels, and the overlaps' residual with and without it);
 otherwise it is `None`. `stacker.expansion_planning_notes` lists what planning
-noted: why it skipped fitting one lens to every panel, or why it kept its first
-plan when the lens-corrected one failed. `cancel`, a callable, is
+noted: first, when lights did not join the canvas, how many, and the most that
+those matching a panel overlapped it against `minimum_overlap`; then why it
+skipped fitting one lens to every panel, or why it kept its first plan when the
+lens-corrected one failed. Unless `options` set `minimum_overlap`, a light
+joins the canvas sharing 0.05 of its footprint with it, as with the CLI's
+`--reference expand`; a fixed reference needs 0.60. A mosaic planned for 10%
+overlap lands nearer 9%, and a minimum of 0.1 can leave every panel but the
+anchor's off the canvas. `cancel`, a callable, is
 asked before each light is planned, and Ctrl-C also stops planning. Drizzle is
 not supported on an expanded canvas. See the CLI documentation for how panels
 are matched and what the result looks like on real data.

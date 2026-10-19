@@ -9,10 +9,11 @@
 use seiza_fits::{HeaderValue, WriteHeaderCard};
 use seiza_stacking::{
     BatchStackOptions, CalibrationMasters, CfaIntegration, Continue, DefectDetectionOptions,
-    Demosaic, DrizzleOptions, FrameDisposition, FrameWeighting, ImpulseFilterOptions,
-    Interpolation, LinearImage, LiveStacker, MasterBuildOptions, MasterFrameKind,
-    NormalizationMode, RegistrationModel, RejectionMode, StackOptions, StackSnapshot,
-    build_master_from_fits, detect_defects, write_master_fits_f32, write_processed_image_fits_f32,
+    Demosaic, DrizzleOptions, FrameAcceptanceCriteria, FrameDisposition, FrameWeighting,
+    ImpulseFilterOptions, Interpolation, LinearImage, LiveStacker, MasterBuildOptions,
+    MasterFrameKind, NormalizationMode, RegistrationModel, RejectionMode, StackOptions,
+    StackSnapshot, build_master_from_fits, detect_defects, write_master_fits_f32,
+    write_processed_image_fits_f32,
 };
 use std::path::PathBuf;
 
@@ -289,6 +290,15 @@ const MOSAIC: &[f64] = &[
     2.1004921e2, 1.0194611e2, 1.0400060e2, 1.9063486e2, 1.5825851e2, 1.0700441e2,
     1.0222562e2, 1.0330536e2, 1.0399973e2, 1.0613483e2, 1.0971373e2, 1.8902301e2,
     1.6568292e2, 1.0487677e2, 6.2708032e2, 1.0713017e2,
+];
+
+#[rustfmt::skip]
+const NARROW_MOSAIC: &[f64] = &[
+    2.6718343e2, 5.4215986e2, 9.4800508e3, 9.9738777e1, 1.3014086e3, 1.7974307e2,
+    9.9623672e1, 9.7871735e1, 1.0279266e2, 1.0594302e2, 1.0311459e2, 1.0515709e2,
+    1.0424060e2, 1.0895921e2, 1.1358248e2, 1.1000770e2, 1.3116101e3, 1.1037816e2,
+    1.1672225e2, 1.1417844e2, 1.2913323e3, 1.0445881e3, 1.8293590e2, 1.1889386e2,
+    1.1991624e2, 1.2088194e2, 1.1871208e2, 1.3691556e2,
 ];
 
 #[rustfmt::skip]
@@ -705,6 +715,33 @@ fn a_binned_mosaic_s_full_resolution_reintegration_keeps_its_output() {
         &summary(&full.result.snapshot.image),
         MOSAIC_FULL_RESOLUTION,
     );
+}
+
+/// Two panels sharing 8% of their footprints, as panels planned for 10%
+/// overlap land, which join at the expanded canvas's suggested minimum
+/// overlap and not at 0.10: a change in how planning measures a panel's
+/// overlap, or admits a panel by it, moves this canvas.
+#[test]
+fn a_mosaic_overlapping_just_above_the_expanded_minimum_keeps_its_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = narrow_mosaic_panels(&directory);
+    let mut options = StackOptions::default();
+    options.acceptance.minimum_overlap_fraction =
+        FrameAcceptanceCriteria::EXPANDED_MINIMUM_OVERLAP_FRACTION;
+    let mut stacker = LiveStacker::with_expanding_reference(
+        &paths,
+        CalibrationMasters::default(),
+        options,
+        usize::MAX,
+        |_, _, _, _| Continue::Yes,
+    )
+    .unwrap();
+    for path in &paths {
+        admit(stacker.push_fits(path).unwrap());
+    }
+    let snapshot = stacker.snapshot().unwrap();
+    assert!(snapshot.image.height > 2 * NARROW_MOSAIC_STEP);
+    check("NARROW_MOSAIC", &summary(&snapshot.image), NARROW_MOSAIC);
 }
 
 /// Two overlapping panels on a canvas that grows to hold them both, with
@@ -1360,6 +1397,57 @@ fn projected_lens_panels(directory: &tempfile::TempDir) -> Vec<PathBuf> {
                 ("XPIXSZ".into(), HeaderValue::Float(5.0)),
             ];
             write_processed_image_fits_f32(&path, &image, &headers, &[]).unwrap();
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+/// How far below the first [`narrow_mosaic_panels`] panel the second one
+/// starts: 92% of a panel's 512 rows.
+const NARROW_MOSAIC_STEP: usize = 471;
+
+/// Two 768 by 512 panels of a crowded field, one above the other and
+/// sharing 8% of their footprints, two dithered frames each. A narrow
+/// overlap holds few stars, so the field is wider than [`mosaic_panels`]'s.
+fn narrow_mosaic_panels(directory: &tempfile::TempDir) -> Vec<PathBuf> {
+    let (width, height) = (768, 512);
+    let (sky_width, sky_height) = (width + 4, height + NARROW_MOSAIC_STEP + 4);
+    let mut sky = vec![0.0_f32; sky_width * sky_height];
+    let mut state = 0x0be1_u32;
+    let mut next = || {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (state >> 8) as f32 / (1 << 24) as f32
+    };
+    for _ in 0..sky_width * sky_height / 160 {
+        let (x, y) = (
+            4.0 + next() * (sky_width - 8) as f32,
+            4.0 + next() * (sky_height - 8) as f32,
+        );
+        let flux = 200.0 + 6_000.0 * next() * next();
+        for py in y as usize - 4..=y as usize + 4 {
+            for px in x as usize - 4..=x as usize + 4 {
+                let (dx, dy) = (px as f32 - x, py as f32 - y);
+                sky[py * sky_width + px] += flux * (-(dx * dx + dy * dy) / 4.5).exp();
+            }
+        }
+    }
+    let mut paths = Vec::new();
+    for panel in 0..2 {
+        for dither in 0..2 {
+            let (ox, oy) = (dither * 3, panel * NARROW_MOSAIC_STEP + dither);
+            let frame = panel * 2 + dither;
+            let data = (0..width * height)
+                .map(|index| {
+                    let (x, y) = (index % width + ox, index / width + oy);
+                    100.0 + 0.02 * y as f32 + sky[y * sky_width + x] + noise(index, frame, 3.0)
+                })
+                .collect::<Vec<_>>();
+            let path = directory
+                .path()
+                .join(format!("narrow-{panel}-{dither}.fits"));
+            let image = LinearImage::new(width, height, 1, data).unwrap();
+            write_processed_image_fits_f32(&path, &image, &[], &[]).unwrap();
             paths.push(path);
         }
     }
