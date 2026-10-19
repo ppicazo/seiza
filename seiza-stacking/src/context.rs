@@ -51,6 +51,7 @@ pub(crate) struct ContextWriteState<'a> {
     pub expanded_panels: &'a [ReferenceRegion],
     /// Each panel's matching stars, on its own grid.
     pub expanded_panel_stars: Vec<Vec<seiza::DetectedStar>>,
+    pub expanded_panel_projections: Vec<Option<crate::expand::PanelProjection>>,
     pub expanded_lens: Option<crate::lens::LensDistortion>,
 }
 
@@ -78,6 +79,7 @@ pub(crate) struct RestoredContext {
     pub expanded_panels: Vec<ReferenceRegion>,
     /// `None` for a context saved before panels kept their stars.
     pub expanded_panel_stars: Option<Vec<Vec<seiza::DetectedStar>>>,
+    pub expanded_panel_projections: Vec<Option<crate::expand::PanelProjection>>,
     pub expanded_lens: Option<crate::lens::LensDistortion>,
 }
 
@@ -135,6 +137,10 @@ struct ContextMetadata {
     /// its neighbors' edges.
     #[serde(default, skip_serializing_if = "is_false")]
     expanded_panel_stars: bool,
+    /// Canvas-to-creator geometry for registering new frames after resume.
+    /// Older readers refuse this metadata instead of discarding projection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    expanded_panel_projections: Vec<Option<crate::expand::PanelProjection>>,
 }
 
 /// A panel star as a context stores it.
@@ -697,6 +703,7 @@ pub(crate) fn read(path: &Path) -> Result<RestoredContext> {
         ledger,
         expanded_panels: metadata.expanded_panels,
         expanded_panel_stars,
+        expanded_panel_projections: metadata.expanded_panel_projections,
         expanded_lens: metadata.expanded_lens,
     })
 }
@@ -757,6 +764,7 @@ impl ContextMetadata {
             expanded_panels: state.expanded_panels.to_vec(),
             expanded_lens: state.expanded_lens,
             expanded_panel_stars: !state.expanded_panel_stars.is_empty(),
+            expanded_panel_projections: state.expanded_panel_projections.clone(),
         })
     }
 
@@ -810,6 +818,14 @@ impl ContextMetadata {
         }
         if self.expanded_panel_stars && self.expanded_panels.is_empty() {
             return Err("context holds panel stars but no expanded canvas".into());
+        }
+        if !self.expanded_panel_projections.is_empty() {
+            if self.expanded_panel_projections.len() != self.expanded_panels.len() {
+                return Err("context must hold projection geometry for every panel".into());
+            }
+            for projection in self.expanded_panel_projections.iter().flatten() {
+                projection.validate().map_err(|error| error.to_string())?;
+            }
         }
         if let Some(lens) = &self.expanded_lens {
             if self.expanded_panels.is_empty() {

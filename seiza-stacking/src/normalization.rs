@@ -1,4 +1,4 @@
-use crate::{Error, LinearImage, Result, image::Placed};
+use crate::{Error, LinearImage, ReferenceRegion, Result, image::Placed};
 use rayon::prelude::*;
 use seiza_stats::{median_in_place, robust_sigma_in_place};
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
@@ -30,7 +30,8 @@ pub enum NormalizationMode {
     /// gains, which a tile of cloud, nebula or frame edge can drive far
     /// enough to reject the frame. The gain is the global one, so it follows
     /// transparency and frame weighting still sees each frame's noise. Each
-    /// tile's offset compares medians of the samples both frames cover;
+    /// tile's offset is the median difference of corresponding samples,
+    /// after applying the gain, so shared nebular structure cancels;
     /// tiles with too few are filled from their neighbours, and the grid is
     /// smoothed over three tiles.
     LocalBackground {
@@ -86,21 +87,19 @@ impl NormalizationMap {
                     .iter()
                     .enumerate()
                     .map(|(channel, &gain)| {
-                        let (reference_median, source_median) = tile_medians(
+                        let offset = tile_offset(
                             reference,
                             source,
                             channel,
-                            0,
-                            0,
-                            source.width,
-                            source.height,
+                            (0, 0, source.width, source.height),
+                            gain,
                         )
                         .ok_or_else(|| {
                             Error::Normalization(
                                 "too few overlapping finite pixels for normalization".into(),
                             )
                         })?;
-                        Ok((gain, reference_median - gain * source_median))
+                        Ok((gain, offset))
                     })
                     .collect::<Result<Vec<_>>>()?;
                 local_background_with_gains(reference, source, tile_size, &globals)
@@ -155,16 +154,65 @@ impl NormalizationMap {
                 "background samples do not match the normalization".into(),
             ));
         }
+        let globals = self.background_globals();
         Ok(local_background_from(
             (layout.width, layout.height, layout.channels),
             layout.tile_size,
-            &self.background_globals(),
+            &globals,
             |cell, channel, _| {
                 let samples = layout.block(cell, channel);
-                sample_medians(
+                sample_offset(
                     reference[samples.clone()].iter().copied(),
                     source[samples].iter().copied(),
+                    globals[channel].0,
                 )
+            },
+        ))
+    }
+
+    /// Fit additive residuals after applying this recorded spatial map.
+    /// The base remains separate: a native sample grid and a rescaled map
+    /// can have different tile sizes, so adding their coefficient arrays
+    /// would change the base's interpolated surface. Missing tiles inherit
+    /// neighbouring residuals; a channel without support keeps zero residual
+    /// rather than erasing its established overlap corrections.
+    pub(crate) fn refit_background_residual_samples(
+        &self,
+        layout: &BackgroundSamples,
+        reference: &[f32],
+        source: &[f32],
+    ) -> Result<Self> {
+        self.validate()?;
+        if (layout.width, layout.height, layout.channels)
+            != (self.width, self.height, self.channels)
+            || reference.len() != layout.len()
+            || source.len() != layout.len()
+        {
+            return Err(Error::Normalization(
+                "background samples do not match the normalization".into(),
+            ));
+        }
+        let sampler = self.sampler();
+        let globals = vec![(1.0, 0.0); self.channels];
+        Ok(local_background_from(
+            (layout.width, layout.height, layout.channels),
+            layout.tile_size,
+            &globals,
+            |cell, channel, (x, y, width, height)| {
+                let block = layout.block(cell, channel);
+                let normalized = source[block.clone()]
+                    .iter()
+                    .copied()
+                    .zip(tile_sample_pixels(layout.width, x, y, width, height))
+                    .map(|(value, pixel)| {
+                        if !value.is_finite() {
+                            return value;
+                        }
+                        let (gain, offset) =
+                            sampler.at(pixel % layout.width, pixel / layout.width, channel);
+                        value.mul_add(gain, offset)
+                    });
+                sample_offset(reference[block].iter().copied(), normalized, 1.0)
             },
         ))
     }
@@ -191,7 +239,7 @@ impl NormalizationMap {
 /// The samples [`NormalizationMode::LocalBackground`]'s fit reads from an
 /// image of one shape: in each tile, in the order of the map's offsets,
 /// every channel at an evenly spaced subset of the tile's pixels, about one
-/// in sixteen of a full tile's, as [`tile_medians`] picks them.
+/// in sixteen of a full tile's, as [`tile_offset`] picks them.
 ///
 /// A reintegration keeps each frame's samples beside its registered image,
 /// and fits the frame's background from them rather than from the whole
@@ -243,6 +291,30 @@ impl BackgroundSamples {
     /// Samples per image.
     pub(crate) fn len(&self) -> usize {
         self.starts[self.starts.len() - 1]
+    }
+
+    /// Samples of tiles intersecting `region`, in their original order,
+    /// one run per tile row, including every channel. Samples outside these
+    /// runs are all the canonical `NaN` that [`Placed::sample`] supplies
+    /// beyond a footprint. Boundary tiles stay whole, preserving missing
+    /// pixels and NaN payloads within the footprint exactly.
+    pub(crate) fn ranges_for_region(
+        &self,
+        region: ReferenceRegion,
+    ) -> Option<impl Iterator<Item = std::ops::Range<usize>> + '_> {
+        let right = region.x.checked_add(region.width)?;
+        let bottom = region.y.checked_add(region.height)?;
+        if region.width == 0 || region.height == 0 || right > self.width || bottom > self.height {
+            return None;
+        }
+        let first_column = region.x / self.tile_size;
+        let end_column = right.div_ceil(self.tile_size);
+        let rows = region.y / self.tile_size..bottom.div_ceil(self.tile_size);
+        Some(rows.map(move |row| {
+            let first = (row * self.columns + first_column) * self.channels;
+            let end = (row * self.columns + end_column) * self.channels;
+            self.starts[first]..self.starts[end]
+        }))
     }
 
     /// Where tile `cell`'s samples of `channel` lie.
@@ -302,7 +374,7 @@ fn tile(
     (x, y, tile_size.min(width - x), tile_size.min(height - y))
 }
 
-/// The pixels [`tile_medians`] reads in the region at `(x, y)` of `width`
+/// The pixels [`tile_offset`] reads in the region at `(x, y)` of `width`
 /// by `height` of an image `image_width` wide: every `stride`-th pixel in
 /// row-major order, for about four thousand.
 fn tile_sample_pixels(
@@ -606,6 +678,57 @@ impl NormalizationMap {
             );
         }
         Ok(())
+    }
+
+    /// Apply the complete spatial map at the exact coordinates the layout
+    /// sampled. The map and sample tiles need not coincide.
+    pub(crate) fn apply_samples(
+        &self,
+        layout: &BackgroundSamples,
+        samples: &mut [f32],
+    ) -> Result<()> {
+        self.validate()?;
+        if (layout.width, layout.height, layout.channels)
+            != (self.width, self.height, self.channels)
+            || samples.len() != layout.len()
+        {
+            return Err(Error::Normalization(
+                "background samples do not match the normalization".into(),
+            ));
+        }
+        if self.is_global() {
+            return self.apply_global_samples(layout, samples);
+        }
+        let sampler = self.sampler();
+        for cell in 0..layout.columns * layout.height.div_ceil(layout.tile_size) {
+            let (x, y, width, height) = tile(
+                cell,
+                layout.columns,
+                layout.width,
+                layout.height,
+                layout.tile_size,
+            );
+            for channel in 0..layout.channels {
+                for (value, pixel) in samples[layout.block(cell, channel)]
+                    .iter_mut()
+                    .zip(tile_sample_pixels(layout.width, x, y, width, height))
+                {
+                    if value.is_finite() {
+                        let (gain, offset) =
+                            sampler.at(pixel % layout.width, pixel / layout.width, channel);
+                        *value = value.mul_add(gain, offset);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a residual leaves every sample untouched. Skipping it also
+    /// preserves the base map's signed zeroes exactly.
+    pub(crate) fn is_identity(&self) -> bool {
+        self.gains.iter().all(|&gain| gain == 1.0)
+            && self.offsets.iter().all(|&offset| offset == 0.0)
     }
 
     /// Check the serialized map shape and every coefficient before use.
@@ -934,8 +1057,9 @@ fn bilinear(
 /// follows transparency. A gain from each tile's dispersion would match the
 /// frames' sky noise instead, scaling a hazy frame to the reference's noise
 /// rather than its signal, which also hides the noise frame weighting reads.
-/// Each tile's offset then carries its gained source median onto the
-/// reference median.
+/// Each tile's offset is the median of paired residuals after applying
+/// that gain. Subtracting corresponding samples cancels shared nebulosity
+/// before fitting the background; subtracting two separate medians does not.
 fn local_background(
     reference: &LinearImage,
     source: Placed<'_>,
@@ -975,21 +1099,28 @@ fn local_background_with_gains(
             // reference.
             source
                 .reaches(x, y, width, height)
-                .then(|| tile_medians(reference, source, channel, x, y, width, height))
+                .then(|| {
+                    tile_offset(
+                        reference,
+                        source,
+                        channel,
+                        (x, y, width, height),
+                        globals[channel].0,
+                    )
+                })
                 .flatten()
         },
     ))
 }
 
 /// [`local_background_with_gains`] over an image of `shape` (width, height,
-/// channels), with `medians` giving the reference's and the source's
-/// medians in a tile, by its index, channel and region, when they share
-/// enough samples.
+/// channels), with `offset` giving the median paired residual in a tile,
+/// by its index, channel and region, when they share enough samples.
 fn local_background_from(
     shape: (usize, usize, usize),
     tile_size: usize,
     globals: &[(f32, f32)],
-    medians: impl Fn(usize, usize, (usize, usize, usize, usize)) -> Option<(f32, f32)> + Sync,
+    offset: impl Fn(usize, usize, (usize, usize, usize, usize)) -> Option<f32> + Sync,
 ) -> NormalizationMap {
     let (width, height, channels) = shape;
     let columns = width.div_ceil(tile_size);
@@ -999,10 +1130,7 @@ fn local_background_from(
         .map(|index| {
             let channel = index % channels;
             let cell = index / channels;
-            medians(cell, channel, tile(cell, columns, width, height, tile_size))
-                .map(|(reference_median, source_median)| {
-                    reference_median - globals[channel].0 * source_median
-                })
+            offset(cell, channel, tile(cell, columns, width, height, tile_size))
                 .filter(|offset| offset.is_finite())
         })
         .collect::<Vec<_>>();
@@ -1034,48 +1162,45 @@ fn local_background_from(
     }
 }
 
-/// The medians of one region and channel in both frames, over samples both
-/// cover, or `None` when they share too few.
-fn tile_medians(
+/// The median residual in one region and channel, over samples both frames
+/// cover after applying `gain`, or `None` when they share too few.
+fn tile_offset(
     reference: &LinearImage,
     source: Placed<'_>,
     channel: usize,
-    x: usize,
-    y: usize,
-    width: usize,
-    height: usize,
-) -> Option<(f32, f32)> {
+    (x, y, width, height): (usize, usize, usize, usize),
+    gain: f32,
+) -> Option<f32> {
     let indices = || {
         tile_sample_pixels(source.width, x, y, width, height)
             .map(move |pixel| pixel * source.channels() + channel)
     };
-    sample_medians(
+    sample_offset(
         indices().map(|index| reference.data[index]),
         indices().map(|index| source.sample(index)),
+        gain,
     )
 }
 
-/// The medians of paired reference and source samples, over the pairs
-/// both have finite, or `None` when fewer than 64 are.
-fn sample_medians(
+/// The median of finite paired residuals. Shared structure cancels before
+/// the robust fit, while isolated mismatches cannot dominate the offset.
+/// `None` when fewer than 64 usable pairs remain.
+fn sample_offset(
     reference: impl Iterator<Item = f32>,
     source: impl Iterator<Item = f32>,
-) -> Option<(f32, f32)> {
-    let mut reference_values = Vec::new();
-    let mut source_values = Vec::new();
+    gain: f32,
+) -> Option<f32> {
+    let mut residuals = Vec::new();
     for (reference_value, source_value) in reference.zip(source) {
-        if reference_value.is_finite() && source_value.is_finite() {
-            reference_values.push(reference_value);
-            source_values.push(source_value);
+        let residual = reference_value - gain * source_value;
+        if reference_value.is_finite() && source_value.is_finite() && residual.is_finite() {
+            residuals.push(residual);
         }
     }
-    if reference_values.len() < 64 {
+    if residuals.len() < 64 {
         return None;
     }
-    Some((
-        median_in_place(&mut reference_values)?,
-        median_in_place(&mut source_values)?,
-    ))
+    median_in_place(&mut residuals)
 }
 
 /// Fill one channel's missing tile offsets from their neighbours, growing
@@ -1353,6 +1478,71 @@ fn affine_for_region(
 mod tests {
     use super::*;
 
+    #[test]
+    fn paired_background_offsets_do_not_follow_shared_nebulae() {
+        let (width, height) = (256, 16);
+        for gain in [0.6, 1.0, 1.8] {
+            for amplitude in [0.0, 50.0, 200.0, 500.0] {
+                let sky = |index: usize| {
+                    let x = (index % width) as f32 / (width - 1) as f32;
+                    100.0 + amplitude * (-0.5 * ((x - 0.25) / 0.15).powi(2)).exp()
+                };
+                let reference =
+                    LinearImage::new(width, height, 1, (0..width * height).map(sky).collect())
+                        .unwrap();
+                let source = LinearImage::new(
+                    width,
+                    height,
+                    1,
+                    (0..width * height)
+                        .map(|index| {
+                            let gradient = 50.0 * (index % width) as f32 / (width - 1) as f32;
+                            (sky(index) + gradient) / gain
+                        })
+                        .collect(),
+                )
+                .unwrap();
+                let map = NormalizationMap::estimate_with_gains(
+                    &reference,
+                    Placed::whole(&source),
+                    NormalizationMode::LocalBackground { tile_size: width },
+                    Some(&[gain]),
+                )
+                .unwrap();
+                assert_eq!(map.mean_gain(), gain);
+                // The median additive difference is -25 regardless of the
+                // shared nebula's shape or brightness. Separate medians
+                // produced offsets from -29.4 to -13.3 on this scene.
+                assert!(
+                    (map.mean_offset() + 25.0).abs() < 0.0002,
+                    "gain {gain}, nebula {amplitude}: {}",
+                    map.mean_offset()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn paired_background_offsets_require_finite_pairs_and_resist_outliers() {
+        let source = [100.0; 100];
+        let mut reference = [107.0; 100];
+        reference[..12].fill(10_000.0);
+        reference[12..20].fill(f32::NAN);
+        assert_eq!(
+            sample_offset(reference.iter().copied(), source.iter().copied(), 1.0),
+            Some(7.0)
+        );
+        reference[..37].fill(f32::NAN);
+        assert_eq!(
+            sample_offset(reference.iter().copied(), source.iter().copied(), 1.0),
+            None
+        );
+        assert_eq!(
+            sample_offset([f32::MAX; 64].into_iter(), [-f32::MAX; 64].into_iter(), 2.0),
+            None
+        );
+    }
+
     /// Refitting a frame's background from its samples alone matches the
     /// refit from whole images to the bit, for one and three channels, over
     /// tiles cut short at the edges, with samples missing, a tile with too
@@ -1417,6 +1607,169 @@ mod tests {
                 .apply_global_samples(&layout, &mut samples)
                 .unwrap();
             assert_eq!(bits(&samples), bits(&layout.of(&whole).unwrap()));
+        }
+    }
+
+    #[test]
+    fn spatial_normalization_samples_match_whole_images_on_other_grids() {
+        let (width, height) = (519_usize, 391_usize);
+        let bits = |values: &[f32]| {
+            values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        };
+        for channels in [1, 3] {
+            let image = LinearImage::new(
+                width,
+                height,
+                channels,
+                (0..width * height * channels)
+                    .map(|index| match index % 101 {
+                        0 => f32::from_bits(0x7fc0_0042),
+                        1 => -0.0,
+                        2 => 0.0,
+                        3 => f32::INFINITY,
+                        _ => (index % 997) as f32 / 8.0 - 30.0,
+                    })
+                    .collect(),
+            )
+            .unwrap();
+            for map_tile in [32, 255, width] {
+                let columns = width.div_ceil(map_tile);
+                let rows = height.div_ceil(map_tile);
+                let map = NormalizationMap {
+                    schema_version: NORMALIZATION_MAP_SCHEMA_VERSION,
+                    width,
+                    height,
+                    channels,
+                    tile_size: map_tile,
+                    columns,
+                    rows,
+                    gains: (0..columns * rows * channels)
+                        .map(|i| 0.5 + (i % 7) as f32 / 8.0)
+                        .collect(),
+                    offsets: (0..columns * rows * channels)
+                        .map(|i| (i % 11) as f32 / 4.0 - 2.0)
+                        .collect(),
+                };
+                let mut whole = image.clone();
+                map.apply(&mut whole).unwrap();
+                for sample_tile in [16, 32, 256] {
+                    let layout = BackgroundSamples::for_image(&image, sample_tile);
+                    let mut samples = layout.of(&image).unwrap();
+                    map.apply_samples(&layout, &mut samples).unwrap();
+                    assert_eq!(
+                        bits(&samples),
+                        bits(&layout.of(&whole).unwrap()),
+                        "map/sample grids {map_tile}/{sample_tile}, channels {channels}"
+                    );
+                }
+                let wrong = BackgroundSamples::new(width + 1, height, channels, 32);
+                assert!(
+                    map.apply_samples(&wrong, &mut vec![0.0; wrong.len()])
+                        .is_err()
+                );
+                let layout = BackgroundSamples::for_image(&image, 32);
+                assert!(
+                    map.apply_samples(&layout, &mut vec![0.0; layout.len() - 1])
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn spatial_background_residual_preserves_the_base_and_only_adds_offsets() {
+        let (width, height, tile_size) = (512_usize, 384_usize, 255_usize);
+        for channels in [1, 3] {
+            let columns = width.div_ceil(tile_size);
+            let rows = height.div_ceil(tile_size);
+            let base = NormalizationMap {
+                schema_version: NORMALIZATION_MAP_SCHEMA_VERSION,
+                width,
+                height,
+                channels,
+                tile_size,
+                columns,
+                rows,
+                gains: (0..columns * rows * channels)
+                    .map(|i| 0.5 + (i % channels) as f32 / 2.0)
+                    .collect(),
+                offsets: (0..columns * rows * channels)
+                    .map(|i| (i / channels) as f32 * 16.0 - 32.0)
+                    .collect(),
+            };
+            let source = LinearImage::new(
+                width,
+                height,
+                channels,
+                (0..width * height * channels)
+                    .map(|i| {
+                        if i % 173 == 0 {
+                            f32::NAN
+                        } else {
+                            512.0 + (i % 113) as f32
+                        }
+                    })
+                    .collect(),
+            )
+            .unwrap();
+            let mut normalized = source.clone();
+            base.apply(&mut normalized).unwrap();
+            let layout = BackgroundSamples::for_image(&source, 256);
+            let samples = layout.of(&source).unwrap();
+            for reference in [
+                layout.of(&normalized).unwrap(),
+                vec![f32::NAN; layout.len()],
+            ] {
+                let residual = base
+                    .refit_background_residual_samples(&layout, &reference, &samples)
+                    .unwrap();
+                assert!(residual.is_identity());
+            }
+            let mut expected = normalized.clone();
+            let correction = [7.25, -3.5, 15.0];
+            for (i, value) in expected.data.iter_mut().enumerate() {
+                if value.is_finite() {
+                    *value += correction[i % channels];
+                }
+            }
+            let saved = base.clone();
+            let residual = base
+                .refit_background_residual_samples(
+                    &layout,
+                    &layout.of(&expected).unwrap(),
+                    &samples,
+                )
+                .unwrap();
+            assert_eq!(base, saved);
+            assert!(residual.gains.iter().all(|&gain| gain == 1.0));
+            for (i, &offset) in residual.offsets.iter().enumerate() {
+                assert_eq!(offset, correction[i % channels]);
+            }
+            residual.apply(&mut normalized).unwrap();
+            assert_eq!(
+                normalized
+                    .data
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .data
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            let wrong = BackgroundSamples::new(width + 1, height, channels, 256);
+            assert!(
+                base.refit_background_residual_samples(
+                    &wrong,
+                    &vec![0.0; wrong.len()],
+                    &vec![0.0; wrong.len()],
+                )
+                .is_err()
+            );
         }
     }
 

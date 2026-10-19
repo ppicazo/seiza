@@ -33,11 +33,11 @@ const MONO_DEFAULT: &[f64] = &[
 ];
 #[rustfmt::skip]
 const MONO_CONFIGURED: &[f64] = &[
-    1.4699745e2, 2.8121569e2, 3.9688047e3, 9.7713203e1, 1.0011301e2, 1.0122166e2,
-    1.1481973e2, 1.0544106e2, 9.8354599e1, 1.0061407e2, 1.0243215e2, 1.0345580e2,
-    1.0467356e2, 9.8428558e1, 1.0228342e2, 4.2148636e2, 1.0456822e2, 1.0636676e2,
-    1.0037716e2, 1.0089593e2, 1.0360520e2, 1.0664339e2, 1.0773047e2, 1.0119784e2,
-    1.7354935e2, 1.0513698e2, 1.0699198e2, 1.1135787e2,
+    1.4695953e2, 2.8119425e2, 3.9687632e3, 9.7643250e1, 1.0004932e2, 1.0116178e2,
+    1.1477510e2, 1.0543606e2, 9.8268410e1, 1.0055153e2, 1.0238376e2, 1.0341871e2,
+    1.0466166e2, 9.8374100e1, 1.0225138e2, 4.2145331e2, 1.0452397e2, 1.0633051e2,
+    1.0034851e2, 1.0087305e2, 1.0359173e2, 1.0660538e2, 1.0766888e2, 1.0121416e2,
+    1.7354532e2, 1.0512951e2, 1.0694588e2, 1.1127830e2,
 ];
 #[rustfmt::skip]
 const BAYER_DEFAULT: &[f64] = &[
@@ -104,6 +104,31 @@ const MOSAIC_FULL_RESOLUTION: &[f64] = &[
     1.5093257e2, 1.0202713e2, 1.0343097e2, 1.6650745e2, 1.7741840e2, 1.0598458e2,
     1.0179967e2, 1.0169817e2, 1.0327754e2, 1.0577757e2, 1.0626158e2, 2.4992326e2,
     1.8955243e2, 1.0545649e2, 7.9738617e2, 1.0734964e2,
+];
+#[rustfmt::skip]
+const LENS_MOSAIC_SIBLINGS: &[f64] = &[
+    1.1248231e2, 1.3249226e2, 4.2811089e3, 9.9621635e1, 1.0401961e2, 1.0109291e2,
+    1.1935750e2, 9.7427887e1, 9.9319954e1, 1.0011208e2, 1.0266560e2, 1.6070786e2,
+    1.0302679e2, 1.0011514e2, 1.0015688e2, 1.0428107e2, 1.0138474e2, 1.0049312e2,
+    9.9420601e1, 9.8447906e1, 1.0165466e2, 1.0112646e2, 1.0431984e2, 1.1429330e2,
+    1.0244468e2, 1.0095029e2, 1.0188347e2, 9.8895889e1, 6.0000000e0, 6.1900000e2,
+    1.0160000e3,
+];
+#[rustfmt::skip]
+const MOSAIC_BACKGROUND_REFERENCE: &[f64] = &[
+    2.5424472e2, 5.0670040e2, 5.8689067e3, 9.8747879e1, 1.0245188e2, 1.0222964e2,
+    3.1747110e2, 1.1775324e2, 9.9335533e1, 1.5773985e2, 2.3785571e3, 1.3038365e2,
+    1.1800996e2, 1.0039601e2, 1.0475277e2, 3.5828067e2, 3.2288803e2, 1.1710192e2,
+    9.7660767e1, 1.0216107e2, 1.0425126e2, 1.0714961e2, 1.4859462e2, 6.1411127e2,
+    1.2025009e2, 1.2104958e2, 4.7897787e2, 2.4683353e2,
+];
+#[rustfmt::skip]
+const SHARED_NEBULA_BACKGROUND: &[f64] = &[
+    1.0662690e0, -2.7621416e1, 2.3148637e2, 2.6217258e2, 5.2560767e2, 1.3647876e2,
+    3.5316037e2, 3.3801196e2, 1.8140225e2, 1.9095937e2, 1.2601199e2, 2.6254865e2,
+    4.7366315e2, 2.6814981e2, 2.3112440e2, 7.4395386e1, 1.3285132e2, 5.1343073e2,
+    3.0254535e2, 1.4823747e2, 7.5180016e1, 9.7638176e1, 4.0146280e2, 2.9319531e2,
+    1.0922065e2, 1.1703941e2, 1.4173183e2, 2.4023395e2, 3.1646753e2, 1.5533604e2,
 ];
 #[rustfmt::skip]
 const DARK_MASTER: &[f64] = &[
@@ -698,6 +723,202 @@ fn a_mosaic_keeps_its_output() {
     }
 }
 
+/// A calibrated lens changes the canvas geometry even with the default
+/// similarity model. Exposures following each panel's first frame must keep
+/// that nonlinear projection when refining their dithered star positions.
+#[test]
+fn a_lens_mosaic_with_sibling_exposures_keeps_its_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = projected_lens_panels(&directory);
+    let mut options = StackOptions {
+        normalization: NormalizationMode::None,
+        ..StackOptions::default()
+    };
+    options.acceptance.minimum_overlap_fraction = 0.1;
+    // The far panel's tangent-plane projection grows by a little over 4%.
+    options.acceptance.maximum_scale_deviation = 0.1;
+    let mut stacker = LiveStacker::with_expanding_reference(
+        &paths,
+        CalibrationMasters::default(),
+        options,
+        usize::MAX,
+        |_, _, _, _| Continue::Yes,
+    )
+    .unwrap();
+    let lens = stacker
+        .expanded_lens()
+        .expect("the panels constrain the lens");
+    assert!(lens.focal_length_pixels.is_some());
+    // A saved canvas carries no per-file planned registrations. Its
+    // continuation must recover the same geometry from the panel metadata.
+    // Contexts require one admitted frame, so save just after the anchor.
+    let context_path = directory.path().join("lens-mosaic.seiza-stack");
+    let mut planned = Vec::new();
+    for (index, path) in paths.iter().enumerate() {
+        let FrameDisposition::Accepted(diagnostics) = stacker.push_fits(path).unwrap() else {
+            panic!("lens mosaic frame {index} was not accepted");
+        };
+        let order = diagnostics.mapping.warp().map(|warp| warp.order());
+        if index % 2 == 1 {
+            assert!(diagnostics.registration_rms_pixels < 0.3, "{diagnostics:?}");
+        }
+        if index >= 2 {
+            assert!(order.is_some_and(|order| order >= 2), "{diagnostics:?}");
+        }
+        planned.push(diagnostics);
+        if index == 0 {
+            stacker.save_context(&context_path).unwrap();
+        }
+    }
+    let mut continued = LiveStacker::open_context(&context_path).unwrap();
+    let mut snapshot = stacker.snapshot().unwrap();
+    let mut maximum_mapping_difference = 0.0_f64;
+    for (index, (path, expected)) in paths.iter().zip(&planned).enumerate().skip(1) {
+        let FrameDisposition::Accepted(actual) = continued.push_fits(path).unwrap() else {
+            panic!("continued lens mosaic frame {index} was not accepted");
+        };
+        let actual_warp = actual.mapping.warp().expect("the lens needs a warp");
+        assert!(actual.registration_rms_pixels < 0.3, "{actual:?}");
+        if index >= 2 {
+            assert!(actual_warp.order() >= 2, "{actual:?}");
+        }
+        let expected_warp = expected.mapping.warp().unwrap();
+        for y in [50.0, 200.0, 350.0] {
+            for x in [50.0, 300.0, 550.0] {
+                let (cx, cy) = expected.transform.apply(x, y);
+                let (ex, ey) = expected_warp.apply(cx, cy);
+                let (ax, ay) = actual_warp.apply(cx, cy);
+                maximum_mapping_difference =
+                    maximum_mapping_difference.max((ex - ax).hypot(ey - ay));
+            }
+        }
+    }
+    let restored = continued.snapshot().unwrap();
+    assert_eq!(restored.accepted_frames, snapshot.accepted_frames);
+    assert_eq!(
+        (restored.image.width, restored.image.height),
+        (snapshot.image.width, snapshot.image.height)
+    );
+    let (mut difference_power, mut signal_power) = (0.0_f64, 0.0_f64);
+    let (mut planned_coverage, mut common_coverage) = (0, 0);
+    for (&expected, &actual) in snapshot.image.data.iter().zip(&restored.image.data) {
+        planned_coverage += usize::from(expected.is_finite());
+        if expected.is_finite() && actual.is_finite() {
+            common_coverage += 1;
+            difference_power += f64::from(expected - actual).powi(2);
+            signal_power += (f64::from(expected) - 100.0).powi(2);
+        }
+    }
+    let relative_signal_rms = (difference_power / signal_power).sqrt();
+    // Continuation refits later panels' first exposures too, whereas
+    // planning places those by the camera poses. Require a tenth-pixel
+    // agreement and less than 1% RMS difference in the stars above sky.
+    assert!(
+        maximum_mapping_difference < 0.1,
+        "{maximum_mapping_difference}"
+    );
+    assert!(relative_signal_rms < 0.01, "{relative_signal_rms}");
+    assert!(common_coverage as f64 >= planned_coverage as f64 * 0.995);
+    // The projected footprint is not rectangular; include its uncovered
+    // pixels as zero so their extent also participates in the fingerprint.
+    for sample in &mut snapshot.image.data {
+        if !sample.is_finite() {
+            *sample = 0.0;
+        }
+    }
+    let mut fingerprint = summary(&snapshot.image);
+    fingerprint.extend([
+        f64::from(snapshot.accepted_frames),
+        snapshot.image.width as f64,
+        snapshot.image.height as f64,
+    ]);
+    check("LENS_MOSAIC_SIBLINGS", &fingerprint, LENS_MOSAIC_SIBLINGS);
+}
+
+/// A globally ranked background reference must not leave a dimmer mosaic
+/// panel without local samples. Its cloudier final exposure has a different
+/// gradient from the twenty better exposures covering that same sky.
+#[test]
+fn a_mosaic_background_reference_keeps_its_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = uneven_mosaic_panels(&directory);
+    let mut options = StackOptions {
+        normalization: NormalizationMode::LocalBackground { tile_size: 32 },
+        rejection: RejectionMode::None,
+        ..StackOptions::default()
+    };
+    options.acceptance.minimum_overlap_fraction = 0.1;
+    let mut stacker = LiveStacker::with_expanding_reference(
+        &paths,
+        CalibrationMasters::default(),
+        options,
+        usize::MAX,
+        |_, _, _, _| Continue::Yes,
+    )
+    .unwrap();
+    stacker
+        .retain_frames_for_reintegration(Some(directory.path()))
+        .unwrap();
+    for (index, path) in paths.iter().enumerate() {
+        let FrameDisposition::Accepted(diagnostics) = stacker.push_fits(path).unwrap() else {
+            panic!("background mosaic frame {index} was not accepted");
+        };
+        if index < 21 {
+            assert!(diagnostics.normalization_mean_gain < 1.2, "{diagnostics:?}");
+        } else {
+            assert!(diagnostics.normalization_mean_gain > 1.6, "{diagnostics:?}");
+        }
+    }
+    let options = BatchStackOptions {
+        rejection: seiza_stacking::MasterRejectionOptions {
+            low_sigma: 100.0,
+            high_sigma: 100.0,
+        },
+        ..BatchStackOptions::default()
+    };
+    let result = stacker.reintegrate(&options, |_, _, _| {}).unwrap();
+    assert_eq!(result.snapshot.accepted_frames, 43);
+    check(
+        "MOSAIC_BACKGROUND_REFERENCE",
+        &summary(&result.snapshot.image),
+        MOSAIC_BACKGROUND_REFERENCE,
+    );
+}
+
+/// The same broad nebular emission is present in both images, while the
+/// sky gradient differs. Local offsets must compare corresponding samples
+/// so the nebula itself does not become a background correction.
+#[test]
+fn a_shared_nebula_local_background_keeps_its_output() {
+    let mut reference = Vec::new();
+    let mut source = Vec::new();
+    for index in 0..WIDTH * HEIGHT {
+        let (x, y) = ((index % WIDTH) as f32, (index / WIDTH) as f32);
+        let filament = (-(x - 70.0 - 0.35 * y).powi(2) / 800.0).exp();
+        let cloud = (-((x - 135.0).powi(2) / 3000.0 + (y - 50.0).powi(2) / 1900.0)).exp();
+        let nebula = 350.0 * filament + 180.0 * cloud + 60.0 * (x * 0.04).sin() * (y * 0.05).sin();
+        let signal = 100.0 + nebula + noise(index, 0, 0.4);
+        reference.push(signal);
+        source.push(0.8 * signal + 40.0 + 0.18 * x - 0.13 * y + 0.0015 * x * y);
+    }
+    let reference = LinearImage::new(WIDTH, HEIGHT, 1, reference).unwrap();
+    let mut source = LinearImage::new(WIDTH, HEIGHT, 1, source).unwrap();
+    let map = seiza_stacking::NormalizationMap::estimate(
+        &reference,
+        &source,
+        NormalizationMode::LocalBackground { tile_size: 32 },
+    )
+    .unwrap();
+    map.apply(&mut source).unwrap();
+    let mut fingerprint = vec![f64::from(map.mean_gain()), f64::from(map.mean_offset())];
+    fingerprint.extend(summary(&source));
+    check(
+        "SHARED_NEBULA_BACKGROUND",
+        &fingerprint,
+        SHARED_NEBULA_BACKGROUND,
+    );
+}
+
 fn mosaic_stack(model: RegistrationModel) -> StackSnapshot {
     let directory = tempfile::tempdir().unwrap();
     let paths = mosaic_panels(&directory);
@@ -1078,6 +1299,114 @@ fn mosaic_panels(directory: &tempfile::TempDir) -> Vec<PathBuf> {
         }
     }
     paths
+}
+
+/// Three overlapping camera pointings through an off-centre radial lens,
+/// two dithered exposures per pointing. Sky stars are projected from rays,
+/// rather than translated on a flat plane, so panel-edge registration has
+/// a measurable nonlinear component after the lens rebuilds the canvas.
+fn projected_lens_panels(directory: &tempfile::TempDir) -> Vec<PathBuf> {
+    let (width, height) = (600, 400);
+    let (cx, cy) = (323.5, 181.5);
+    let focal = 2400.0_f64;
+    let radius_squared = (width * width + height * height) as f64 * 0.25;
+    let mut state = 7_u32;
+    let mut next = || {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (state >> 8) as f64 / (1 << 24) as f64
+    };
+    let stars = (0..4000)
+        .map(|_| {
+            (
+                -10.0 + next() * 620.0,
+                -10.0 + next() * 1050.0,
+                200.0 + 5.0 / (0.01 + next()).powf(1.5),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut paths = Vec::new();
+    for panel in 0..3 {
+        for dither in 0..2 {
+            let frame = panel * 2 + dither;
+            let angle = ((panel as f64 * 300.0 + dither as f64 * 2.3) / focal).atan();
+            let (sin, cos) = angle.sin_cos();
+            let mut data = (0..width * height)
+                .map(|index| 100.0 + noise(index, frame, 5.0))
+                .collect::<Vec<_>>();
+            for &(sky_x, sky_y, peak) in &stars {
+                let ray_y = sky_y - cy;
+                let depth = sin * ray_y + cos * focal;
+                let u = focal * (sky_x - cx - dither as f64 * 3.1) / depth;
+                let v = focal * (cos * ray_y - sin * focal) / depth;
+                let q = (u * u + v * v) / radius_squared;
+                let factor = 1.0 + 0.02 * q + 0.004 * q * q;
+                let (sx, sy) = (cx + u * factor, cy + v * factor);
+                if sx < -5.0 || sy < -5.0 || sx > width as f64 + 5.0 || sy > height as f64 + 5.0 {
+                    continue;
+                }
+                let (x0, y0) = (sx.floor() as isize - 4, sy.floor() as isize - 4);
+                for y in y0.max(0)..(y0 + 10).min(height as isize) {
+                    for x in x0.max(0)..(x0 + 10).min(width as isize) {
+                        let distance = (x as f64 - sx).powi(2) + (y as f64 - sy).powi(2);
+                        data[y as usize * width + x as usize] +=
+                            (peak * (-distance / 2.9).exp()) as f32;
+                    }
+                }
+            }
+            let path = directory.path().join(format!("lens-{panel}-{dither}.fits"));
+            let image = LinearImage::new(width, height, 1, data).unwrap();
+            let headers = [
+                ("FOCALLEN".into(), HeaderValue::Float(12.0)),
+                ("XPIXSZ".into(), HeaderValue::Float(5.0)),
+            ];
+            write_processed_image_fits_f32(&path, &image, &headers, &[]).unwrap();
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+fn uneven_mosaic_panels(directory: &tempfile::TempDir) -> Vec<PathBuf> {
+    let originals = mosaic_panels(directory);
+    let panels = [0, 2].map(|index| {
+        seiza_image_io::read_astronomy(&originals[index])
+            .unwrap()
+            .image
+            .into_physical_f32()
+    });
+    let (width, height) = MOSAIC_PANEL;
+    (0..43)
+        .map(|frame| {
+            let panel = usize::from(frame >= 21);
+            let transparency = if panel == 0 {
+                1.0
+            } else if frame == 42 {
+                1.0 / 3.0
+            } else {
+                0.5
+            };
+            let data = panels[panel]
+                .iter()
+                .enumerate()
+                .map(|(index, &sample)| {
+                    let x = (index % width) as f32 / width as f32;
+                    let y = (index / width) as f32 / height as f32;
+                    let gradient = if panel == 0 {
+                        0.0
+                    } else if frame == 42 {
+                        120.0 * x * x + 40.0 * y * y
+                    } else {
+                        15.0 * x * x + 10.0 * y * y
+                    };
+                    transparency * (sample + gradient) + noise(index, frame, 0.2)
+                })
+                .collect::<Vec<_>>();
+            let path = directory.path().join(format!("background-{frame}.fits"));
+            let image = LinearImage::new(width, height, 1, data).unwrap();
+            write_processed_image_fits_f32(&path, &image, &[], &[]).unwrap();
+            path
+        })
+        .collect()
 }
 
 /// Each channel's mean, root mean square and maximum over finite samples,

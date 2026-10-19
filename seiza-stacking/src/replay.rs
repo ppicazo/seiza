@@ -526,6 +526,10 @@ struct Renormalizer {
     layout: BackgroundSamples,
     /// The integrated reference at those samples, all the fit reads of it.
     reference: Vec<f32>,
+    /// Expanded mosaics keep the recorded spatial correction and fit only
+    /// an additive residual. Ordinary stacks keep the original refit.
+    preserve_recorded: bool,
+    /// Residual maps when preserving the base, otherwise complete maps.
     maps: std::sync::Mutex<Vec<Option<crate::NormalizationMap>>>,
 }
 
@@ -533,7 +537,8 @@ impl Renormalizer {
     /// Frame `index`'s background offsets refitted against the integrated
     /// reference on `interpolated`, its unnormalized registered image,
     /// keeping its recorded gain; fitted once and then reused, so every pass
-    /// sees the same samples.
+    /// sees the same samples. With `preserve_recorded`, the returned map is
+    /// an additive residual to apply after the frame's recorded map.
     fn map_for(
         &self,
         admitted: &AdmittedFrame,
@@ -556,11 +561,12 @@ impl Renormalizer {
         if let Some(map) = self.fitted(index) {
             return Ok(map);
         }
-        let map = admitted.mapping.normalization().refit_background_samples(
-            &self.layout,
-            &self.reference,
-            samples,
-        )?;
+        let base = admitted.mapping.normalization();
+        let map = if self.preserve_recorded {
+            base.refit_background_residual_samples(&self.layout, &self.reference, samples)?
+        } else {
+            base.refit_background_samples(&self.layout, &self.reference, samples)?
+        };
         self.maps
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())[index] = Some(map.clone());
@@ -724,7 +730,8 @@ pub(crate) fn keeps_zeros(options: &crate::StackOptions, cfa: Option<crate::Baye
 /// frame. A stack told to [`LiveStacker::retain_frames_for_reintegration`]
 /// keeps one beside the live pass, which writes each frame's file while it
 /// has the registered image in hand, so the replay prepares nothing. A frame
-/// whose file could not be written is prepared again when it is next needed.
+/// whose retained file could not be written is prepared again when needed.
+/// An explicit replay cache must hold every frame for the banded passes.
 ///
 /// Under local background normalization each frame's file has a smaller one
 /// beside it, the samples the background fit reads (see
@@ -733,6 +740,10 @@ pub(crate) fn keeps_zeros(options: &crate::StackOptions, cfa: Option<crate::Baye
 pub(crate) struct FrameCache {
     files: CacheFiles,
     slots: Vec<std::sync::Mutex<CacheSlot>>,
+    /// A replay explicitly assigned to this directory must not silently
+    /// switch to the higher-memory whole-frame passes if a file fails.
+    /// Live retention remains best effort and overrides replay's directory.
+    required: bool,
 }
 
 /// The directory a [`FrameCache`] keeps its files in, which frames being
@@ -844,9 +855,9 @@ impl CacheFiles {
             region: image.region,
         };
         FrameCache::write_placed(frame.path.as_deref()?, image, keep_zeros).ok()?;
-        if let Some(samples) = samples {
+        if let (Some(samples), Some(layout)) = (samples, self.background.as_ref()) {
             let path = staged("samples");
-            if FrameCache::write_samples(&path, &samples).is_ok() {
+            if FrameCache::write_samples(&path, &samples, layout, image.region).is_ok() {
                 frame.samples = Some(path);
             } else {
                 let _ = std::fs::remove_file(path);
@@ -874,6 +885,28 @@ impl CacheAdmissions<'_> {
 }
 
 impl FrameCache {
+    /// Keep the low-memory algorithm predictable when the caller chose a
+    /// scratch location. Only an implicit system-temp cache may fall back.
+    fn for_replay(
+        directory: Option<&Path>,
+        frames: usize,
+        background: Option<BackgroundSamples>,
+    ) -> Result<Option<Self>> {
+        match Self::new(directory, frames, background) {
+            Ok(mut cache) => {
+                cache.required = directory.is_some();
+                Ok(Some(cache))
+            }
+            Err(error) => match directory {
+                Some(directory) => Err(Error::Stack(format!(
+                    "cannot initialize replay scratch directory {} (an existing writable directory is required): {error}",
+                    directory.display()
+                ))),
+                None => Ok(None),
+            },
+        }
+    }
+
     /// A cache for `frames` frames in a new directory, keeping the samples
     /// of `background` beside each.
     fn new(
@@ -901,6 +934,7 @@ impl FrameCache {
             slots: (0..frames)
                 .map(|_| std::sync::Mutex::new(CacheSlot::Empty))
                 .collect(),
+            required: false,
         })
     }
 
@@ -933,10 +967,14 @@ impl FrameCache {
     /// are not kept or cannot be read.
     fn samples(&self, index: usize) -> Option<Vec<f32>> {
         let layout = self.files.background.as_ref()?;
-        if !self.sampled(index) {
+        let CacheSlot::Stored {
+            samples: true,
+            region,
+        } = self.slot(index)
+        else {
             return None;
-        }
-        Self::read_samples(&self.files.samples_path(index), layout.len())
+        };
+        Self::read_samples(&self.files.samples_path(index), layout, region)
     }
 
     /// Where preparation threads stage frames.
@@ -995,9 +1033,9 @@ impl FrameCache {
             *slot = if Self::write_placed(&self.path(index), image.view(), false).is_ok() {
                 let samples = self.files.background.as_ref().is_some_and(|layout| {
                     let path = self.files.samples_path(index);
-                    let written = layout
-                        .of_placed(image.view())
-                        .is_ok_and(|samples| Self::write_samples(&path, &samples).is_ok());
+                    let written = layout.of_placed(image.view()).is_ok_and(|samples| {
+                        Self::write_samples(&path, &samples, layout, image.region).is_ok()
+                    });
                     if !written {
                         let _ = std::fs::remove_file(path);
                     }
@@ -1037,14 +1075,17 @@ impl FrameCache {
             *slot = CacheSlot::Unavailable;
             return;
         };
-        let samples = samples.is_some_and(|samples| {
-            let path = self.files.samples_path(index);
-            let written = Self::write_samples(&path, samples).is_ok();
-            if !written {
-                let _ = std::fs::remove_file(path);
-            }
-            written
-        });
+        let samples =
+            samples
+                .zip(self.files.background.as_ref())
+                .is_some_and(|(samples, layout)| {
+                    let path = self.files.samples_path(index);
+                    let written = Self::write_samples(&path, samples, layout, region).is_ok();
+                    if !written {
+                        let _ = std::fs::remove_file(path);
+                    }
+                    written
+                });
         *slot = CacheSlot::Stored { samples, region };
     }
 
@@ -1081,9 +1122,39 @@ impl FrameCache {
 
     /// Write a frame's background samples, changed as [`Self::write_placed`]
     /// changes an image, since the fit reads them through the identity
-    /// normalization.
-    fn write_samples(path: &Path, samples: &[f32]) -> std::io::Result<()> {
-        Self::write_values(path, &[samples.len()], [samples], false)
+    /// normalization. Only tiles intersecting the footprint are stored;
+    /// all other samples are known NaNs. The fixed header identifies the
+    /// layout's sample count and the footprint; their deterministic ranges
+    /// need no per-run metadata in the file.
+    fn write_samples(
+        path: &Path,
+        samples: &[f32],
+        layout: &BackgroundSamples,
+        region: ReferenceRegion,
+    ) -> std::io::Result<()> {
+        let invalid = || {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "background samples do not match their layout or footprint",
+            )
+        };
+        if samples.len() != layout.len() {
+            return Err(invalid());
+        }
+        let ranges = layout.ranges_for_region(region).ok_or_else(invalid)?;
+        Self::write_values(
+            path,
+            &[
+                SAMPLE_CACHE_VERSION,
+                samples.len(),
+                region.x,
+                region.y,
+                region.width,
+                region.height,
+            ],
+            ranges.map(|range| &samples[range]),
+            false,
+        )
     }
 
     /// Write `header`, then the samples of each of `runs` in turn, with
@@ -1152,30 +1223,60 @@ impl FrameCache {
         })
     }
 
-    /// Read `count` samples [`Self::write_samples`] wrote.
-    fn read_samples(path: &Path, count: usize) -> Option<Vec<f32>> {
+    /// Restore the exact sample grid [`Self::write_samples`] wrote, filling
+    /// omitted tiles with their original canonical NaNs. Header and length
+    /// are checked against the known layout and footprint before allocating
+    /// the grid, and payload reads use a bounded buffer.
+    fn read_samples(
+        path: &Path,
+        layout: &BackgroundSamples,
+        region: ReferenceRegion,
+    ) -> Option<Vec<f32>> {
         use std::io::Read;
         let mut file = std::fs::File::open(path).ok()?;
-        let mut header = [0_u8; 8];
+        let mut header = [0_u8; SAMPLE_HEADER_BYTES];
         file.read_exact(&mut header).ok()?;
-        let length = u64::try_from(count.checked_mul(4)?.checked_add(header.len())?).ok()?;
-        if u64::from_le_bytes(header) != count as u64 || file.metadata().ok()?.len() != length {
+        let expected = [
+            SAMPLE_CACHE_VERSION,
+            layout.len(),
+            region.x,
+            region.y,
+            region.width,
+            region.height,
+        ];
+        if header.chunks_exact(8).zip(expected).any(|(raw, expected)| {
+            u64::from_le_bytes(raw.try_into().expect("a header field is eight bytes"))
+                != expected as u64
+        }) {
             return None;
         }
-        let mut bytes = vec![0_u8; count * 4];
-        file.read_exact(&mut bytes).ok()?;
-        Some(
-            bytes
-                .chunks_exact(4)
-                .map(|raw| f32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
-                .collect(),
-        )
+        let stored = layout
+            .ranges_for_region(region)?
+            .try_fold(0_usize, |sum, range| sum.checked_add(range.len()))?;
+        let length = u64::try_from(stored.checked_mul(4)?.checked_add(header.len())?).ok()?;
+        if file.metadata().ok()?.len() != length {
+            return None;
+        }
+        let mut samples = vec![f32::NAN; layout.len()];
+        let mut bytes = vec![0_u8; (stored * 4).min(1 << 20)];
+        for range in layout.ranges_for_region(region)? {
+            for chunk in samples[range].chunks_mut(bytes.len() / 4) {
+                let raw = &mut bytes[..chunk.len() * 4];
+                file.read_exact(raw).ok()?;
+                for (sample, raw) in chunk.iter_mut().zip(raw.chunks_exact(4)) {
+                    *sample = f32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+                }
+            }
+        }
+        Some(samples)
     }
 
     /// Fill `band`, whole rows of an image of `shape`, with rows `top..`
     /// of frame `index`'s file, normalizing them with `map` as each
-    /// megabyte arrives, while it is still in the processor's cache. Only
-    /// the region the file holds is read; the rest of the band is `NaN`.
+    /// megabyte arrives, while it is still in the processor's cache. When
+    /// `recorded` is present, apply it first and then `map` as an additive
+    /// residual, retaining each map's tile grid. Only the region the file
+    /// holds is read; the rest of the band is `NaN`.
     fn read_band(
         &self,
         index: usize,
@@ -1183,6 +1284,7 @@ impl FrameCache {
         top: usize,
         band: &mut [f32],
         map: &crate::NormalizationMap,
+        recorded: Option<&crate::NormalizationMap>,
     ) -> Result<()> {
         use std::io::{Read, Seek};
         let path = self.path(index);
@@ -1238,7 +1340,11 @@ impl FrameCache {
             (header.len() + (first - region.y) * run * 4) as u64,
         ))
         .map_err(|error| failed(error.to_string()))?;
-        let normalizer = RowNormalizer::new(map, region.x, region.width);
+        let normalizer = RowNormalizer::new(recorded.unwrap_or(map), region.x, region.width);
+        let residual = recorded
+            .filter(|_| !map.is_identity())
+            .map(|_| RowNormalizer::new(map, region.x, region.width));
+        let mut residual_coefficients = RowCoefficients::default();
         let rows_per_read = ((1 << 20) / (run * 4)).max(1);
         let mut bytes = vec![0_u8; rows_per_read * run * 4];
         let mut coefficients = RowCoefficients::default();
@@ -1255,6 +1361,9 @@ impl FrameCache {
                     *sample = f32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
                 }
                 normalizer.apply(&mut coefficients, samples, row);
+                if let Some(residual) = &residual {
+                    residual.apply(&mut residual_coefficients, samples, row);
+                }
             }
         }
         Ok(())
@@ -1263,6 +1372,10 @@ impl FrameCache {
 
 /// The bytes of [`FrameCache::write_placed`]'s header: seven `u64`s.
 const KEPT_HEADER_BYTES: usize = 56;
+
+/// An ephemeral sample-cache format: version, sample count and footprint.
+const SAMPLE_CACHE_VERSION: usize = 1;
+const SAMPLE_HEADER_BYTES: usize = 48;
 
 /// The grid's width, height and channels and the region a kept image's
 /// header gives, when the region lies on the grid.
@@ -1305,12 +1418,21 @@ struct CacheBands<'a> {
     /// The admitted frame each band source index reads.
     frames: Vec<usize>,
     maps: &'a [crate::NormalizationMap],
+    /// Base maps applied before maps when those hold mosaic residuals.
+    /// Both slices follow frames, not the ledger's original ordering.
+    recorded: Option<&'a [crate::NormalizationMap]>,
 }
 
 impl crate::batch::BandSource for CacheBands<'_> {
     fn read(&self, index: usize, top: usize, band: &mut [f32]) -> Result<()> {
-        self.cache
-            .read_band(self.frames[index], self.shape, top, band, &self.maps[index])
+        self.cache.read_band(
+            self.frames[index],
+            self.shape,
+            top,
+            band,
+            &self.maps[index],
+            self.recorded.map(|maps| &maps[index]),
+        )
     }
 
     fn region(&self, index: usize) -> Option<ReferenceRegion> {
@@ -1340,7 +1462,8 @@ impl Replay<'_> {
     }
 
     /// The map that normalizes frame `index`: refitted against the
-    /// integrated reference, or as the live pass recorded it.
+    /// integrated reference, or as the live pass recorded it. For an expanded
+    /// background refit this is the residual; the recorded map is applied first.
     fn normalization(&self, index: usize) -> Result<crate::NormalizationMap> {
         match self.renormalizer {
             Some(renormalizer) => renormalizer
@@ -1479,12 +1602,22 @@ impl Replay<'_> {
         let maps = (0..count)
             .map(|index| self.normalization(index))
             .collect::<Result<Vec<_>>>()?;
+        let recorded = self
+            .renormalizer
+            .filter(|fit| fit.preserve_recorded)
+            .map(|_| {
+                frames
+                    .iter()
+                    .map(|frame| frame.mapping.normalization().clone())
+                    .collect::<Vec<_>>()
+            });
         let reference = &stacker.reference;
         let source = CacheBands {
             cache,
             shape: (reference.width, reference.height, reference.channels),
             frames: (0..count).collect(),
             maps: &maps,
+            recorded: recorded.as_deref(),
         };
         // The frame indices are spread over the bands, and the drizzle's
         // frames, so that they follow the work done.
@@ -2046,6 +2179,20 @@ impl LiveStacker {
         progress: &mut dyn FnMut(BatchStackPass, usize, usize),
     ) -> Result<Vec<Option<f64>>> {
         let count = self.ledger.frames.len();
+        if cancel.is_some_and(CancelSignal::is_cancelled) {
+            return Err(Error::Cancelled);
+        }
+        // Warped frames keep their carried geometry. When none can be
+        // refined, replay can prepare them once instead of building a
+        // full-resolution reference that no frame will use.
+        if self
+            .ledger
+            .frames
+            .iter()
+            .all(|frame| frame.mapping.warp().is_some())
+        {
+            return Ok(vec![None; count]);
+        }
         let masters = MastersCache::default();
         let footprints = !crate::stack::resamples_whole_canvas();
         let interpolation = self.options.interpolation;
@@ -2087,9 +2234,15 @@ impl LiveStacker {
             if cancel.is_some_and(CancelSignal::is_cancelled) {
                 return Err(Error::Cancelled);
             }
+            let carried = self.ledger.frames[index].mapping.clone();
+            // The first pass includes warped neighbours in the reference,
+            // but they need no second read or star detection of their own.
+            // Replay prepares their cache entries when it needs them.
+            if carried.warp().is_some() {
+                continue;
+            }
             progress(BatchStackPass::Estimate, index, count);
             let (image, placed) = read(self, index)?;
-            let carried = self.ledger.frames[index].mapping.clone();
             let region = placed.region;
             // The canvas over the frame's footprint without the frame.
             let mut others = vec![f32::NAN; region.width * region.height * channels];
@@ -2122,40 +2275,34 @@ impl LiveStacker {
             let mut initial = carried.transform();
             initial.translation_x -= region.x as f64;
             initial.translation_y -= region.y as f64;
-            let refit = carried
-                .warp()
-                .is_none()
-                .then(|| {
-                    crate::registration::refine_similarity(
-                        &others,
-                        &image,
-                        &source_stars,
-                        initial,
-                        &options,
-                        stars,
-                        crate::binning::Scale::NATIVE,
-                    )
-                })
-                .flatten()
-                .map(|mut result| {
-                    result.transform.translation_x += region.x as f64;
-                    result.transform.translation_y += region.y as f64;
-                    result
-                })
-                .filter(|result| {
-                    let (right, bottom) = ((image.width - 1) as f64, (image.height - 1) as f64);
-                    let moved = [(0.0, 0.0), (right, 0.0), (0.0, bottom), (right, bottom)]
-                        .into_iter()
-                        .map(|(x, y)| {
-                            let (a, b) = result.transform.apply(x, y);
-                            let (c, d) = carried.transform().apply(x, y);
-                            (a - c).hypot(b - d)
-                        })
-                        .fold(0.0, f64::max);
-                    moved <= tolerance
-                        && result.rms_error_pixels
-                            <= self.options.acceptance.maximum_registration_rms_pixels
-                });
+            let refit = crate::registration::refine_similarity(
+                &others,
+                &image,
+                &source_stars,
+                initial,
+                &options,
+                stars,
+                crate::binning::Scale::NATIVE,
+            )
+            .map(|mut result| {
+                result.transform.translation_x += region.x as f64;
+                result.transform.translation_y += region.y as f64;
+                result
+            })
+            .filter(|result| {
+                let (right, bottom) = ((image.width - 1) as f64, (image.height - 1) as f64);
+                let moved = [(0.0, 0.0), (right, 0.0), (0.0, bottom), (right, bottom)]
+                    .into_iter()
+                    .map(|(x, y)| {
+                        let (a, b) = result.transform.apply(x, y);
+                        let (c, d) = carried.transform().apply(x, y);
+                        (a - c).hypot(b - d)
+                    })
+                    .fold(0.0, f64::max);
+                moved <= tolerance
+                    && result.rms_error_pixels
+                        <= self.options.acceptance.maximum_registration_rms_pixels
+            });
             if let Some(result) = refit {
                 self.ledger.frames[index].mapping =
                     carried.with_geometry(result.transform, None)?;
@@ -2171,18 +2318,29 @@ impl LiveStacker {
         Ok(refined)
     }
 
-    /// A cache for the frames a full-resolution pass refines, in
-    /// `scratch_directory` or the system temporary directory.
+    /// A cache on this stack's native-resolution grid, initialized before
+    /// reading or allocating that grid. Its background layout uses native
+    /// pixel units even when this stack is still binned.
     pub(crate) fn full_resolution_cache(
         &self,
         scratch_directory: Option<&Path>,
-    ) -> Option<FrameCache> {
-        FrameCache::new(
-            scratch_directory,
-            self.ledger.frames.len(),
-            self.background_samples(),
-        )
-        .ok()
+    ) -> Result<Option<FrameCache>> {
+        let mut cache = FrameCache::for_replay(scratch_directory, self.ledger.frames.len(), None)?;
+        if let Some(cache) = &mut cache {
+            cache.files.background = match self.options.normalization {
+                crate::NormalizationMode::LocalBackground { tile_size } => {
+                    let factor = self.options.bin_factor as usize;
+                    Some(BackgroundSamples::new(
+                        self.reference.width * factor,
+                        self.reference.height * factor,
+                        self.reference.channels,
+                        tile_size,
+                    ))
+                }
+                _ => None,
+            };
+        }
+        Ok(cache)
     }
 
     /// Each admitted frame's mapping from its sensor pixels, which a drizzle
@@ -2277,9 +2435,11 @@ impl LiveStacker {
     /// read whole. The result is exactly that
     /// of [`crate::integrate_registered_frames`], whose rejection this is. Memory
     /// is 16 bytes per output sample (20 for a weighted stack) plus the
-    /// bands. Where a frame cannot be kept in a scratch file, every frame is
-    /// instead read whole on each of the three passes, with the memory
-    /// [`crate::integrate_registered_frames`] describes.
+    /// bands. If an implicit system-temp or live-retention cache cannot keep
+    /// every frame, every frame is instead read whole on each of the three
+    /// passes, with the memory [`crate::integrate_registered_frames`]
+    /// describes. A replay assigned an explicit scratch directory fails
+    /// instead of making that higher-memory fallback.
     ///
     /// The live stack is left as it was. `progress` receives the pass, a
     /// zero-based frame index and the frame count: [`BatchStackPass::Estimate`]
@@ -2401,12 +2561,11 @@ impl LiveStacker {
         {
             Some(retained)
         } else {
-            own_cache = FrameCache::new(
+            own_cache = FrameCache::for_replay(
                 options.scratch_directory.as_deref(),
                 count,
                 self.background_samples(),
-            )
-            .ok();
+            )?;
             own_cache.as_ref()
         };
         // A frame prepared again from its source is resampled over its
@@ -2417,6 +2576,7 @@ impl LiveStacker {
                 reference: self
                     .normalization_reference(&layout, &masters, cache, options, footprints)?,
                 layout,
+                preserve_recorded: self.canvas_registrar.is_some(),
                 maps: std::sync::Mutex::new(vec![None; count]),
             }),
             None => None,
@@ -2434,7 +2594,15 @@ impl LiveStacker {
         };
         let (mut result, drizzled) = match banded_result {
             Some(result) => result,
-            None => replay.frames(cache, drizzle, &mut progress)?,
+            None => {
+                if banded && let Some(cache) = cache.filter(|cache| cache.required) {
+                    return Err(Error::Stack(format!(
+                        "cannot keep every frame in replay scratch directory {}; refusing a higher-memory whole-frame fallback",
+                        cache.files.directory.path().display()
+                    )));
+                }
+                replay.frames(cache, drizzle, &mut progress)?
+            }
         };
         result.snapshot.rejected_frames = self.rejected_frames;
         self.fill_photosite_gaps(&mut result.snapshot.image.data, &result.snapshot.coverage);
@@ -2458,7 +2626,13 @@ impl LiveStacker {
     /// The background fit reads only the reference's samples in `layout`,
     /// so only those are returned. When the cache keeps every one of the
     /// best frames' samples, only those are read and averaged; otherwise the
-    /// frames are averaged whole.
+    /// frames are averaged whole. On an expanded canvas, each sample takes
+    /// its own best frames: a globally selected set could cover just one
+    /// panel, leaving the other panels without a background reference.
+    /// Mosaics retain each frame's complete recorded spatial correction:
+    /// reducing it to a mean offset would undo the live overlap agreement.
+    /// Their replay fits only residual differences from that common sky;
+    /// it does not remove a gradient shared by all the recorded maps.
     fn normalization_reference(
         &self,
         layout: &BackgroundSamples,
@@ -2480,6 +2654,11 @@ impl LiveStacker {
         };
         let mut ranked = (0..frames.len()).collect::<Vec<_>>();
         ranked.sort_by(|&left, &right| quality(&frames[right]).total_cmp(&quality(&frames[left])));
+        if self.canvas_registrar.is_some() {
+            return self.mosaic_normalization_reference(
+                layout, masters, cache, options, footprints, &ranked,
+            );
+        }
         ranked.truncate(NORMALIZATION_REFERENCE_FRAMES);
         if let Some(cache) = cache.filter(|cache| ranked.iter().all(|&index| cache.sampled(index)))
             && let Some(reference) = self.sampled_reference(layout, cache, &ranked)?
@@ -2489,6 +2668,54 @@ impl LiveStacker {
         layout
             .of(&self
                 .normalization_reference_image(&ranked, masters, cache, options, footprints)?)
+    }
+
+    /// Average the best available frames at each background sample, so a
+    /// well-exposed panel cannot exhaust the reference budget for another.
+    /// Finite samples carry the actual registered footprint, including
+    /// warped edges and missing pixels. The accumulators cover only the
+    /// background layout; an uncached frame is prepared over its footprint
+    /// and kept for the subsequent integration when scratch is available.
+    fn mosaic_normalization_reference(
+        &self,
+        layout: &BackgroundSamples,
+        masters: &MastersCache,
+        cache: Option<&FrameCache>,
+        options: &BatchStackOptions,
+        footprints: bool,
+        ranked: &[usize],
+    ) -> Result<Vec<f32>> {
+        crate::batch::check_cancelled(options)?;
+        let mut sum = vec![0.0_f32; layout.len()];
+        let mut count = vec![0_u16; layout.len()];
+        for &index in ranked {
+            crate::batch::check_cancelled(options)?;
+            let admitted = &self.ledger.frames[index];
+            self.source_unchanged(admitted)?;
+            let mut samples = match cache.and_then(|cache| cache.samples(index)) {
+                Some(samples) => samples,
+                None => {
+                    let masters = masters.get(self, admitted.calibration)?;
+                    let image = self.prepared(index, admitted, &masters, cache, footprints)?;
+                    layout.of_placed(image.view())?
+                }
+            };
+            admitted
+                .mapping
+                .normalization()
+                .apply_samples(layout, &mut samples)?;
+            sum.par_iter_mut()
+                .zip(count.par_iter_mut())
+                .zip(samples.par_iter())
+                .for_each(|((sum, count), &value)| {
+                    if value.is_finite() && usize::from(*count) < NORMALIZATION_REFERENCE_FRAMES {
+                        *sum += value;
+                        *count += 1;
+                    }
+                });
+        }
+        crate::batch::check_cancelled(options)?;
+        Ok(mean(sum, count))
     }
 
     /// [`Self::normalization_reference`] at the samples of `layout` alone,
@@ -2565,6 +2792,7 @@ impl LiveStacker {
                 shape,
                 frames: ranked.clone(),
                 maps: &maps,
+                recorded: None,
             };
             const CHUNK: usize = 1 << 14;
             crate::batch::for_each_band(
@@ -2921,7 +3149,17 @@ impl LiveStacker {
             None => admitted.mapping.normalization().clone(),
         };
         let region = placed.region;
-        map.apply_region(&mut placed.image, region.x, region.y)?;
+        if renormalizer.is_some_and(|fit| fit.preserve_recorded) {
+            admitted
+                .mapping
+                .normalization()
+                .apply_region(&mut placed.image, region.x, region.y)?;
+            if !map.is_identity() {
+                map.apply_region(&mut placed.image, region.x, region.y)?;
+            }
+        } else {
+            map.apply_region(&mut placed.image, region.x, region.y)?;
+        }
         placed.into_grid()
     }
 
@@ -2966,6 +3204,1007 @@ mod tests {
         assert_eq!(drizzle_read_limits(512 * mib, 16 * mib, 4, 4), (1, 1));
         assert_eq!(drizzle_read_limits(128 * mib, 16 * mib, 4, 4), (1, 0));
         assert_eq!(drizzle_read_limits(512 * mib, 16 * mib, 1, 4), (4, 4));
+    }
+
+    #[test]
+    fn explicit_replay_scratch_never_silently_disables_the_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing");
+        let file = directory.path().join("file");
+        std::fs::write(&file, b"not a directory").unwrap();
+        for path in [&missing, &file] {
+            let error = match FrameCache::for_replay(Some(path), 1, None) {
+                Err(error) => error,
+                Ok(_) => panic!("invalid explicit scratch must not fall back"),
+            };
+            assert!(error.to_string().contains("scratch directory"));
+        }
+        assert!(!missing.exists());
+        assert!(
+            FrameCache::for_replay(Some(directory.path()), 1, None)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    fn canvas_refinement_frames(warped: &[bool]) -> (tempfile::TempDir, LiveStacker) {
+        let directory = tempfile::tempdir().unwrap();
+        let image = crate::registration::test_star_field(false);
+        let paths = (0..warped.len())
+            .map(|index| {
+                let path = directory.path().join(format!("light-{index}.fits"));
+                crate::write_linear_image_fits_f32(&path, &image, &[], &[]).unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        let mut stacker = LiveStacker::open_fits(
+            &paths[0],
+            None,
+            None,
+            None,
+            None,
+            crate::StackOptions {
+                normalization: crate::NormalizationMode::None,
+                ..crate::StackOptions::default()
+            },
+        )
+        .unwrap();
+        for path in &paths[1..] {
+            assert!(matches!(
+                stacker.push_fits(path).unwrap(),
+                crate::FrameDisposition::Accepted(_)
+            ));
+        }
+        let identity: crate::PolynomialWarp = serde_json::from_value(serde_json::json!({
+            "order": 1, "center_x": 0.0, "center_y": 0.0, "scale": 1.0,
+            "x": [0.0, 1.0, 0.0], "y": [0.0, 0.0, 1.0]
+        }))
+        .unwrap();
+        for (frame, &warped) in stacker.ledger.frames.iter_mut().zip(warped) {
+            if warped {
+                frame.mapping = frame
+                    .mapping
+                    .with_geometry(frame.mapping.transform(), Some(identity.clone()))
+                    .unwrap();
+            }
+        }
+        (directory, stacker)
+    }
+
+    fn snapshot_bits(snapshot: &crate::StackSnapshot) -> Vec<u32> {
+        snapshot
+            .image
+            .data
+            .iter()
+            .chain(&snapshot.variance.data)
+            .map(|value| value.to_bits())
+            .chain(snapshot.coverage.iter().copied())
+            .chain(snapshot.rejected_samples.iter().copied())
+            .collect()
+    }
+
+    /// A recorded mosaic with two disjoint source footprints. The first
+    /// panel has more than twenty exposures and better transparency, so a
+    /// globally ranked reference never reaches the second panel. Its poor
+    /// exposure precedes its good ones to exercise quality, not file order.
+    fn mosaic_background_frames() -> (tempfile::TempDir, LiveStacker, FrameCache) {
+        let (directory, mut stacker) = canvas_refinement_frames(&[false]);
+        stacker.options.normalization = crate::NormalizationMode::LocalBackground { tile_size: 32 };
+        stacker.canvas_registrar = Some(
+            crate::expand::CanvasRegistrar::new(
+                &stacker.reference,
+                &[stacker.full_region(&stacker.ledger.frames[0])],
+                None,
+                None,
+                &stacker.options.registration,
+                stacker.options.scale(),
+            )
+            .unwrap(),
+        );
+        let paths = [1.0_f32, 2.0, 4.0]
+            .into_iter()
+            .map(|gain| {
+                let path = directory.path().join(format!("panel-gain-{gain}.fits"));
+                let image = LinearImage::new(
+                    64,
+                    64,
+                    1,
+                    (0..64 * 64)
+                        .map(|pixel| {
+                            (100.0 + (pixel % 64) as f32 / 8.0 + (pixel / 64) as f32 / 16.0) / gain
+                                + if gain == 4.0 { 25.0 } else { 0.0 }
+                        })
+                        .collect(),
+                )
+                .unwrap();
+                crate::write_linear_image_fits_f32(&path, &image, &[], &[]).unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        let prototype = stacker.ledger.frames[0].clone();
+        let reference = &stacker.reference;
+        stacker.ledger.frames = (0..42)
+            .map(|index| {
+                let (source, gain, x, y) = if index < 21 {
+                    (0, 1.0, 32.0, 32.0)
+                } else if index == 21 {
+                    (2, 4.0, 320.0, 224.0)
+                } else {
+                    (1, 2.0, 320.0, 224.0)
+                };
+                let normalization = serde_json::from_value(serde_json::json!({
+                    "schema_version": 1,
+                    "width": reference.width, "height": reference.height, "channels": 1,
+                    "tile_size": reference.width.max(reference.height), "columns": 1, "rows": 1,
+                    "gains": [gain], "offsets": [0.0]
+                }))
+                .unwrap();
+                AdmittedFrame {
+                    source: Some(FrameSource {
+                        path: paths[source].clone(),
+                        rescale_to: None,
+                        stamp: SourceStamp::of(&paths[source]),
+                    }),
+                    mapping: RegisteredFrameMapping::new(
+                        reference.width,
+                        reference.height,
+                        crate::SimilarityTransform {
+                            translation_x: x,
+                            translation_y: y,
+                            ..crate::SimilarityTransform::IDENTITY
+                        },
+                        normalization,
+                    )
+                    .unwrap(),
+                    ..prototype.clone()
+                }
+            })
+            .collect();
+        stacker.accepted_frames = stacker.ledger.frames.len() as u32;
+        let cache = FrameCache::new(
+            Some(directory.path()),
+            stacker.ledger.frames.len(),
+            stacker.background_samples(),
+        )
+        .unwrap();
+        (directory, stacker, cache)
+    }
+
+    /// Both partially overlapping panels already map to the same sky.
+    /// The second panel needs a spatial offset and a different global gain.
+    /// The scene contains a broad nebula, a genuine sky gradient and stars;
+    /// it must not become flatter merely because replay rebuilds a reference.
+    fn spatially_agreed_mosaic(
+        map_tile: usize,
+        sample_tile: usize,
+    ) -> (
+        tempfile::TempDir,
+        LiveStacker,
+        FrameCache,
+        Vec<PlacedImage>,
+        LinearImage,
+    ) {
+        let (directory, mut stacker) = canvas_refinement_frames(&[false]);
+        let (width, height) = (stacker.reference.width, stacker.reference.height);
+        assert_eq!((width, height), (512, 384));
+        stacker.options.normalization = crate::NormalizationMode::LocalBackground {
+            tile_size: sample_tile,
+        };
+        stacker.canvas_registrar = Some(
+            crate::expand::CanvasRegistrar::new(
+                &stacker.reference,
+                &[stacker.full_region(&stacker.ledger.frames[0])],
+                None,
+                None,
+                &stacker.options.registration,
+                stacker.options.scale(),
+            )
+            .unwrap(),
+        );
+        let sky = LinearImage::new(
+            width,
+            height,
+            1,
+            (0..width * height)
+                .map(|pixel| {
+                    let (x, y) = ((pixel % width) as f32, (pixel / width) as f32);
+                    let nebula =
+                        (128.0 - ((x - 220.0) / 12.0).powi(2) - ((y - 170.0) / 15.0).powi(2))
+                            .max(0.0);
+                    let stars =
+                        ((stacker.reference.data[pixel] - 100.0).max(0.0) * 16.0).round() / 16.0;
+                    1024.0 + x / 8.0 + y / 16.0 + (nebula * 16.0).round() / 16.0 + stars
+                })
+                .collect(),
+        )
+        .unwrap();
+        let prototype = stacker.ledger.frames[0].clone();
+        let mut images = Vec::new();
+        stacker.ledger.frames = (0..2)
+            .map(|index| {
+                let normalization: crate::NormalizationMap = if index == 0 {
+                    crate::NormalizationMap::identity(&sky)
+                } else {
+                    let columns = width.div_ceil(map_tile);
+                    let rows = height.div_ceil(map_tile);
+                    let offsets = (0..columns * rows)
+                        .map(|cell| ((cell % columns) as f32 - (columns - 1) as f32 / 2.0) * 32.0)
+                        .collect::<Vec<_>>();
+                    serde_json::from_value(serde_json::json!({
+                        "schema_version": 1,
+                        "width": width, "height": height, "channels": 1,
+                        "tile_size": map_tile, "columns": columns, "rows": rows,
+                        "gains": vec![2.0; columns * rows], "offsets": offsets
+                    }))
+                    .unwrap()
+                };
+                let region = ReferenceRegion {
+                    x: index * 128,
+                    y: 0,
+                    width: 384,
+                    height,
+                };
+                let sampler = normalization.sampler();
+                let image = LinearImage::new(
+                    region.width,
+                    region.height,
+                    1,
+                    (0..region.width * region.height)
+                        .map(|pixel| {
+                            let (x, y) = (region.x + pixel % region.width, pixel / region.width);
+                            let (gain, offset) = sampler.at(x, y, 0);
+                            (sky.data[y * width + x] - offset) / gain
+                        })
+                        .collect(),
+                )
+                .unwrap();
+                let path = directory.path().join(format!("agreed-panel-{index}.fits"));
+                crate::write_linear_image_fits_f32(&path, &image, &[], &[]).unwrap();
+                images.push(PlacedImage {
+                    image,
+                    region,
+                    width,
+                    height,
+                });
+                AdmittedFrame {
+                    source: Some(FrameSource {
+                        stamp: SourceStamp::of(&path),
+                        path,
+                        rescale_to: None,
+                    }),
+                    mapping: RegisteredFrameMapping::new(
+                        width,
+                        height,
+                        crate::SimilarityTransform {
+                            translation_x: region.x as f64,
+                            ..crate::SimilarityTransform::IDENTITY
+                        },
+                        normalization,
+                    )
+                    .unwrap(),
+                    ..prototype.clone()
+                }
+            })
+            .collect();
+        stacker.accepted_frames = 2;
+        let cache =
+            FrameCache::new(Some(directory.path()), 2, stacker.background_samples()).unwrap();
+        for (index, image) in images.iter().enumerate() {
+            cache
+                .get_or_prepare(index, Vec::new(), || Ok(image.clone()))
+                .unwrap();
+        }
+        (directory, stacker, cache, images, sky)
+    }
+
+    #[test]
+    fn mosaic_background_reference_preserves_spatially_agreed_nebula() {
+        let (_directory, stacker, cache, images, sky) = spatially_agreed_mosaic(128, 128);
+        // These binary-grid maps produce exactly the same sky, not merely
+        // statistically similar panels. Establish that before testing replay.
+        for (frame, image) in stacker.ledger.frames.iter().zip(&images) {
+            let mut normalized = image.clone();
+            frame
+                .mapping
+                .normalization()
+                .apply_region(&mut normalized.image, image.region.x, image.region.y)
+                .unwrap();
+            for (pixel, &value) in normalized.image.data.iter().enumerate() {
+                let (x, y) = (
+                    image.region.x + pixel % image.region.width,
+                    pixel / image.region.width,
+                );
+                assert_eq!(value.to_bits(), sky.data[y * sky.width + x].to_bits());
+            }
+        }
+        let layout = stacker.background_samples().unwrap();
+        let reference = stacker
+            .normalization_reference(
+                &layout,
+                &MastersCache::default(),
+                Some(&cache),
+                &BatchStackOptions::default(),
+                true,
+            )
+            .unwrap();
+        let expected = layout.of(&sky).unwrap();
+        let error = reference
+            .iter()
+            .zip(&expected)
+            .map(|(&actual, &expected)| (actual - expected).abs())
+            .fold(0.0_f32, f32::max);
+        assert_eq!(
+            error, 0.0,
+            "replay reference discarded spatial agreement: {error}"
+        );
+    }
+
+    #[test]
+    fn mosaic_background_refit_preserves_an_already_correct_spatial_map() {
+        // Bin=3 live tiles of 85 pixels become 255; native samples use 256.
+        for (map_tile, sample_tile) in [(128, 128), (255, 256)] {
+            let (_directory, stacker, cache, images, _sky) =
+                spatially_agreed_mosaic(map_tile, sample_tile);
+            let admitted = &stacker.ledger.frames[1];
+            let base = admitted.mapping.normalization();
+            let mut normalized = images[1].clone();
+            base.apply_region(
+                &mut normalized.image,
+                normalized.region.x,
+                normalized.region.y,
+            )
+            .unwrap();
+            let layout = stacker.background_samples().unwrap();
+            let exact_reference = layout.of_placed(normalized.view()).unwrap();
+            for reference in [exact_reference, vec![f32::NAN; layout.len()]] {
+                let renormalizer = Renormalizer {
+                    layout: layout.clone(),
+                    reference,
+                    preserve_recorded: true,
+                    maps: std::sync::Mutex::new(vec![None; 2]),
+                };
+                let residual = renormalizer
+                    .map_from_samples(admitted, 1, &cache.samples(1).unwrap())
+                    .unwrap();
+                assert!(
+                    residual.is_identity(),
+                    "an agreed or unsupported refit must produce no residual; grids {map_tile}/{sample_tile}"
+                );
+                let actual = stacker
+                    .replay_frame(
+                        admitted,
+                        &stacker.calibration,
+                        1,
+                        Some(&renormalizer),
+                        Some(&cache),
+                        true,
+                    )
+                    .unwrap();
+                let expected = normalized.clone().into_grid().unwrap();
+                assert_eq!(
+                    actual
+                        .data
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    expected
+                        .data
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mosaic_background_residual_matches_bands_and_whole_replay() {
+        let (_directory, stacker, cache, images, _sky) = spatially_agreed_mosaic(255, 256);
+        let admitted = &stacker.ledger.frames[1];
+        let base = admitted.mapping.normalization();
+        let mut expected = images[1].clone();
+        base.apply_region(&mut expected.image, expected.region.x, expected.region.y)
+            .unwrap();
+        for value in &mut expected.image.data {
+            *value += 7.25;
+        }
+        let layout = stacker.background_samples().unwrap();
+        let renormalizer = Renormalizer {
+            reference: layout.of_placed(expected.view()).unwrap(),
+            layout,
+            preserve_recorded: true,
+            maps: std::sync::Mutex::new(vec![None; 2]),
+        };
+        let residual = renormalizer
+            .map_from_samples(admitted, 1, &cache.samples(1).unwrap())
+            .unwrap();
+        assert!(!residual.is_identity());
+        assert_eq!(residual.gain_range(), (1.0, 1.0));
+        let expected = expected.into_grid().unwrap();
+        let bits = |values: &[f32]| {
+            values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        };
+        let whole = stacker
+            .replay_frame(
+                admitted,
+                &stacker.calibration,
+                1,
+                Some(&renormalizer),
+                Some(&cache),
+                true,
+            )
+            .unwrap();
+        assert_eq!(bits(&whole.data), bits(&expected.data));
+        let maps = [residual];
+        let recorded = [base.clone()];
+        let shape = (whole.width, whole.height, whole.channels);
+        let source = CacheBands {
+            cache: &cache,
+            shape,
+            frames: vec![1],
+            maps: &maps,
+            recorded: Some(&recorded),
+        };
+        for rows in [1, 31, 256] {
+            crate::batch::for_each_band(shape, 1, rows, &source, None, |_, top, bands| {
+                let start = top * whole.width;
+                assert_eq!(
+                    bits(bands[0]),
+                    bits(&whole.data[start..start + bands[0].len()])
+                );
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn mosaic_background_reference_uses_the_best_twenty_at_each_sample() {
+        let (_directory, mut stacker, cache) = mosaic_background_frames();
+        let layout = stacker.background_samples().unwrap();
+        let masters = MastersCache::default();
+        let options = BatchStackOptions::default();
+        let panel_samples = |index: usize| {
+            let admitted = &stacker.ledger.frames[index];
+            let image = stacker
+                .prepared(index, admitted, &stacker.calibration, None, true)
+                .unwrap();
+            let mut samples = layout.of_placed(image.view()).unwrap();
+            admitted
+                .mapping
+                .normalization()
+                .global_equivalent()
+                .apply_global_samples(&layout, &mut samples)
+                .unwrap();
+            samples
+        };
+        let left = panel_samples(0);
+        let right = panel_samples(22);
+        assert!(left.iter().any(|value| value.is_finite()));
+        assert!(right.iter().any(|value| value.is_finite()));
+        assert!(
+            left.iter()
+                .zip(&right)
+                .all(|(a, b)| !a.is_finite() || !b.is_finite())
+        );
+        let expected = left
+            .iter()
+            .zip(&right)
+            .map(|(&a, &b)| if a.is_finite() { a } else { b })
+            .map(|value| (0..20).fold(0.0, |sum, _| sum + value) / 20.0)
+            .collect::<Vec<_>>();
+        let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        let cached = stacker
+            .normalization_reference(&layout, &masters, Some(&cache), &options, true)
+            .unwrap();
+        assert_eq!(bits(&cached), bits(&expected));
+        for index in 0..stacker.ledger.frames.len() {
+            assert!(cache.sampled(index));
+            assert!(cache.region(index).unwrap().width < stacker.reference.width);
+        }
+        let uncached = stacker
+            .normalization_reference(&layout, &masters, None, &options, true)
+            .unwrap();
+        assert_eq!(bits(&cached), bits(&uncached));
+        // A missing sample file uses its kept footprint image; it does not
+        // require a whole-canvas reference image as the fallback did.
+        std::fs::remove_file(cache.files.samples_path(22)).unwrap();
+        let missing_samples = stacker
+            .normalization_reference(&layout, &masters, Some(&cache), &options, true)
+            .unwrap();
+        assert_eq!(bits(&cached), bits(&missing_samples));
+
+        // Recorded weights take precedence over transparency. Promoting
+        // the outlier includes it with nineteen good samples: +100 / 20.
+        for (index, frame) in stacker.ledger.frames.iter_mut().enumerate() {
+            frame.weighting.weight = vec![if index == 21 { 2.0 } else { 1.0 }];
+        }
+        let weighted = stacker
+            .normalization_reference(&layout, &masters, Some(&cache), &options, true)
+            .unwrap();
+        for ((actual, expected), right) in weighted.iter().zip(&expected).zip(&right) {
+            if expected.is_finite() {
+                assert_eq!(
+                    *actual,
+                    expected + if right.is_finite() { 5.0 } else { 0.0 }
+                );
+            } else {
+                assert!(actual.is_nan());
+            }
+        }
+        for frame in &mut stacker.ledger.frames {
+            frame.weighting = FrameWeightRecord::default();
+        }
+        // Ordinary single-field stacks keep their original global ranking.
+        stacker.canvas_registrar = None;
+        let single_field = stacker
+            .normalization_reference(&layout, &masters, Some(&cache), &options, true)
+            .unwrap();
+        for ((actual, expected), left) in single_field.iter().zip(&expected).zip(&left) {
+            if left.is_finite() {
+                assert_eq!(actual, expected);
+            } else {
+                assert!(actual.is_nan());
+            }
+        }
+    }
+
+    #[test]
+    fn mosaic_background_reference_checks_cancellation_and_redundant_sources() {
+        let (_directory, stacker, cache) = mosaic_background_frames();
+        let layout = stacker.background_samples().unwrap();
+        let masters = MastersCache::default();
+        stacker
+            .normalization_reference(
+                &layout,
+                &masters,
+                Some(&cache),
+                &BatchStackOptions::default(),
+                true,
+            )
+            .unwrap();
+        for after in [0, 3] {
+            let checks = std::sync::atomic::AtomicUsize::new(0);
+            let options = BatchStackOptions {
+                cancel: Some(CancelSignal::new(move || {
+                    checks.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= after
+                })),
+                ..BatchStackOptions::default()
+            };
+            assert!(matches!(
+                stacker.normalization_reference(&layout, &masters, Some(&cache), &options, true),
+                Err(Error::Cancelled)
+            ));
+        }
+        // Even the worst frame, excluded wherever twenty better ones are
+        // available, must still pass the source-integrity check.
+        let source = &stacker.ledger.frames[21].source.as_ref().unwrap().path;
+        std::fs::remove_file(source).unwrap();
+        let error = stacker
+            .normalization_reference(
+                &layout,
+                &masters,
+                Some(&cache),
+                &BatchStackOptions::default(),
+                true,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("changed since it was stacked"));
+    }
+
+    #[test]
+    fn explicit_replay_scratch_write_failure_does_not_fall_back() {
+        let (directory, mut stacker) = canvas_refinement_frames(&[false, false]);
+        let options = BatchStackOptions::default();
+        let expected = stacker.reintegrate(&options, |_, _, _| {}).unwrap();
+        for explicit in [true, false] {
+            let cache = FrameCache::for_replay(
+                explicit.then(|| directory.path()),
+                stacker.ledger.frames.len(),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+            // Initialization succeeds, but the first image cannot be
+            // written because a directory occupies its file's location.
+            std::fs::create_dir(cache.path(0)).unwrap();
+            stacker.frame_cache = Some(cache);
+            let result = stacker.reintegrate(&options, |_, _, _| {});
+            if explicit {
+                let error = result.unwrap_err();
+                assert!(error.to_string().contains("scratch directory"));
+                assert!(error.to_string().contains("whole-frame fallback"));
+            } else {
+                assert_eq!(
+                    snapshot_bits(&result.unwrap().snapshot),
+                    snapshot_bits(&expected.snapshot)
+                );
+            }
+            assert!(matches!(
+                stacker.frame_cache.as_ref().unwrap().slot(0),
+                CacheSlot::Unavailable
+            ));
+            // The internal equivalence-test mode still deliberately runs
+            // whole-frame passes, including with an explicit cache.
+            let (whole, _) = stacker
+                .replay_with(&options, None, |_, _, _| {}, false)
+                .unwrap();
+            assert_eq!(
+                snapshot_bits(&whole.snapshot),
+                snapshot_bits(&expected.snapshot)
+            );
+        }
+    }
+
+    #[test]
+    fn background_sample_cache_preserves_bits_and_stores_only_footprint_tiles() {
+        let directory = tempfile::tempdir().unwrap();
+        let bits = |samples: &[f32]| {
+            samples
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        };
+        for channels in [1, 3] {
+            let (width, height) = (259, 197);
+            let layout = BackgroundSamples::new(width, height, channels, 32);
+            let mut cache =
+                FrameCache::new(Some(directory.path()), 0, Some(layout.clone())).unwrap();
+            let whole = ReferenceRegion {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            };
+            let regions = [
+                whole,
+                ReferenceRegion {
+                    x: 75,
+                    y: 69,
+                    width: 64,
+                    height: 48,
+                },
+                ReferenceRegion {
+                    x: 256,
+                    y: 192,
+                    width: 3,
+                    height: 5,
+                },
+                ReferenceRegion {
+                    x: 31,
+                    y: 31,
+                    width: 2,
+                    height: 2,
+                },
+            ];
+            let image = |region: ReferenceRegion| PlacedImage {
+                image: LinearImage::new(
+                    region.width,
+                    region.height,
+                    channels,
+                    (0..region.width * region.height * channels)
+                        .map(|index| match index % 13 {
+                            0 => f32::NAN,
+                            1 => f32::from_bits(0x7fc0_1234),
+                            2 => -0.0,
+                            3 => 0.0,
+                            4 => f32::INFINITY,
+                            5 => f32::NEG_INFINITY,
+                            _ => index as f32 * 0.25 - 5.0,
+                        })
+                        .collect(),
+                )
+                .unwrap(),
+                region,
+                width,
+                height,
+            };
+            for (case, region) in regions.into_iter().enumerate() {
+                let placed = image(region);
+                let samples = layout.of_placed(placed.view()).unwrap();
+                let expected = samples
+                    .iter()
+                    .map(|&value| if value == 0.0 { 0.0 } else { value })
+                    .collect::<Vec<_>>();
+                let first = cache.slots.len();
+                let (files, mut admissions) = cache.split();
+                let staged = files.stage(placed.view(), Some(samples), false).unwrap();
+                admissions.admit(Some(staged));
+                admissions.admit(None);
+                cache
+                    .get_or_prepare(first + 1, Vec::new(), || Ok(placed.clone()))
+                    .unwrap();
+                for index in first..first + 2 {
+                    assert_eq!(bits(&cache.samples(index).unwrap()), bits(&expected));
+                    let stored = layout
+                        .ranges_for_region(region)
+                        .unwrap()
+                        .map(|range| range.len())
+                        .sum::<usize>();
+                    let bytes = std::fs::metadata(cache.files.samples_path(index))
+                        .unwrap()
+                        .len();
+                    assert_eq!(bytes, (SAMPLE_HEADER_BYTES + stored * 4) as u64);
+                    if case != 0 {
+                        assert!(bytes < (layout.len() * 4 / 3) as u64);
+                    }
+                }
+            }
+            // The whole-image keep path is used by photosite retention;
+            // its sample file still makes -0 positive, even when its image
+            // deliberately retains negative zeros.
+            let full = image(whole);
+            let samples = layout.of_placed(full.view()).unwrap();
+            let expected = samples
+                .iter()
+                .map(|&value| if value == 0.0 { 0.0 } else { value })
+                .collect::<Vec<_>>();
+            let index = cache.slots.len();
+            cache.split().1.admit(None);
+            cache.keep(index, &full.image, Some(&samples), true);
+            assert_eq!(bits(&cache.samples(index).unwrap()), bits(&expected));
+        }
+    }
+
+    #[test]
+    fn background_sample_cache_rejects_malformed_files_and_regions() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("samples");
+        let layout = BackgroundSamples::new(129, 97, 3, 32);
+        let region = ReferenceRegion {
+            x: 35,
+            y: 33,
+            width: 49,
+            height: 25,
+        };
+        let image = PlacedImage {
+            image: LinearImage::new(
+                region.width,
+                region.height,
+                3,
+                vec![7.0; region.width * region.height * 3],
+            )
+            .unwrap(),
+            region,
+            width: 129,
+            height: 97,
+        };
+        let samples = layout.of_placed(image.view()).unwrap();
+        FrameCache::write_samples(&path, &samples, &layout, region).unwrap();
+        let valid = std::fs::read(&path).unwrap();
+        let mut malformed = vec![
+            valid[..SAMPLE_HEADER_BYTES - 1].to_vec(),
+            valid[..valid.len() - 1].to_vec(),
+            [valid.as_slice(), &[0]].concat(),
+        ];
+        for field in 0..SAMPLE_HEADER_BYTES / 8 {
+            let mut changed = valid.clone();
+            changed[field * 8..field * 8 + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+            malformed.push(changed);
+        }
+        for bytes in malformed {
+            std::fs::write(&path, bytes).unwrap();
+            assert!(FrameCache::read_samples(&path, &layout, region).is_none());
+        }
+        std::fs::write(&path, valid).unwrap();
+        assert!(FrameCache::read_samples(&path, &layout, region).is_some());
+        assert!(
+            FrameCache::read_samples(
+                &path,
+                &layout,
+                ReferenceRegion {
+                    x: region.x + 1,
+                    ..region
+                },
+            )
+            .is_none()
+        );
+        for invalid in [
+            ReferenceRegion { width: 0, ..region },
+            ReferenceRegion {
+                height: 0,
+                ..region
+            },
+            ReferenceRegion {
+                x: usize::MAX,
+                ..region
+            },
+            ReferenceRegion {
+                y: usize::MAX,
+                ..region
+            },
+            ReferenceRegion { x: 128, ..region },
+            ReferenceRegion { y: 96, ..region },
+        ] {
+            assert!(layout.ranges_for_region(invalid).is_none());
+            assert!(FrameCache::write_samples(&path, &samples, &layout, invalid).is_err());
+            assert!(FrameCache::read_samples(&path, &layout, invalid).is_none());
+        }
+        assert!(
+            FrameCache::write_samples(&path, &samples[..samples.len() - 1], &layout, region)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn full_resolution_cache_checks_scratch_before_native_reads_and_uses_native_tiles() {
+        let (directory, stacker) = canvas_refinement_frames(&[false]);
+        let path = &stacker.ledger.frames[0].source.as_ref().unwrap().path;
+        let binned = LiveStacker::open_fits(
+            path,
+            None,
+            None,
+            None,
+            None,
+            crate::StackOptions {
+                bin_factor: 2,
+                normalization: crate::NormalizationMode::LocalBackground { tile_size: 32 },
+                ..crate::StackOptions::default()
+            },
+        )
+        .unwrap();
+        let native = FitsFrame::open(path).unwrap().image;
+        let cache = binned
+            .full_resolution_cache(Some(directory.path()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cache
+                .files
+                .background
+                .as_ref()
+                .unwrap()
+                .of(&native)
+                .unwrap(),
+            BackgroundSamples::for_image(&native, 32)
+                .of(&native)
+                .unwrap()
+        );
+        // A bad scratch path wins over a missing source, even before the
+        // full-resolution reference can be decoded and registered.
+        std::fs::remove_file(path).unwrap();
+        let options = BatchStackOptions {
+            scratch_directory: Some(directory.path().join("missing")),
+            ..BatchStackOptions::default()
+        };
+        for refine in [false, true] {
+            let error = match binned.full_resolution(&options, refine, &mut |_, _, _| {}) {
+                Err(error) => error,
+                Ok(_) => panic!("invalid scratch must fail before native preparation"),
+            };
+            assert!(error.to_string().contains("scratch directory"));
+        }
+    }
+
+    #[test]
+    fn retained_cache_ignores_an_unused_replay_directory() {
+        let (directory, mut stacker) = canvas_refinement_frames(&[false, false]);
+        stacker
+            .retain_frames_for_reintegration(Some(directory.path()))
+            .unwrap();
+        let options = BatchStackOptions {
+            scratch_directory: Some(directory.path().join("unused-missing")),
+            ..BatchStackOptions::default()
+        };
+        stacker.reintegrate(&options, |_, _, _| {}).unwrap();
+        assert!(!options.scratch_directory.unwrap().exists());
+    }
+
+    #[test]
+    fn whole_frame_replay_matches_bands_inside_one_and_two_thread_pools() {
+        let mut previous = None;
+        for threads in [1, 2] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let results = pool.install(|| {
+                let (_directory, stacker) = canvas_refinement_frames(&[false, false]);
+                let options = BatchStackOptions::default();
+                let drizzle = DrizzleOptions::default();
+                let (banded, banded_drizzle) = stacker
+                    .replay_with(&options, Some(&drizzle), |_, _, _| {}, true)
+                    .unwrap();
+                let (whole, whole_drizzle) = stacker
+                    .replay_with(&options, Some(&drizzle), |_, _, _| {}, false)
+                    .unwrap();
+                assert_eq!(
+                    snapshot_bits(&whole.snapshot),
+                    snapshot_bits(&banded.snapshot)
+                );
+                let drizzle_bits = |result: DrizzleResult| {
+                    result
+                        .image
+                        .data
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>()
+                };
+                let drizzled = drizzle_bits(whole_drizzle.unwrap());
+                assert_eq!(drizzled, drizzle_bits(banded_drizzle.unwrap()));
+                (snapshot_bits(&whole.snapshot), drizzled)
+            });
+            if let Some(previous) = &previous {
+                assert_eq!(&results, previous);
+            }
+            previous = Some(results);
+        }
+    }
+
+    #[test]
+    fn warped_canvas_refinement_skips_reads_but_replay_still_checks_sources() {
+        let (directory, mut stacker) = canvas_refinement_frames(&[true, true]);
+        let options = BatchStackOptions::default();
+        let expected = stacker.reintegrate(&options, |_, _, _| {}).unwrap();
+        stacker.frame_cache = stacker
+            .full_resolution_cache(Some(directory.path()))
+            .unwrap();
+        let refined = stacker
+            .refine_canvas_full_resolution(None, &mut |_, _, _| {
+                panic!("a warped-only canvas needs no refinement reads")
+            })
+            .unwrap();
+        assert_eq!(refined, vec![None, None]);
+        assert!(!stacker.frame_cache.as_ref().unwrap().stored(0));
+        assert!(!stacker.frame_cache.as_ref().unwrap().stored(1));
+        let cancel = CancelSignal::new(|| true);
+        assert!(matches!(
+            stacker.refine_canvas_full_resolution(Some(&cancel), &mut |_, _, _| {}),
+            Err(Error::Cancelled)
+        ));
+
+        let actual = stacker.reintegrate(&options, |_, _, _| {}).unwrap();
+        let bits = |image: &LinearImage| {
+            image
+                .data
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(bits(&actual.snapshot.image), bits(&expected.snapshot.image));
+        assert_eq!(
+            bits(&actual.snapshot.variance),
+            bits(&expected.snapshot.variance)
+        );
+        assert_eq!(actual.snapshot.coverage, expected.snapshot.coverage);
+        assert_eq!(
+            actual.snapshot.rejected_samples,
+            expected.snapshot.rejected_samples
+        );
+        assert!(stacker.frame_cache.as_ref().unwrap().stored(0));
+        assert!(stacker.frame_cache.as_ref().unwrap().stored(1));
+
+        let source = &stacker.ledger.frames[0].source.as_ref().unwrap().path;
+        std::fs::remove_file(source).unwrap();
+        assert!(stacker.reintegrate(&options, |_, _, _| {}).is_err());
+    }
+
+    #[test]
+    fn mixed_canvas_refinement_uses_warped_neighbours_without_refitting_them() {
+        let (directory, mut stacker) = canvas_refinement_frames(&[true, false]);
+        stacker.frame_cache = stacker
+            .full_resolution_cache(Some(directory.path()))
+            .unwrap();
+        let carried = stacker.ledger.frames[0].mapping.clone();
+        let mut reads = Vec::new();
+        let refined = stacker
+            .refine_canvas_full_resolution(None, &mut |_, index, _| reads.push(index))
+            .unwrap();
+        assert_eq!(reads, vec![0, 1, 1]);
+        assert!(refined[0].is_none());
+        // The only other frame supplies the stars for this refit: omitting
+        // the warped neighbour from pass one would leave no reference.
+        assert!(refined[1].is_some());
+        assert_eq!(stacker.ledger.frames[0].mapping, carried);
+        assert!(!stacker.frame_cache.as_ref().unwrap().stored(0));
+        assert!(stacker.frame_cache.as_ref().unwrap().stored(1));
+        stacker
+            .reintegrate(&BatchStackOptions::default(), |_, _, _| {})
+            .unwrap();
+        assert!(stacker.frame_cache.as_ref().unwrap().stored(0));
     }
 
     fn record(noise: f32, weight: f32) -> FrameWeightRecord {
@@ -3143,6 +4382,7 @@ mod tests {
             shape: (width, height, 1),
             frames: vec![0, 1],
             maps: &maps,
+            recorded: None,
         };
         let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
         let mut read = Vec::new();
@@ -3225,7 +4465,7 @@ mod tests {
         let read = |index: usize| {
             let mut band = vec![0.0; image.sample_count()];
             cache
-                .read_band(index, (width, height, 3), 0, &mut band, &map)
+                .read_band(index, (width, height, 3), 0, &mut band, &map, None)
                 .unwrap();
             band
         };
