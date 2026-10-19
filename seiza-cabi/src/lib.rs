@@ -3542,7 +3542,10 @@ fn open_with_reference_image(
 /// `"registration": {"model": "quadratic"}` in `options_json`, a light lying
 /// mostly within one panel is warped onto it, which follows lens distortion
 /// across a meridian flip. For panels, set
-/// `"acceptance": {"minimum_overlap_fraction": 0.1}` or near it.
+/// `"acceptance": {"minimum_overlap_fraction": 0.05}`, the CLI's default
+/// for `--reference expand`: panels planned for 10% overlap land nearer 9%,
+/// and the default of 0.60 joins none of them. Lights left off the canvas
+/// are counted in [`seiza_live_stacker_expansion_planning_notes_json`].
 /// Bayer drizzle and drizzled reintegration are not supported on the canvas.
 ///
 /// The masters, `dark_exposure_seconds` and `options_json` are those of
@@ -3702,7 +3705,9 @@ pub unsafe extern "C" fn seiza_live_stacker_expanded_lens_json(
 
 #[unsafe(no_mangle)]
 /// What planning a canvas from [`seiza_live_stacker_open_fits_expanding`]
-/// noted, as an owned JSON array of strings: why it skipped fitting one lens
+/// noted, as an owned JSON array of strings: first, when lights did not join
+/// the canvas, how many, and the most that those matching a panel overlapped
+/// it against `minimum_overlap_fraction`; then why it skipped fitting one lens
 /// to every panel (their camera or optics differ, or their headers do not
 /// say), or why it kept its first plan when the lens-corrected one failed.
 /// The array is empty for an ordinary stack and for a reopened context,
@@ -9758,11 +9763,24 @@ mod tests {
         flat: Option<&str>,
         cancel: *const SeizaCancelSignal,
     ) -> Result<*mut SeizaLiveStacker, String> {
+        open_expanding_with(paths, flat, cancel, 0.1)
+    }
+
+    fn open_expanding_with(
+        paths: &Value,
+        flat: Option<&str>,
+        cancel: *const SeizaCancelSignal,
+        minimum_overlap_fraction: f32,
+    ) -> Result<*mut SeizaLiveStacker, String> {
         let paths = CString::new(paths.to_string()).unwrap();
         let flat = flat.map(|flat| CString::new(flat).unwrap());
         let options = CString::new(
-            r#"{"normalization": {"mode": "none"}, "rejection": {"mode": "none"},
-                "acceptance": {"minimum_overlap_fraction": 0.1}}"#,
+            json!({
+                "normalization": {"mode": "none"},
+                "rejection": {"mode": "none"},
+                "acceptance": {"minimum_overlap_fraction": minimum_overlap_fraction},
+            })
+            .to_string(),
         )
         .unwrap();
         let mut error = ptr::null_mut();
@@ -9852,6 +9870,32 @@ mod tests {
             json!([])
         );
         unsafe { seiza_live_stacker_free(ordinary) };
+    }
+
+    /// Panels sharing less of their footprints than the minimum overlap are
+    /// left off the canvas, and planning says how many lights did not join,
+    /// and how close they came, before any is pushed.
+    #[test]
+    fn expanding_stack_cabi_notes_lights_that_did_not_join() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = overlapping_panels(directory.path());
+        let again = directory.path().join("panel-1-again.fits");
+        std::fs::copy(&paths[1], &again).unwrap();
+        // Neighbours share 80 of their 192 columns, under half.
+        let order = json!([&paths[1], &paths[0], again.to_str().unwrap(), &paths[2]]);
+        let stacker = open_expanding_with(&order, None, ptr::null(), 0.5).unwrap();
+        let notes = stacker_json(seiza_live_stacker_expansion_planning_notes_json, stacker);
+        let note = notes[0].as_str().unwrap();
+        assert!(
+            note.starts_with("2 of 4 lights did not join the canvas, which holds 1 panel,"),
+            "{notes}"
+        );
+        assert!(
+            note.contains("they matched a panel but overlapped the canvas by at most 0.4"),
+            "{note}"
+        );
+        assert!(note.contains("below the minimum overlap of 0.5"), "{note}");
+        unsafe { seiza_live_stacker_free(stacker) };
     }
 
     #[test]

@@ -1,5 +1,7 @@
 """Native Python coverage for batch, live, and calibration stacking APIs."""
 
+import shutil
+
 import numpy as np
 import pytest
 
@@ -799,6 +801,25 @@ def test_expanding_stack_holds_every_panel(tmp_path):
     ordinary = seiza.LiveStacker(paths[0], options=options)
     assert ordinary.expanded_lens is None
     assert ordinary.expansion_planning_notes == []
+
+
+def test_expanding_stack_notes_lights_that_did_not_join(tmp_path):
+    paths = overlapping_panels(tmp_path)
+    again = tmp_path / "panel-1-again.fits"
+    shutil.copy(paths[1], again)
+    # Neighbours share 80 of their 192 columns, under half.
+    options = seiza.StackOptions(
+        normalization="none", rejection="none", minimum_overlap=0.5
+    )
+    order = [paths[1], paths[0], again, paths[2]]
+    stacker = seiza.LiveStacker.open_fits_expanding(order, options=options)
+    note = stacker.expansion_planning_notes[0]
+    assert note.startswith(
+        "2 of 4 lights did not join the canvas, which holds 1 panel,"
+    ), note
+    assert "they matched a panel but overlapped the canvas by at most 0.4" in note
+    assert "below the minimum overlap of 0.5" in note
+    assert not stacker.push_fits(paths[0]).accepted
 
 
 def lens_panels(tmp_path, width=600, height=400, step=300):

@@ -1142,11 +1142,13 @@ pub(crate) fn plan(
             optics: None,
             tried: 0,
             error: None,
+            overlap: None,
         })
         .collect::<Vec<_>>();
     // Whether a frame from the other side of the pier may start a panel: only
     // once a pass finds nothing else to join.
     let mut flipped_start = false;
+    let mut unjoined = None;
     while !pending.is_empty() {
         let before = pending.len();
         let mut deferred = Vec::new();
@@ -1189,24 +1191,22 @@ pub(crate) fn plan(
                             (image, sites)
                         }
                     };
-                    let joined = plan
-                        .join(
-                            path,
-                            (&image, sites),
-                            &item.stars,
-                            (registration, window, coverage),
-                            flipped_start,
-                            options,
-                            maximum_samples,
-                        )
-                        .map(|joined| joined.map(|(result, starts)| (result, starts, window)));
+                    let offer = plan.join(
+                        path,
+                        (&image, sites),
+                        &item.stars,
+                        (registration, window, coverage),
+                        flipped_start,
+                        options,
+                        maximum_samples,
+                    );
                     // The canvas may yet grow enough for any panel to admit it.
                     item.tried = 0;
-                    joined
+                    offer.map(|offer| (offer, window))
                 }
             };
             match joined {
-                Ok(Some((registration, starts_panel, window))) => {
+                Ok((Offer::Joined(registration, starts_panel), window)) => {
                     plan.registrations.insert(
                         path_identity(path),
                         PlannedRegistration {
@@ -1227,8 +1227,18 @@ pub(crate) fn plan(
                         starts_panel,
                     });
                 }
-                Ok(None) => {
+                Ok((Offer::Flipped, _)) => {
                     waiting_for_pier_side = true;
+                    deferred.push(item);
+                }
+                Ok((Offer::Short(overlap), _)) => {
+                    item.overlap = Some(item.overlap.map_or(overlap, |best| best.max(overlap)));
+                    let error = Error::Registration(format!(
+                        "panel overlap {overlap:.3} is below {}",
+                        options.acceptance.minimum_overlap_fraction
+                    ));
+                    first_error.get_or_insert_with(|| format!("{}: {error}", path.display()));
+                    item.error = Some(error.to_string());
                     deferred.push(item);
                 }
                 Err(error) => {
@@ -1256,7 +1266,15 @@ pub(crate) fn plan(
                 )));
             }
             // A frame of another target, or cloud, would otherwise cost the
-            // whole mosaic; it is rejected when pushed, with the reason.
+            // whole mosaic; it is rejected when pushed, with the reason. So
+            // would a panel overlapping a little less than the minimum: that
+            // is said now, rather than only frame by frame as each is pushed.
+            unjoined = unjoined_note(
+                &deferred,
+                paths.len(),
+                plan.windows.len(),
+                options.acceptance.minimum_overlap_fraction,
+            );
             for item in deferred {
                 plan.registrations.insert(
                     path_identity(item.path),
@@ -1273,7 +1291,11 @@ pub(crate) fn plan(
         pending = deferred;
     }
     let mut summary = None;
-    let (compatible, mut planning_notes) = optical_compatibility(&plan.record.optics);
+    let (compatible, optical_notes) = optical_compatibility(&plan.record.optics);
+    let mut planning_notes = unjoined
+        .into_iter()
+        .chain(optical_notes)
+        .collect::<Vec<_>>();
     // The lens bends neighboring panels' edges opposite ways, which the
     // similarities placing the panels' first frames cannot follow; measured
     // where those frames overlap, it is undone and the canvas planned again.
@@ -1361,14 +1383,69 @@ struct Pending<'a> {
     tried: usize,
     /// Why it last failed to join.
     error: Option<String>,
+    /// The most of its footprint it has shared with the canvas when it
+    /// matched a panel but overlapped too little to join.
+    overlap: Option<f64>,
+}
+
+/// What became of a frame offered to the canvas.
+enum Offer {
+    /// It joined, starting a panel or not.
+    Joined(RegistrationResult, bool),
+    /// It would start a panel from the other side of the pier than the
+    /// anchor, which waits until a pass finds nothing else to join.
+    Flipped,
+    /// It matched a panel, but shared only this fraction of the smaller
+    /// footprint with the canvas, below the minimum overlap.
+    Short(f64),
+}
+
+/// What planning tells of the `unjoined` lights, of `total`, that it left
+/// off a canvas of `panels` panels, or `None` when every light joined. Each
+/// is rejected, with its reason, when pushed. A mosaic planned for 10%
+/// overlap lands nearer 9%, so a minimum just above that leaves every other
+/// panel out without failing planning; the note says so at once, and how
+/// close they came.
+fn unjoined_note(
+    unjoined: &[Pending<'_>],
+    total: usize,
+    panels: usize,
+    minimum_overlap: f32,
+) -> Option<String> {
+    if unjoined.is_empty() {
+        return None;
+    }
+    let short = unjoined
+        .iter()
+        .filter_map(|item| item.overlap)
+        .collect::<Vec<_>>();
+    let mut note = format!(
+        "{} of {total} lights did not join the canvas, which holds {panels} panel{}, \
+         and are rejected when pushed",
+        unjoined.len(),
+        if panels == 1 { "" } else { "s" }
+    );
+    if let Some(best) = short.iter().copied().reduce(f64::max) {
+        let some = if short.len() == unjoined.len() {
+            "they".to_string()
+        } else {
+            format!("{} of them", short.len())
+        };
+        note.push_str(&format!(
+            "; {some} matched a panel but overlapped the canvas by at most {best:.3}, below \
+             the minimum overlap of {minimum_overlap}: if they are panels of this mosaic, \
+             a lower minimum overlap admits them"
+        ));
+    }
+    Some(note)
 }
 
 impl Plan {
     /// Grow the canvas to the footprint of `source`, registered to `window`
     /// with `coverage` of its stars inside it, and fill the sky it newly
-    /// covers. Leaves the plan untouched on failure, and returns `None`
-    /// without joining a frame that would start a panel from the other side
-    /// of the pier than the anchor, unless `flipped_start` allows it.
+    /// covers. Leaves the plan untouched unless the frame joins, and does not
+    /// join one that would start a panel from the other side of the pier
+    /// than the anchor, unless `flipped_start` allows it.
     #[allow(clippy::too_many_arguments)]
     fn join(
         &mut self,
@@ -1379,7 +1456,7 @@ impl Plan {
         flipped_start: bool,
         options: &StackOptions,
         maximum_samples: usize,
-    ) -> Result<Option<(RegistrationResult, bool)>> {
+    ) -> Result<Offer> {
         let criteria = options.acceptance;
         let finite_source = source.data.iter().filter(|v| v.is_finite()).count() as f64;
         let mut registration = registration;
@@ -1403,7 +1480,7 @@ impl Plan {
         // reverses across a meridian flip; a panel started from the anchor's
         // side of the pier meets its neighbors on equal terms.
         if refined && !flipped_start && flipped(registration.transform.rotation_radians) {
-            return Ok(None);
+            return Ok(Offer::Flipped);
         }
         let Placement {
             width,
@@ -1420,10 +1497,7 @@ impl Plan {
         let source_area = finite_source * transform.scale.powi(2);
         let overlap = common as f64 / (self.finite as f64).min(source_area).max(1.0);
         if common == 0 || overlap < f64::from(criteria.minimum_overlap_fraction) {
-            return Err(Error::Registration(format!(
-                "panel overlap {overlap:.3} is below {}",
-                criteria.minimum_overlap_fraction
-            )));
+            return Ok(Offer::Short(overlap));
         }
 
         // Only a panel's first frame fills the canvas. Its siblings would add
@@ -1488,7 +1562,7 @@ impl Plan {
                 creates_window,
             });
         }
-        Ok(Some((joined, starts_panel)))
+        Ok(Offer::Joined(joined, starts_panel))
     }
 
     /// Match a panel-starting frame's pixels, resampled onto `region` of the

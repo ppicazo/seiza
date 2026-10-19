@@ -11,14 +11,26 @@ use seiza_fits::{F32ImageData, write_f32_image};
 /// Returns each frame's path, panel by panel.
 fn mosaic(
     directory: &Path,
+    grid: (usize, usize),
+    size: (usize, usize),
+    dithers: usize,
+    channels: usize,
+) -> Vec<PathBuf> {
+    mosaic_overlapping(directory, grid, size, dithers, channels, 12)
+}
+
+/// [`mosaic`]'s panels, overlapping by `overlap` percent on each side.
+fn mosaic_overlapping(
+    directory: &Path,
     (columns, rows): (usize, usize),
     (panel_width, panel_height): (usize, usize),
     dithers: usize,
     channels: usize,
+    overlap: usize,
 ) -> Vec<PathBuf> {
     const DITHER: usize = 3;
-    let step_x = panel_width * 88 / 100;
-    let step_y = panel_height * 88 / 100;
+    let step_x = panel_width * (100 - overlap) / 100;
+    let step_y = panel_height * (100 - overlap) / 100;
     let sky_width = panel_width + (columns - 1) * step_x + DITHER * dithers;
     let sky_height = panel_height + (rows - 1) * step_y + DITHER * dithers;
     let mut sky = vec![0.01_f32; sky_width * sky_height];
@@ -596,4 +608,83 @@ fn a_binned_mosaic_reintegrates_at_full_resolution() {
     }
     // Promoted, the binned mosaic covers the sky the native one does.
     assert!((covered[1] / covered[0] - 1.0).abs() < 0.02, "{covered:?}");
+}
+
+/// Panels planned for 10% overlap land nearer 9%. On a real 2x2 mosaic, a
+/// minimum overlap of 0.10 left only the anchor's panel on the canvas without
+/// failing planning, and every other light came back rejected, one at a time,
+/// as it was pushed. Planning says so at once, and how close the panels came;
+/// at the expanded canvas's suggested minimum, every panel joins.
+#[test]
+fn panels_just_short_of_the_minimum_overlap_are_noted_at_planning() {
+    let directory = tempfile::tempdir().unwrap();
+    let (width, height) = (768, 512);
+    // Each side panel shares 8% of its footprint with the anchor's, and the
+    // diagonal one less than 1%.
+    let paths = mosaic_overlapping(directory.path(), (2, 2), (width, height), 2, 1, 8);
+    let plan = |minimum_overlap_fraction| {
+        let mut options = StackOptions {
+            normalization: NormalizationMode::None,
+            ..StackOptions::default()
+        };
+        options.acceptance.minimum_overlap_fraction = minimum_overlap_fraction;
+        LiveStacker::with_expanding_reference(
+            &paths,
+            CalibrationMasters::default(),
+            options,
+            usize::MAX,
+            |_, _, _, _| Continue::Yes,
+        )
+        .unwrap()
+    };
+
+    let mut short = plan(0.1);
+    let notes = short.expansion_planning_notes().to_vec();
+    let note = &notes[0];
+    assert!(
+        note.starts_with("6 of 8 lights did not join the canvas, which holds 1 panel,"),
+        "{notes:?}"
+    );
+    // The diagonal panel's frames match no panel; the side panels' do.
+    assert!(note.contains("; 4 of them matched a panel"), "{note}");
+    assert!(note.contains("below the minimum overlap of 0.1"), "{note}");
+    let best = note
+        .split("by at most ")
+        .nth(1)
+        .and_then(|rest| rest.split(',').next())
+        .and_then(|best| best.parse::<f64>().ok())
+        .unwrap_or_else(|| panic!("{note}"));
+    assert!((0.07..0.09).contains(&best), "{note}");
+    let dispositions = push_all(&mut short, &paths, false);
+    assert!(
+        dispositions[..2]
+            .iter()
+            .all(|disposition| disposition.starts_with("Accepted")),
+        "{dispositions:?}"
+    );
+    assert!(
+        dispositions[2..]
+            .iter()
+            .all(|disposition| disposition.starts_with("Rejected")),
+        "{dispositions:?}"
+    );
+
+    let mut joined = plan(FrameAcceptanceCriteria::EXPANDED_MINIMUM_OVERLAP_FRACTION);
+    assert!(
+        !joined
+            .expansion_planning_notes()
+            .iter()
+            .any(|note| note.contains("did not join")),
+        "{:?}",
+        joined.expansion_planning_notes()
+    );
+    let dispositions = push_all(&mut joined, &paths, false);
+    assert!(
+        dispositions
+            .iter()
+            .all(|disposition| disposition.starts_with("Accepted")),
+        "{dispositions:?}"
+    );
+    assert!(joined.reference.width > 2 * width * 92 / 100);
+    assert!(joined.reference.height > 2 * height * 92 / 100);
 }

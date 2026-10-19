@@ -1234,7 +1234,10 @@ SeizaLiveStacker *seiza_live_stacker_open_fits_with_reference_image_candidates(c
  `"registration": {"model": "quadratic"}` in `options_json`, a light lying
  mostly within one panel is warped onto it, which follows lens distortion
  across a meridian flip. For panels, set
- `"acceptance": {"minimum_overlap_fraction": 0.1}` or near it.
+ `"acceptance": {"minimum_overlap_fraction": 0.05}`, the CLI's default
+ for `--reference expand`: panels planned for 10% overlap land nearer 9%,
+ and the default of 0.60 joins none of them. Lights left off the canvas
+ are counted in [`seiza_live_stacker_expansion_planning_notes_json`].
  Bayer drizzle and drizzled reintegration are not supported on the canvas.
 
  The masters, `dark_exposure_seconds` and `options_json` are those of
@@ -1289,7 +1292,9 @@ char *seiza_live_stacker_expanded_lens_json(const SeizaLiveStacker *stacker, cha
 
 /*
  What planning a canvas from [`seiza_live_stacker_open_fits_expanding`]
- noted, as an owned JSON array of strings: why it skipped fitting one lens
+ noted, as an owned JSON array of strings: first, when lights did not join
+ the canvas, how many, and the most that those matching a panel overlapped
+ it against `minimum_overlap_fraction`; then why it skipped fitting one lens
  to every panel (their camera or optics differ, or their headers do not
  say), or why it kept its first plan when the lens-corrected one failed.
  The array is empty for an ordinary stack and for a reopened context,

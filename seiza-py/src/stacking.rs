@@ -1259,7 +1259,10 @@ impl PyLiveStacker {
     /// With ``registration_model="quadratic"`` in ``options``, a frame lying
     /// mostly within one panel is warped onto it, which follows lens
     /// distortion across a meridian flip; each panel's first frame keeps
-    /// its similarity. Use a ``minimum_overlap`` near 0.1 for panels.
+    /// its similarity. Use ``minimum_overlap=0.05`` for panels, the CLI's
+    /// default for ``--reference expand``: panels planned for 10% overlap
+    /// land nearer 9%, and the default of 0.60 joins none of them.
+    /// ``expansion_planning_notes`` counts the lights left off the canvas.
     ///
     /// ``cancel``, a callable, is asked before each frame is read; Ctrl-C
     /// also stops planning. The stack starts empty: push every light, the
@@ -1639,10 +1642,13 @@ impl PyLiveStacker {
         Ok(Some(dict))
     }
 
-    /// What planning an expanded canvas noted: why it skipped fitting one
-    /// lens to every panel (their camera or optics differ, or their headers
-    /// do not say), or why it kept its first plan when the lens-corrected
-    /// one failed. Empty for an ordinary stack and a reopened context.
+    /// What planning an expanded canvas noted: first, when lights did not
+    /// join the canvas, how many, and the most that those matching a panel
+    /// overlapped it against ``minimum_overlap``; then why it skipped
+    /// fitting one lens to every panel (their camera or optics differ, or
+    /// their headers do not say), or why it kept its first plan when the
+    /// lens-corrected one failed. Empty for an ordinary stack and a reopened
+    /// context.
     #[getter]
     fn expansion_planning_notes(&self) -> PyResult<Vec<String>> {
         Ok(self.active()?.expansion_planning_notes().to_vec())

@@ -667,7 +667,7 @@ changed:
 | `--reference auto\|first\|expand` | `auto` | `auto` scores every frame on a half-resolution view (star signal over sky noise, which seeing, trailing, haze and twilight all lower) and, among frames near the best score, takes the flattest sky. `first` keeps the first frame given. `expand` auto-selects an anchor and grows the canvas to include connected overlapping panels (see below). |
 | `--reference-image PATH` | none | Use a common FITS/XISF reference for separate channel stacks, including `--reintegrate` and `--drizzle`. Sets only the alignment grid and WCS. `--reference auto\|first` selects a light within this channel for normalization and noise weighting. No external-reference pixels are integrated unless its path is also listed as a light. |
 | `--max-canvas-megasamples` | `256` | Largest canvas `expand` may grow, in millions of samples (pixels times color channels). A run peaks at about 40 bytes per sample, so the default allows about 10 GB. |
-| `--min-overlap` | `0.60`, or `0.10` with `expand` | Expansion requires this fraction of the smaller finite footprint to overlap the growing template. Fixed canvases measure coverage of the reference grid. |
+| `--min-overlap` | `0.60`, or `0.05` with `expand` | Expansion requires this fraction of the smaller finite footprint to overlap the growing template. Fixed canvases measure coverage of the reference grid. |
 | `--registration-model similarity\|affine\|quadratic` | `quadratic` | After the similarity match, fit a polynomial to up to 2 000 stars to follow lens distortion. A frame with too few stars keeps its similarity. Under `expand`, each panel's first frame is placed through the lens the panels' overlaps measure (see below). |
 | `--normalization none\|global\|local\|local-background` | `local-background` | `local-background` keeps one gain per channel, measured from star photometry, and matches each tile's background to the reference's, so frames whose sky gradients differ leave no seams where coverage changes. `local` also fits a gain per tile. |
 | `--local-tile-size` | `256` | Tile size for `local` and `local-background`. |
@@ -736,10 +736,17 @@ anchor, an input changes or cannot be read, or the canvas would exceed
 `--max-canvas-megasamples`. One set of
 calibration masters applies to every frame, so lights whose sessions need
 different flats are better stacked per session first and their stacks
-expanded. The default overlap threshold is 10%; change it with
-`--min-overlap`. Expansion bounds each search by the panels it matches;
-`--max-registration-drift` and `--max-registration-drift-fraction` are intended
-for ordinary fixed-reference stacks.
+expanded. The default overlap threshold is 5%; change it with
+`--min-overlap`. Panels planned for 10% overlap land short of 10%: on a 2x2
+IC 1318 mosaic (6248x4176, 450 mm) planned that way, they overlapped by 0.088
+to 0.094, so a 10% threshold kept only the anchor's panel, while 5% joined all
+four at a median 0.1 px RMS. The threshold does not guard against chance
+matches; the star-pairing, scale and residual checks above do. When lights do
+not join, a note on stderr and in the report's
+`configuration.expansion_planning_notes` says how many, and how close those
+that matched a panel came to the threshold. Expansion bounds each search by
+the panels it matches; `--max-registration-drift` and `--max-registration-drift-fraction` are
+intended for ordinary fixed-reference stacks.
 
 On a three-panel Rosette mosaic from an ASI6200MM (9576x6388), three
 uncalibrated 900 s lights per panel and filter, panels shot months apart with
