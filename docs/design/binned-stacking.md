@@ -684,9 +684,10 @@ Phase 1 follows the decisions above, with these differences:
   debayers a superpixel frame and bins it on by `b / 2`, and at an odd
   factor (the full-resolution pass, the native lens pass) uses VNG. Each
   prepared frame's channel offsets (`ChannelSites`, `±0.5 / b` working
-  pixels for red and blue) follow from its Bayer layout, so nothing is
-  stored. `resample_region_sited` reads each channel from its own site, one
-  channel at a time, wherever a frame is resampled: registration, replay,
+  pixels for red and blue) follow from its Bayer layout. Mappings retain
+  them as `channel_sites` in JSON and in context metadata so public crop
+  extraction reproduces live registration. `resample_region_sited` reads each
+  channel from its own site, one channel at a time, wherever a frame is resampled: registration, replay,
   and canvas placement. The integrated reference, an external reference and
   a canvas's anchor are not otherwise resampled, so each is resampled once
   through the identity onto its pixel centres; frames kept for

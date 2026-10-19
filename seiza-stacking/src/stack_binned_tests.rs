@@ -718,3 +718,52 @@ fn a_superpixel_stack_lines_its_colours_up() {
         assert!(options.validate().is_err(), "{bin_factor}");
     }
 }
+
+#[test]
+fn superpixel_mapping_crops_match_live_reference_after_json_and_context() {
+    let directory = tempfile::tempdir().unwrap();
+    let frames = bayer_field(directory.path(), 2, None);
+    for bin_factor in [2, 4] {
+        let options = StackOptions {
+            demosaic: crate::Demosaic::Superpixel,
+            normalization: NormalizationMode::None,
+            ..binned(bin_factor)
+        };
+        let mut stacker =
+            LiveStacker::open_fits(&frames[0].0, None, None, None, None, options.clone()).unwrap();
+        let (prepared, _) =
+            develop(FitsFrame::open(&frames[0].0).unwrap(), &options, bin_factor).unwrap();
+        let region = ReferenceRegion {
+            x: 8,
+            y: 8,
+            width: 32,
+            height: 24,
+        };
+        let expected = stacker.snapshot().unwrap().image.crop(region).unwrap();
+        let context = directory.path().join(format!("mapping-{bin_factor}.seiza"));
+        let FrameDisposition::Accepted(accepted) = stacker.push_fits(&frames[1].0).unwrap() else {
+            panic!("second frame rejected");
+        };
+        assert_eq!(
+            accepted.mapping.channel_sites(),
+            stacker.reference_mapping().channel_sites()
+        );
+        stacker.save_context(&context).unwrap();
+        let reopened = LiveStacker::open_context(&context).unwrap();
+        assert_eq!(
+            reopened.ledger.mapping(1).channel_sites(),
+            accepted.mapping.channel_sites()
+        );
+        for mapping in [stacker.reference_mapping(), reopened.reference_mapping()] {
+            let json = serde_json::to_string(&mapping).unwrap();
+            let mapping: RegisteredFrameMapping = serde_json::from_str(&json).unwrap();
+            let actual = mapping
+                .extract_region_with(&prepared.image, region, options.interpolation)
+                .unwrap();
+            assert_eq!(
+                actual.data, expected.data,
+                "bin {bin_factor}: saved mapping crop"
+            );
+        }
+    }
+}

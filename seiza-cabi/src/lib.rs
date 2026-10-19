@@ -4040,7 +4040,9 @@ pub unsafe extern "C" fn seiza_live_stacker_reference_noise_json(
 #[unsafe(no_mangle)]
 /// Returns the reference frame's mapping onto the stack grid, the identity,
 /// as owned JSON in the same versioned form as each pushed frame's
-/// `diagnostics.mapping`, so a host can keep one record per frame, the
+/// `diagnostics.mapping`, including optional `channel_sites` for superpixel
+/// sources (three `[x, y]` offsets in source pixels, in RGB order), so a host
+/// can keep one record per frame, the
 /// reference included. Free it, or an `error_out` string, with
 /// [`seiza_string_free`].
 ///
@@ -10159,6 +10161,51 @@ mod tests {
                 .contains("Bayer")
         );
         unsafe { seiza_string_free(error) };
+    }
+
+    #[test]
+    fn stacking_cabi_superpixel_mapping_keeps_channel_sites() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sites.fits");
+        let (width, height) = (320, 256);
+        let image = LinearImage::new(width, height, 1, stacking_star_field(width, height)).unwrap();
+        seiza_stacking::write_processed_image_fits_f32(
+            &path,
+            &image,
+            &[],
+            &[seiza_fits::WriteHeaderCard::new(
+                "BAYERPAT",
+                HeaderValue::String("RGGB".into()),
+            )],
+        )
+        .unwrap();
+        let path = CString::new(path.to_str().unwrap()).unwrap();
+        let options = CString::new(
+            r#"{"demosaic":"superpixel","bin_factor":2,"normalization":{"mode":"none"}}"#,
+        )
+        .unwrap();
+        let mut error = ptr::null_mut();
+        let stacker = unsafe {
+            seiza_live_stacker_open_fits(
+                path.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                0.0,
+                options.as_ptr(),
+                &mut error,
+            )
+        };
+        assert!(!stacker.is_null());
+        assert!(error.is_null());
+        let mapping = owned_json_value(unsafe {
+            seiza_live_stacker_reference_mapping_json(stacker, &mut error)
+        });
+        assert_eq!(
+            mapping["channel_sites"],
+            serde_json::json!([[-0.25, -0.25], [0.0, 0.0], [0.25, 0.25]])
+        );
+        unsafe { seiza_live_stacker_free(stacker) };
     }
 
     #[test]

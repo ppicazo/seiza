@@ -1458,7 +1458,9 @@ char *seiza_live_stacker_reference_noise_json(const SeizaLiveStacker *stacker, c
 /*
  Returns the reference frame's mapping onto the stack grid, the identity,
  as owned JSON in the same versioned form as each pushed frame's
- `diagnostics.mapping`, so a host can keep one record per frame, the
+ `diagnostics.mapping`, including optional `channel_sites` for superpixel
+ sources (three `[x, y]` offsets in source pixels, in RGB order), so a host
+ can keep one record per frame, the
  reference included. Free it, or an `error_out` string, with
  [`seiza_string_free`].
 

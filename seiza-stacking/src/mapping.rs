@@ -18,7 +18,9 @@ const REGISTERED_FRAME_MAPPING_SCHEMA_VERSION: u32 = 1;
 /// section of its own. So too the bin factor of a stack whose lights were
 /// binned ([`crate::StackOptions::bin_factor`]): JSON carries it as an
 /// optional `bin_factor`, left out at 1, and a context keeps it in its
-/// options.
+/// options. Superpixel mappings also carry `channel_sites`, three `[x, y]`
+/// offsets in source pixels in RGB order; contexts keep these in metadata.
+/// Sources passed to extraction must use the same preparation as the stack.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RegisteredFrameMapping {
     schema_version: u32,
@@ -28,6 +30,7 @@ pub struct RegisteredFrameMapping {
     normalization: NormalizationMap,
     warp: Option<crate::PolynomialWarp>,
     bin_factor: u32,
+    channel_sites: Option<crate::registration::ChannelSites>,
 }
 
 #[derive(Serialize)]
@@ -50,6 +53,8 @@ struct RegisteredFrameMappingReadableRef<'a> {
     warp: Option<&'a crate::PolynomialWarp>,
     #[serde(skip_serializing_if = "is_native_bin_factor")]
     bin_factor: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel_sites: Option<crate::registration::ChannelSites>,
 }
 
 fn native_bin_factor() -> u32 {
@@ -74,6 +79,7 @@ impl Serialize for RegisteredFrameMapping {
                 normalization: &self.normalization,
                 warp: self.warp.as_ref(),
                 bin_factor: self.bin_factor,
+                channel_sites: self.channel_sites,
             }
             .serialize(serializer)
         } else {
@@ -111,6 +117,8 @@ struct RegisteredFrameMappingReadableWire {
     warp: Option<crate::PolynomialWarp>,
     #[serde(default = "native_bin_factor")]
     bin_factor: u32,
+    #[serde(default)]
+    channel_sites: Option<crate::registration::ChannelSites>,
 }
 
 impl<'de> Deserialize<'de> for RegisteredFrameMapping {
@@ -130,6 +138,7 @@ impl<'de> Deserialize<'de> for RegisteredFrameMapping {
                 normalization: wire.normalization,
                 warp: None,
                 bin_factor: native_bin_factor(),
+                channel_sites: None,
             }
         };
         let mut mapping = Self::from_parts(
@@ -142,6 +151,7 @@ impl<'de> Deserialize<'de> for RegisteredFrameMapping {
         .map_err(D::Error::custom)?;
         mapping.set_warp(wire.warp).map_err(D::Error::custom)?;
         mapping.bin_factor = wire.bin_factor;
+        mapping.channel_sites = wire.channel_sites;
         mapping.validate().map_err(D::Error::custom)?;
         Ok(mapping)
     }
@@ -174,6 +184,7 @@ impl RegisteredFrameMapping {
             normalization: NormalizationMap::identity(reference),
             warp: None,
             bin_factor: native_bin_factor(),
+            channel_sites: None,
         }
     }
 
@@ -192,6 +203,7 @@ impl RegisteredFrameMapping {
             normalization,
             warp: None,
             bin_factor: native_bin_factor(),
+            channel_sites: None,
         };
         mapping.validate()?;
         Ok(mapping)
@@ -202,6 +214,13 @@ impl RegisteredFrameMapping {
     /// [`crate::StackOptions::bin_factor`].
     pub fn bin_factor(&self) -> u32 {
         self.bin_factor
+    }
+
+    pub(crate) fn channel_sites(&self) -> Option<crate::registration::ChannelSites> {
+        self.channel_sites
+    }
+    pub(crate) fn set_channel_sites(&mut self, sites: Option<crate::registration::ChannelSites>) {
+        self.channel_sites = sites;
     }
 
     pub(crate) fn set_bin_factor(&mut self, bin_factor: u32) {
@@ -241,6 +260,12 @@ impl RegisteredFrameMapping {
             normalization: self.normalization.rescaled(scale),
             warp: self.warp.as_ref().map(|warp| warp.rescaled(scale as f64)),
             bin_factor,
+            // Native preparation uses VNG, with co-sited channels.
+            channel_sites: if bin_factor == 1 {
+                None
+            } else {
+                self.channel_sites.map(|sites| sites.rescaled(scale as f64))
+            },
         };
         mapping.validate()?;
         Ok(mapping)
@@ -263,6 +288,7 @@ impl RegisteredFrameMapping {
         )?;
         mapping.set_warp(self.warp.clone())?;
         mapping.bin_factor = self.bin_factor;
+        mapping.channel_sites = self.channel_sites;
         Ok(mapping)
     }
 
@@ -284,6 +310,7 @@ impl RegisteredFrameMapping {
             translation_y: -offset / scale,
         };
         Self {
+            channel_sites: None,
             transform: unbin.then(self.transform),
             warp: self.warp.as_ref().map(|warp| warp.source_rescaled(scale)),
             ..self.clone()
@@ -306,6 +333,7 @@ impl RegisteredFrameMapping {
         )?;
         mapping.set_warp(warp)?;
         mapping.bin_factor = self.bin_factor;
+        mapping.channel_sites = self.channel_sites;
         Ok(mapping)
     }
 
@@ -362,6 +390,9 @@ impl RegisteredFrameMapping {
             )));
         }
         self.transform.validate()?;
+        if let Some(sites) = self.channel_sites {
+            sites.validate()?;
+        }
         if let Some(warp) = &self.warp {
             warp.validate()?;
         }
@@ -393,7 +424,7 @@ impl RegisteredFrameMapping {
         region: ReferenceRegion,
         interpolation: crate::Interpolation,
     ) -> Result<LinearImage> {
-        self.extract_region_sited(source, region, interpolation, None)
+        self.extract_region_sited(source, region, interpolation, self.channel_sites)
     }
 
     /// [`Self::extract_region_with`] for a source whose channels sample the
@@ -497,6 +528,38 @@ impl RegisteredFrameMapping {
         self.validate()?;
         reference_to_output.validate()?;
         if self.normalization.is_global() && self.warp.is_none() {
+            if let Some(sites) = self.channel_sites.filter(|_| source.channels == 3) {
+                let transform = self.transform.as_affine().then(reference_to_output);
+                let mut data = Vec::new();
+                for (channel, (dx, dy)) in sites.0.into_iter().enumerate() {
+                    let shifted = AffineTransform {
+                        translation_x: dx,
+                        translation_y: dy,
+                        ..AffineTransform::IDENTITY
+                    }
+                    .then(transform);
+                    let plane = resample_region_to_reference_affine(
+                        &source.channel(channel)?,
+                        output_width,
+                        output_height,
+                        output_region,
+                        shifted,
+                    )?;
+                    if data.is_empty() {
+                        let samples = plane.data.len().checked_mul(3).ok_or_else(|| {
+                            Error::Registration("resampled image dimensions overflow".into())
+                        })?;
+                        data.resize(samples, 0.0);
+                    }
+                    for (pixel, value) in data.chunks_exact_mut(3).zip(plane.data) {
+                        pixel[channel] = value;
+                    }
+                }
+                let mut crop =
+                    LinearImage::new(output_region.width, output_region.height, 3, data)?;
+                self.normalization.apply_global(&mut crop)?;
+                return Ok(crop);
+            }
             let mut crop = resample_region_to_reference_affine(
                 source,
                 output_width,
@@ -508,7 +571,7 @@ impl RegisteredFrameMapping {
             return Ok(crop);
         }
 
-        let mut intermediate = crate::registration::resample_region_geometry(
+        let mut intermediate = crate::registration::resample_region_sited(
             source,
             self.reference_width,
             self.reference_height,
@@ -520,6 +583,7 @@ impl RegisteredFrameMapping {
             },
             self.geometry(),
             crate::registration::Sampling::Bilinear,
+            self.channel_sites,
         )?;
         self.normalization.apply(&mut intermediate)?;
         resample_region_to_reference_affine(
@@ -550,6 +614,79 @@ impl RegisteredFrameMapping {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn superpixel_mapping_extracts_co_sited_planes_through_affine_and_warp() {
+        use crate::registration::ChannelSites;
+        let sites = ChannelSites([(-0.125, -0.125), (0.0, 0.0), (0.125, 0.125)]);
+        let data = (0..32 * 24)
+            .flat_map(|i| {
+                sites.0.map(|(dx, dy)| {
+                    (100.0 + 3.0 * (i % 32) as f64 + 2.0 * (i / 32) as f64 + 3.0 * dx + 2.0 * dy)
+                        as f32
+                })
+            })
+            .collect();
+        let source = LinearImage::new(32, 24, 3, data).unwrap();
+        let mut mapping = RegisteredFrameMapping::identity(&source);
+        mapping.set_bin_factor(4);
+        mapping.set_channel_sites(Some(sites));
+        let identity = crate::NormalizationMap::identity(&source);
+        mapping = mapping
+            .with_normalization(identity)
+            .unwrap()
+            .with_geometry(SimilarityTransform::IDENTITY, None)
+            .unwrap();
+        let mapping: RegisteredFrameMapping =
+            serde_json::from_str(&serde_json::to_string(&mapping).unwrap()).unwrap();
+        assert_eq!(
+            mapping.rebinned(2).unwrap().channel_sites(),
+            Some(sites.rescaled(2.0))
+        );
+        assert_eq!(mapping.rebinned(1).unwrap().channel_sites(), None);
+        assert_eq!(mapping.sensor_sourced().channel_sites(), None);
+        let region = ReferenceRegion {
+            x: 5,
+            y: 5,
+            width: 12,
+            height: 10,
+        };
+        let pairs = [
+            (0.0, 0.0),
+            (31.0, 0.0),
+            (0.0, 23.0),
+            (31.0, 23.0),
+            (15.0, 11.0),
+        ]
+        .map(|p| (p, p));
+        let warp = crate::PolynomialWarp::fit(1, 32, 24, &pairs).unwrap();
+        for mapping in [
+            mapping.clone(),
+            mapping
+                .with_geometry(SimilarityTransform::IDENTITY, Some(warp))
+                .unwrap(),
+        ] {
+            for crop in [
+                mapping.extract_region(&source, region).unwrap(),
+                mapping
+                    .extract_region_after_affine(&source, 32, 24, region, AffineTransform::IDENTITY)
+                    .unwrap(),
+            ] {
+                for (i, rgb) in crop.data.chunks_exact(3).enumerate() {
+                    let expected = 100.0
+                        + 3.0 * (region.x + i % region.width) as f32
+                        + 2.0 * (region.y + i / region.width) as f32;
+                    assert!(
+                        rgb.iter().all(|v| (v - expected).abs() < 1e-3),
+                        "{rgb:?} vs {expected}"
+                    );
+                }
+            }
+        }
+        let mut json = serde_json::to_value(&mapping).unwrap();
+        json["channel_sites"] = serde_json::json!([[99.0, 0.0], [0.0, 0.0], [0.0, 0.0]]);
+        assert!(serde_json::from_value::<RegisteredFrameMapping>(json).is_err());
+    }
 
     /// A binned mapping with a quadratic warp and a tiled normalization.
     fn binned_mapping(bin_factor: u32, rotation_radians: f64) -> RegisteredFrameMapping {

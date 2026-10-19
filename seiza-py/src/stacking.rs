@@ -560,7 +560,8 @@ impl PyFrameDisposition {
 
     /// How an accepted frame maps onto the reference grid, its
     /// registration and normalization, as a dict in the core's versioned
-    /// form; `None` for a rejected frame.
+    /// form; `None` for a rejected frame. Superpixel mappings include
+    /// ``channel_sites``: three [x, y] offsets in source pixels, in RGB order.
     #[getter]
     fn mapping(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         self.mapping_json

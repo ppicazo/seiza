@@ -1129,3 +1129,133 @@ fn check(case: &str, actual: &[f64], expected: &[f64]) {
          and record the new output:\nconst {case}: &[f64] = &[{recorded}];"
     );
 }
+
+/// Persisted superpixel provenance must reproduce registered crops.
+#[test]
+fn a_superpixel_mapping_crop_keeps_its_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let raw = bayer_field(0.0, 0.0, 0);
+    let path = directory.path().join("mapping.fits");
+    let headers = [("BAYERPAT".to_string(), HeaderValue::String("RGGB".into()))];
+    write_processed_image_fits_f32(&path, &raw, &headers, &[]).unwrap();
+    let options = StackOptions {
+        demosaic: Demosaic::Superpixel,
+        bin_factor: 2,
+        normalization: NormalizationMode::None,
+        ..StackOptions::default()
+    };
+    let stacker = LiveStacker::open_fits(&path, None, None, None, None, options).unwrap();
+    let mut rgb = Vec::new();
+    for y in (0..HEIGHT).step_by(2) {
+        for x in (0..WIDTH).step_by(2) {
+            let i = y * WIDTH + x;
+            rgb.extend([
+                raw.data[i],
+                (raw.data[i + 1] + raw.data[i + WIDTH]) * 0.5,
+                raw.data[i + WIDTH + 1],
+            ]);
+        }
+    }
+    let source = LinearImage::new(WIDTH / 2, HEIGHT / 2, 3, rgb).unwrap();
+    let mapping: seiza_stacking::RegisteredFrameMapping =
+        serde_json::from_str(&serde_json::to_string(&stacker.reference_mapping()).unwrap())
+            .unwrap();
+    let crop = mapping
+        .extract_region(
+            &source,
+            seiza_stacking::ReferenceRegion {
+                x: 8,
+                y: 8,
+                width: 64,
+                height: 48,
+            },
+        )
+        .unwrap();
+    check("SUPERPIXEL_MAPPING", &summary(&crop), SUPERPIXEL_MAPPING);
+}
+const SUPERPIXEL_MAPPING: &[f64] = &[
+    4.6129709e2,
+    5.3272965e2,
+    3.4753945e3,
+    3.4899965e2,
+    4.1961527e2,
+    3.2700420e3,
+    2.3674625e2,
+    2.8542620e2,
+    2.0870115e3,
+    3.9798587e2,
+    2.9957031e2,
+    1.9816434e2,
+    3.9873520e2,
+    2.9978717e2,
+    1.9965741e2,
+    4.0193481e2,
+    2.9670645e2,
+    1.9881876e2,
+    4.0075842e2,
+    2.9681415e2,
+    2.0030560e2,
+    3.9871417e2,
+    3.0025806e2,
+    2.0054459e2,
+    4.0067859e2,
+    3.0272089e2,
+    2.0001205e2,
+    4.0058521e2,
+    3.0220166e2,
+    1.9886996e2,
+    7.0804315e2,
+    5.7922803e2,
+    3.8427917e2,
+    3.9960498e2,
+    3.0205103e2,
+    1.9988741e2,
+    4.8768317e2,
+    3.3742047e2,
+    2.3734398e2,
+    3.9926544e2,
+    3.0087814e2,
+    2.0023781e2,
+    3.9913580e2,
+    3.0262817e2,
+    2.0076703e2,
+    4.0098938e2,
+    3.0328943e2,
+    2.0037813e2,
+    4.0247852e2,
+    3.0105304e2,
+    2.0066864e2,
+    4.8872424e2,
+    3.6936542e2,
+    2.8197803e2,
+    4.0155557e2,
+    3.0108139e2,
+    2.0062837e2,
+    4.0217484e2,
+    3.0054605e2,
+    1.9856046e2,
+    4.0086761e2,
+    2.9843954e2,
+    2.0179404e2,
+    4.0032507e2,
+    3.0067365e2,
+    1.9861986e2,
+    4.0054169e2,
+    2.9966174e2,
+    1.9960168e2,
+    4.0074237e2,
+    3.0304419e2,
+    1.9828320e2,
+    3.9814484e2,
+    2.9712723e2,
+    1.9894531e2,
+    3.9910040e2,
+    2.9690900e2,
+    2.0062030e2,
+    3.9986386e2,
+    2.9974023e2,
+    1.9847993e2,
+    4.0010007e2,
+    3.0147623e2,
+    2.0163464e2,
+];

@@ -730,7 +730,9 @@ class LiveStacker:
     @property
     def reference_noise(self) -> list[float]: ...
     @property
-    def reference_mapping(self) -> dict[str, Any]: ...
+    def reference_mapping(self) -> dict[str, Any]:
+        """Processing provenance; superpixel maps include RGB channel_sites offsets."""
+        ...
     def compatible_calibration(
         self,
         light: FrameSignature,

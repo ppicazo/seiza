@@ -384,7 +384,9 @@ frame's noise, the unit of the weights; under equal weighting they are empty.
 `seiza.frame_noise(image)` measures any linear array the same way. Each
 accepted frame's `mapping`, and `LiveStacker.reference_mapping` for the
 reference, is a dict of its registration and normalization, to keep beside
-the frame.
+the frame. Superpixel mappings include `channel_sites`, three `[x, y]`
+offsets in source pixels in RGB order. Saved contexts retain these offsets,
+so crop extraction from equally prepared source frames keeps colours aligned.
 
 `LiveStacker.open_prepared_fits(path)` opens a stack from a frame already
 calibrated and debayered, keeping its FITS header cards, so you can correct a

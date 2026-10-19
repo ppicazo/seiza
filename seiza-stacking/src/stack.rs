@@ -1340,6 +1340,7 @@ impl LiveStacker {
             crate::replay::Ledger::empty()
         };
         ledger.set_bin_factor(options.bin_factor);
+        ledger.set_reference_channel_sites(options.channel_sites(reference_cfa));
         if !reference_noise.is_empty() {
             ledger.set_reference_weighting(&reference_noise);
         }
@@ -1976,6 +1977,9 @@ impl LiveStacker {
     pub fn reference_mapping(&self) -> RegisteredFrameMapping {
         let mut mapping = RegisteredFrameMapping::identity(&self.reference);
         mapping.set_bin_factor(self.options.bin_factor);
+        if self.reference_is_integrated {
+            mapping.set_channel_sites(self.ledger.reference_channel_sites());
+        }
         mapping
     }
 
@@ -2737,6 +2741,7 @@ pub(crate) fn prepare_frame(
     )?;
     mapping.set_warp(registration.warp.clone())?;
     mapping.set_bin_factor(options.bin_factor);
+    mapping.set_channel_sites(options.channel_sites(cfa));
     Ok(PreparedFrame::Ready(Box::new(ReadyFrame {
         registered,
         region,

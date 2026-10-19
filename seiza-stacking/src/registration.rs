@@ -1696,10 +1696,27 @@ impl From<Interpolation> for Sampling {
 /// mean lies at the centre. Binning on by the rest of the bin factor keeps
 /// those offsets in sensor pixels, so in the frame's own they are
 /// `±0.5 / bin_factor`.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct ChannelSites([(f64, f64); 3]);
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct ChannelSites(pub(crate) [(f64, f64); 3]);
 
 impl ChannelSites {
+    pub(crate) fn validate(self) -> Result<()> {
+        if self
+            .0
+            .iter()
+            .any(|&(x, y)| !x.is_finite() || !y.is_finite() || x.abs() > 0.5 || y.abs() > 0.5)
+        {
+            return Err(Error::Registration(
+                "channel sites must be finite offsets within half a pixel".into(),
+            ));
+        }
+        Ok(())
+    }
+    pub(crate) fn rescaled(self, scale: f64) -> Self {
+        Self(self.0.map(|(x, y)| (x * scale, y * scale)))
+    }
+
     /// The sites of a superpixel frame of `layout`, binned by `bin_factor`
     /// in all.
     pub(crate) fn superpixel(layout: crate::BayerLayout, bin_factor: u32) -> Self {

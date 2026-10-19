@@ -218,6 +218,49 @@ impl Ledger {
         }
     }
 
+    pub(crate) fn reference_channel_sites(&self) -> Option<crate::registration::ChannelSites> {
+        self.frames
+            .first()
+            .and_then(|frame| frame.mapping.channel_sites())
+    }
+    pub(crate) fn set_reference_channel_sites(
+        &mut self,
+        sites: Option<crate::registration::ChannelSites>,
+    ) {
+        if let Some(frame) = self.frames.first_mut() {
+            frame.mapping.set_channel_sites(sites);
+        }
+    }
+    pub(crate) fn channel_sites(&self) -> Vec<Option<crate::registration::ChannelSites>> {
+        let sites: Vec<_> = self
+            .frames
+            .iter()
+            .map(|frame| frame.mapping.channel_sites())
+            .collect();
+        if sites.iter().any(Option::is_some) {
+            sites
+        } else {
+            Vec::new()
+        }
+    }
+    pub(crate) fn attach_channel_sites(
+        &mut self,
+        sites: &[Option<crate::registration::ChannelSites>],
+    ) -> Result<()> {
+        if sites.len() != self.frames.len() {
+            return Err(Error::Registration(
+                "context channel sites do not match admitted frame count".into(),
+            ));
+        }
+        for (frame, &sites) in self.frames.iter_mut().zip(sites) {
+            if let Some(sites) = sites {
+                sites.validate()?;
+            }
+            frame.mapping.set_channel_sites(sites);
+        }
+        Ok(())
+    }
+
     pub(crate) fn set_reference_source(&mut self, source: Option<FrameSource>) {
         if let Some(reference) = self.frames.first_mut() {
             reference.source = source;
@@ -591,6 +634,27 @@ const WHOLE_FRAME_READS: usize = 4;
 
 /// The most frames a banded reintegration drizzles together.
 const DRIZZLE_FRAMES: usize = 4;
+
+/// Budget native source buffers independently of the binned registered cache.
+fn drizzle_read_limits(
+    memory: usize,
+    registered_bytes: usize,
+    bin_factor: u32,
+    lookahead: usize,
+) -> (usize, usize) {
+    let bin = bin_factor as usize;
+    let source_bytes = registered_bytes
+        .saturating_mul(bin)
+        .saturating_mul(bin)
+        .max(1);
+    let together = DRIZZLE_FRAMES.min((memory / 2 / source_bytes).max(1));
+    let lookahead = if bin == 1 {
+        lookahead
+    } else {
+        lookahead.min((memory / source_bytes).saturating_sub(together))
+    };
+    (together, lookahead)
+}
 
 /// [`REPLAY_LOOKAHEAD`], or fewer in a Rayon pool of few threads.
 fn replay_lookahead() -> usize {
@@ -1462,8 +1526,12 @@ impl Replay<'_> {
         )?;
         let bands = total_units - count;
         let sensor = stacker.drizzle_mappings();
-        let together =
-            DRIZZLE_FRAMES.min((self.options.band_memory_bytes / 2 / frame_bytes.max(1)).max(1));
+        let (together, lookahead) = drizzle_read_limits(
+            self.options.band_memory_bytes,
+            frame_bytes,
+            stacker.options.bin_factor,
+            lookahead,
+        );
         crate::tasks::ahead(|ahead| {
             std::thread::scope(|scope| {
                 let read = |index: usize| {
@@ -2892,6 +2960,13 @@ impl LiveStacker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn binned_drizzle_bounds_native_source_reads() {
+        let mib = 1024 * 1024;
+        assert_eq!(drizzle_read_limits(512 * mib, 16 * mib, 4, 4), (1, 1));
+        assert_eq!(drizzle_read_limits(128 * mib, 16 * mib, 4, 4), (1, 0));
+        assert_eq!(drizzle_read_limits(512 * mib, 16 * mib, 1, 4), (4, 4));
+    }
 
     fn record(noise: f32, weight: f32) -> FrameWeightRecord {
         FrameWeightRecord {

@@ -1215,3 +1215,24 @@ def test_defects_are_learned_from_dithered_lights_and_repaired(tmp_path):
         seiza.DefectMap(4, 4, [16])
     with pytest.raises(seiza.StackError, match="persistence"):
         seiza.detect_defects(lights, persistence=2.0)
+
+
+@pytest.mark.parametrize("bin_factor", [2, 4])
+def test_superpixel_mapping_channel_sites_survive_context(tmp_path, bin_factor):
+    image = synthetic_star_field(height=256, width=320)
+    paths = [tmp_path / f"sites-{i}.fits" for i in range(2)]
+    for path in paths:
+        fits.writeto(path, image, header=fits.Header({"BAYERPAT": "RGGB"}))
+    options = seiza.StackOptions(demosaic="superpixel", bin_factor=bin_factor,
+                                 normalization="none", rejection="none")
+    stacker = seiza.LiveStacker(paths[0], options=options)
+    d = 0.5 / bin_factor
+    sites = [[-d, -d], [0.0, 0.0], [d, d]]
+    assert stacker.reference_mapping["channel_sites"] == sites
+    disposition = stacker.push_fits(paths[1])
+    assert disposition.accepted
+    assert disposition.mapping["channel_sites"] == sites
+    context = tmp_path / "sites.seiza"
+    stacker.save_context(context)
+    reopened = seiza.LiveStacker.open_context(context)
+    assert reopened.reference_mapping["channel_sites"] == sites
