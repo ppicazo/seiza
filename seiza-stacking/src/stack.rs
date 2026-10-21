@@ -763,9 +763,11 @@ impl LiveStacker {
     ) -> Result<Self> {
         let source = crate::replay::FrameSource::of(&reference);
         let reference_metadata = reference.metadata();
+        let clipped = crate::saturation::raw_clip_mask(&reference);
         let (reference, cfa) =
             prepare_light(reference, &calibration, &options.match_tolerances, &options)
                 .map_err(LightFailure::into_error)?;
+        let clipped = developed_clip_mask(clipped, cfa, &options);
         let mut stacker = Self::from_prepared(
             reference.image,
             reference.headers,
@@ -775,6 +777,25 @@ impl LiveStacker {
             FrameInputMode::CalibrateAndPrepare,
             ReferenceContribution::Integrated(cfa),
         )?;
+        // The reference is integrated where it lies, as it was prepared.
+        if let Some(clipped) = clipped {
+            let (width, height, channels) = (
+                stacker.reference.width,
+                stacker.reference.height,
+                stacker.reference.channels,
+            );
+            stacker.accumulator.add_clipped(
+                &clipped,
+                ReferenceRegion {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                },
+                width,
+                channels,
+            );
+        }
         stacker.ledger.set_reference_source(source);
         Ok(stacker)
     }
@@ -865,6 +886,7 @@ impl LiveStacker {
                 &[],
                 channel.image,
                 channel_cfa,
+                None,
                 None,
             )? {
                 PreparedFrame::Ready(ready) => {
@@ -1565,6 +1587,7 @@ impl LiveStacker {
                 count: restored.count,
                 rejected: restored.rejected,
                 weight_sum: restored.weight_sum,
+                clipped: restored.clipped,
             },
             reference_headers: restored.reference_headers,
             accepted_frames: restored.accepted_frames,
@@ -1635,6 +1658,7 @@ impl LiveStacker {
                     .canvas_registrar
                     .as_ref()
                     .and_then(crate::expand::CanvasRegistrar::lens),
+                clipped: self.accumulator.clipped.as_deref(),
             },
         )
     }
@@ -1780,6 +1804,7 @@ impl LiveStacker {
     pub fn push(&mut self, frame: FitsFrame) -> Result<FrameDisposition> {
         self.require_fits_input_mode()?;
         let source = crate::replay::FrameSource::of(&frame);
+        let clipped = crate::saturation::raw_clip_mask(&frame);
         let (frame, cfa) = match prepare_light(
             frame,
             &self.calibration,
@@ -1809,6 +1834,7 @@ impl LiveStacker {
             frame.image,
             cfa,
             cache,
+            developed_clip_mask(clipped, cfa, &self.options),
         )?
         .with_source(source);
         Ok(self.integrate_prepared(prepared))
@@ -1875,6 +1901,7 @@ impl LiveStacker {
             frame,
             None,
             None,
+            None,
         )?;
         Ok(self.integrate_prepared(prepared))
     }
@@ -1925,6 +1952,19 @@ impl LiveStacker {
         integration.integrate(prepared)
     }
     /// Copy the current estimate and coverage masks into an owned snapshot.
+    /// How much of each pixel's integrated observations came from clipped
+    /// raw pixels, from 0 to 1, as a mono image on the stack's grid: where
+    /// the sensor saturated, a stack records only that the sky was at least
+    /// that bright, and its colour there means nothing. `None` when no
+    /// integrated frame clipped, or its saturation level was unknown.
+    /// [`crate::neutralize_clipped`] renders those pixels neutral after
+    /// colour calibration.
+    pub fn clipped_fraction(&self) -> Option<LinearImage> {
+        let channels = self.reference.channels;
+        let fraction = self.accumulator.clipped_fraction(channels)?;
+        LinearImage::new(self.reference.width, self.reference.height, 1, fraction).ok()
+    }
+
     pub fn snapshot(&self) -> Result<StackSnapshot> {
         let (mut mean, variance) = self.accumulator.snapshot();
         self.fill_photosite_gaps(&mut mean, &self.accumulator.count);
@@ -2231,6 +2271,17 @@ pub(crate) fn calibrate_light(
 /// Prepare a light read from a file, as every path that stacks, plans or
 /// replays one does: [`calibrate_light`], then debayer, then bin by
 /// [`StackOptions::bin_factor`].
+/// A frame's raw clip mask, taken before calibration, carried through the
+/// demosaic and binning [`develop`] gave the frame; `None` when it had none
+/// or cannot follow.
+pub(crate) fn developed_clip_mask(
+    mask: Option<LinearImage>,
+    cfa: Option<BayerLayout>,
+    options: &StackOptions,
+) -> Option<LinearImage> {
+    crate::saturation::develop_clip_mask(mask?, cfa, options.demosaic, options.bin_factor).ok()
+}
+
 pub(crate) fn prepare_light(
     frame: FitsFrame,
     calibration: &CalibrationMasters,
@@ -2455,6 +2506,9 @@ pub(crate) struct ReadyFrame {
     /// The registered image before normalization, written for a later
     /// reintegration when the stack keeps frames for one.
     staged: Option<crate::replay::StagedFrame>,
+    /// How much of each pixel of `region` the frame's clipped raw pixels
+    /// reach, from 0 to 1, when any of them clipped.
+    clipped: Option<LinearImage>,
 }
 
 impl PreparedFrame {
@@ -2517,6 +2571,7 @@ impl FrameRegistration<'_> {
 /// With `cache`, the registered image is written there before it is
 /// normalized, which is the image a reintegration would otherwise make again
 /// from the source; see [`LiveStacker::retain_frames_for_reintegration`].
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_frame(
     reference: &LinearImage,
     target: FrameRegistration<'_>,
@@ -2525,6 +2580,7 @@ pub(crate) fn prepare_frame(
     frame: LinearImage,
     cfa: Option<BayerLayout>,
     cache: Option<&crate::replay::CacheFiles>,
+    clipped: Option<LinearImage>,
 ) -> Result<PreparedFrame> {
     if reference.channels != frame.channels {
         return Ok(PreparedFrame::Rejected(
@@ -2782,6 +2838,21 @@ pub(crate) fn prepare_frame(
     mapping.set_warp(registration.warp.clone())?;
     mapping.set_bin_factor(options.bin_factor);
     mapping.set_channel_sites(options.channel_sites(cfa));
+    // Where the frame's raw pixels clipped, carried onto the grid as the
+    // frame was: bilinearly, so a pixel reads how much of it they reach.
+    let clipped = match clipped {
+        Some(mask) if (mask.width, mask.height) == (frame.width, frame.height) => {
+            Some(crate::registration::resample_region_geometry(
+                &mask,
+                reference.width,
+                reference.height,
+                region,
+                geometry,
+                crate::registration::Sampling::Bilinear,
+            )?)
+        }
+        _ => None,
+    };
     Ok(PreparedFrame::Ready(Box::new(ReadyFrame {
         registered,
         region,
@@ -2798,6 +2869,7 @@ pub(crate) fn prepare_frame(
         weight,
         photosites: photosites.is_some(),
         staged,
+        clipped,
     })))
 }
 
@@ -2879,6 +2951,7 @@ impl IntegrationHalf<'_> {
             weight,
             photosites,
             staged,
+            clipped,
         } = *ready;
         let weights = (!weight.is_empty()).then_some(weight.as_slice());
         let placed = Placed {
@@ -2909,6 +2982,14 @@ impl IntegrationHalf<'_> {
         let (accepted_samples, rejected_samples) =
             self.accumulator
                 .integrate_placed(placed, self.options.rejection, weights);
+        if let Some(clipped) = &clipped {
+            self.accumulator.add_clipped(
+                clipped,
+                region,
+                self.reference_width,
+                registered.channels,
+            );
+        }
         *self.accepted_frames += 1;
         self.ledger.admit(
             source,
@@ -2968,6 +3049,9 @@ struct Accumulator {
     rejected: Vec<u32>,
     /// Per-sample sum of weights; `None` when frames are weighted equally.
     weight_sum: Option<Vec<f32>>,
+    /// Per-pixel sum of how much of each integrated frame's pixel its
+    /// clipped raw pixels reached; `None` until a frame with any arrives.
+    clipped: Option<Vec<f32>>,
 }
 
 impl Accumulator {
@@ -2978,7 +3062,64 @@ impl Accumulator {
             count: vec![0; samples],
             rejected: vec![0; samples],
             weight_sum: weighted.then(|| vec![0.0; samples]),
+            clipped: None,
         }
+    }
+
+    /// Add a frame's clipped share of each pixel of `region`, a mono image
+    /// as wide as the region, on a grid `grid_width` pixels wide whose
+    /// samples hold `channels` channels each.
+    fn add_clipped(
+        &mut self,
+        mask: &LinearImage,
+        region: ReferenceRegion,
+        grid_width: usize,
+        channels: usize,
+    ) {
+        if mask.channels != 1
+            || (mask.width, mask.height) != (region.width, region.height)
+            || !mask.data.iter().any(|&value| value > 0.0)
+        {
+            return;
+        }
+        let pixels = self.mean.len() / channels.max(1);
+        let clipped = self.clipped.get_or_insert_with(|| vec![0.0; pixels]);
+        clipped[region.y * grid_width..(region.y + region.height) * grid_width]
+            .par_chunks_mut(grid_width)
+            .zip(mask.data.par_chunks(region.width))
+            .for_each(|(row, values)| {
+                for (sum, &value) in row[region.x..region.x + region.width]
+                    .iter_mut()
+                    .zip(values)
+                {
+                    if value.is_finite() && value > 0.0 {
+                        *sum += value.min(1.0);
+                    }
+                }
+            });
+    }
+
+    /// Each pixel's clipped share of the observations it has had, from 0 to
+    /// 1, counting its first channel's accepted and rejected samples; `None`
+    /// when no integrated frame clipped.
+    fn clipped_fraction(&self, channels: usize) -> Option<Vec<f32>> {
+        let clipped = self.clipped.as_ref()?;
+        let channels = channels.max(1);
+        Some(
+            clipped
+                .par_iter()
+                .enumerate()
+                .map(|(pixel, &sum)| {
+                    let observations =
+                        self.count[pixel * channels] + self.rejected[pixel * channels];
+                    if observations == 0 {
+                        0.0
+                    } else {
+                        (sum / observations as f32).min(1.0)
+                    }
+                })
+                .collect(),
+        )
     }
 
     /// Integrate one frame. `weights` holds one weight per channel and is
@@ -3540,6 +3681,61 @@ mod tests {
             }
         }
         LinearImage::new(width, height, 1, data).unwrap()
+    }
+
+    /// Where a frame's raw pixels reach the sensor's ceiling, the stack
+    /// records how much of each pixel's observations clipped, and a context
+    /// keeps it.
+    #[test]
+    fn the_stack_records_where_frames_clipped_and_a_context_keeps_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let raw = |image: LinearImage| FitsFrame {
+            image,
+            headers: vec![
+                ("BITPIX".into(), HeaderValue::Integer(16)),
+                ("BZERO".into(), HeaderValue::Float(32768.0)),
+            ],
+            exposure_seconds: None,
+            bayer: None,
+            source: None,
+            bounds: None,
+        };
+        let field = stacking_star_field(160, 128);
+        let mut stacker = LiveStacker::new(
+            raw(field.clone()),
+            CalibrationMasters::default(),
+            StackOptions::default(),
+        )
+        .unwrap();
+        assert!(stacker.clipped_fraction().is_none());
+        // The brightest star's core, clipped in the second frame only.
+        let core = [(91, 118), (92, 118), (91, 119), (92, 119)];
+        let mut clipped = field.clone();
+        for &(x, y) in &core {
+            clipped.data[y * 160 + x] = 65535.0;
+        }
+        assert!(matches!(
+            stacker.push(raw(clipped)).unwrap(),
+            FrameDisposition::Accepted(_)
+        ));
+        let fraction = stacker.clipped_fraction().unwrap();
+        assert_eq!(
+            (fraction.width, fraction.height, fraction.channels),
+            (160, 128, 1)
+        );
+        // One of the two observations clipped at the core, none in the sky;
+        // the frame's sub-pixel registration spreads the share a little.
+        let at = |x: usize, y: usize| fraction.data[y * 160 + x];
+        for &(x, y) in &core {
+            assert!((0.3..=0.5).contains(&at(x, y)), "({x}, {y}): {}", at(x, y));
+        }
+        let total: f32 = fraction.data.iter().sum();
+        assert!((total - 2.0).abs() < 0.1, "{total}");
+        assert_eq!(at(10, 10), 0.0);
+        let path = directory.path().join("clipped.seiza-stack");
+        stacker.save_context(&path).unwrap();
+        let reopened = LiveStacker::open_context(&path).unwrap();
+        assert_eq!(reopened.clipped_fraction().unwrap().data, fraction.data);
     }
 
     fn offset_image(reference: &LinearImage, offset: f32) -> LinearImage {
@@ -4159,6 +4355,7 @@ mod tests {
                 expanded_panel_stars: Vec::new(),
                 expanded_panel_projections: Vec::new(),
                 expanded_lens: None,
+                clipped: None,
             },
         )
         .unwrap();
@@ -4282,6 +4479,7 @@ mod tests {
                 expanded_panel_stars: Vec::new(),
                 expanded_panel_projections: Vec::new(),
                 expanded_lens: None,
+                clipped: None,
             },
         )
         .unwrap();

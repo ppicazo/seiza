@@ -186,3 +186,24 @@ def test_calibrate_and_stretch_still_stretches_when_it_cannot_calibrate(tmp_path
         np.testing.assert_array_equal(unchanged, image)
     with pytest.raises(ValueError):
         seiza.calibrate_and_stretch(image, wcs, stretch={"model": "nonsense"}, gaia=gaia)
+
+
+def test_neutralize_clipped_renders_a_stacks_clipped_pixels_neutral():
+    tinted = [700.0, 800.0, 780.0]
+    sky = [10.0, 20.0, 15.0]
+    image = np.array([[tinted, sky]], dtype=np.float32)
+    neutral = seiza.neutralize_clipped(image, np.array([[1.0, 0.0]], dtype=np.float32))
+    np.testing.assert_array_equal(neutral[0, 0], [800.0, 800.0, 800.0])
+    np.testing.assert_array_equal(neutral[0, 1], sky)
+    np.testing.assert_array_equal(image[0, 0], tinted)
+    with pytest.raises(ValueError, match="does not fit"):
+        seiza.neutralize_clipped(image, np.zeros((1, 3), dtype=np.float32))
+
+    # A map that clips nothing leaves calibrate_and_stretch's result alone.
+    field, wcs, gaia = synthetic_field()
+    plain = seiza.calibrate_and_stretch(field, wcs, stretch=AUTO_STRETCH, gaia=gaia)
+    unclipped = np.zeros(field.shape[:2], dtype=np.float32)
+    same = seiza.calibrate_and_stretch(
+        field, wcs, stretch=AUTO_STRETCH, gaia=gaia, clipped=unclipped
+    )
+    np.testing.assert_array_equal(same.image, plain.image)

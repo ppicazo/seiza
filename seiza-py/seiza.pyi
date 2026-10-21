@@ -772,6 +772,7 @@ class LiveStacker:
     def expansion_planning_notes(self) -> list[str]: ...
     def measure_depth(self) -> SnrSample | None: ...
     def snapshot(self) -> StackSnapshot: ...
+    def clipped_fraction(self) -> npt.NDArray[np.float32] | None: ...
     def write_fits(self, path: str | Path) -> None: ...
     def retain_frames_for_reintegration(
         self,
@@ -1643,6 +1644,7 @@ def calibrate_and_stretch(
     wcs: Wcs | None = None,
     *,
     stretch: Mapping[str, Any] | Sequence[Mapping[str, Any]],
+    clipped: npt.NDArray[np.float32] | None = None,
     gaia: Sequence[Mapping[str, float | None]] | None = None,
     catalog: str | Path | None = None,
     epoch: float | None = None,
@@ -1654,6 +1656,9 @@ def calibrate_and_stretch(
     neutralize_background: bool = True,
     calibrator_max_g: float | None = None,
 ) -> CalibratedStretch: ...
+def neutralize_clipped(
+    image: npt.NDArray[np.float32], clipped: npt.NDArray[np.float32]
+) -> npt.NDArray[np.float32]: ...
 
 # Flat sessions and their dust. Planes are 2-D float32 arrays; results are
 # dicts of the core's own JSON, as the C ABI's seiza_flat_* and seiza_dust_*

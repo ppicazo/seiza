@@ -53,6 +53,8 @@ pub(crate) struct ContextWriteState<'a> {
     pub expanded_panel_stars: Vec<Vec<seiza::DetectedStar>>,
     pub expanded_panel_projections: Vec<Option<crate::expand::PanelProjection>>,
     pub expanded_lens: Option<crate::lens::LensDistortion>,
+    /// Per-pixel sums of integrated frames' clipped shares.
+    pub clipped: Option<&'a [f32]>,
 }
 
 pub(crate) struct RestoredContext {
@@ -81,6 +83,9 @@ pub(crate) struct RestoredContext {
     pub expanded_panel_stars: Option<Vec<Vec<seiza::DetectedStar>>>,
     pub expanded_panel_projections: Vec<Option<crate::expand::PanelProjection>>,
     pub expanded_lens: Option<crate::lens::LensDistortion>,
+    /// `None` for a context saved before stacks recorded clipping, or of a
+    /// stack no clipped frame reached.
+    pub clipped: Option<Vec<f32>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -141,6 +146,11 @@ struct ContextMetadata {
     /// Older readers refuse this metadata instead of discarding projection.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     expanded_panel_projections: Vec<Option<crate::expand::PanelProjection>>,
+    /// Whether a section of per-pixel clipped shares ends the payload.
+    /// Readers that predate it refuse the field rather than reopen a stack
+    /// that forgets where its frames clipped.
+    #[serde(default, skip_serializing_if = "is_false")]
+    clipped: bool,
 }
 
 /// A panel star as a context stores it.
@@ -425,6 +435,10 @@ fn write_version(path: &Path, state: ContextWriteState<'_>, format_version: u32)
                     .and_then(|()| encoder.write_all(stars)),
                 None => Ok(()),
             })
+            .and_then(|()| match state.clipped {
+                Some(clipped) => write_f32_values(&mut encoder, clipped),
+                None => Ok(()),
+            })
             .map_err(|error| context_write_error(path, error.to_string()))?;
 
         let mut writer = encoder
@@ -611,6 +625,14 @@ pub(crate) fn read(path: &Path) -> Result<RestoredContext> {
     } else {
         None
     };
+    let clipped = if metadata.clipped {
+        Some(
+            read_f32_values(&mut decoder, reference.pixel_count())
+                .map_err(|error| context_read_error(path, error))?,
+        )
+    } else {
+        None
+    };
     let mut trailing = [0_u8; 1];
     if decoder
         .read(&mut trailing)
@@ -705,6 +727,7 @@ pub(crate) fn read(path: &Path) -> Result<RestoredContext> {
         expanded_panel_stars,
         expanded_panel_projections: metadata.expanded_panel_projections,
         expanded_lens: metadata.expanded_lens,
+        clipped,
     })
 }
 
@@ -765,6 +788,7 @@ impl ContextMetadata {
             expanded_lens: state.expanded_lens,
             expanded_panel_stars: !state.expanded_panel_stars.is_empty(),
             expanded_panel_projections: state.expanded_panel_projections.clone(),
+            clipped: state.clipped.is_some(),
         })
     }
 

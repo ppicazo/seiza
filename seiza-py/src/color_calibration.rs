@@ -524,13 +524,17 @@ fn calibrate_color_image<'py>(
 /// keeps them. Once calibration has run, a stage with ``"color_strategy":
 /// "unlinked"`` is linked instead and listed in `linked_stages`. When
 /// calibration cannot run, every stage runs as given, the image is still
-/// stretched, and the result's outcome says why.
+/// stretched, and the result's outcome says why. With `clipped`, the map
+/// `LiveStacker.clipped_fraction()` gives, the pixels a stack's clipped raw
+/// samples reached come out neutral rather than tinted, as
+/// `neutralize_clipped` renders them, before the stretch.
 #[pyfunction]
 #[pyo3(signature = (
     image,
     wcs=None,
     *,
     stretch,
+    clipped=None,
     gaia=None,
     catalog=None,
     epoch=None,
@@ -548,6 +552,7 @@ fn calibrate_and_stretch(
     image: PyReadonlyArrayDyn<'_, f32>,
     wcs: Option<PyRef<'_, PyWcs>>,
     stretch: Bound<'_, PyAny>,
+    clipped: Option<PyReadonlyArrayDyn<'_, f32>>,
     gaia: Option<Vec<Bound<'_, PyDict>>>,
     catalog: Option<std::path::PathBuf>,
     epoch: Option<f64>,
@@ -560,6 +565,7 @@ fn calibrate_and_stretch(
     calibrator_max_g: Option<f32>,
 ) -> PyResult<PyCalibratedStretch> {
     let image = linear_image(image)?;
+    let clipped = clipped.map(linear_image).transpose()?;
     let json = py.import("json")?;
     let text: String = json.call_method1("dumps", (stretch,))?.extract()?;
     let value: serde_json::Value = serde_json::from_str(&text)
@@ -587,7 +593,14 @@ fn calibrate_and_stretch(
     };
     let result = py
         .detach(|| {
-            rust_calibrate_and_stretch(image, wcs.as_ref(), input.colors(), &options, &stack)
+            rust_calibrate_and_stretch(
+                image,
+                wcs.as_ref(),
+                input.colors(),
+                &options,
+                &stack,
+                clipped.as_ref(),
+            )
         })
         .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
     let plans = serde_json::to_string(&result.stretch_plans)
@@ -605,6 +618,26 @@ fn calibrate_and_stretch(
     })
 }
 
+/// Render neutral the pixels of a linear `(height, width, 3)` image a
+/// stack's clipped raw samples reached, and return the result: each pixel's
+/// channels rise toward its brightest channel by a smooth step of its
+/// clipped fraction, none at 5% and all the way from 50%. Run it after
+/// colour calibration. `clipped` is the `(height, width)` map
+/// `LiveStacker.clipped_fraction()` gives, on the image's grid or one it is
+/// a whole multiple of, such as a drizzled stack's.
+#[pyfunction]
+fn neutralize_clipped<'py>(
+    py: Python<'py>,
+    image: PyReadonlyArrayDyn<'_, f32>,
+    clipped: PyReadonlyArrayDyn<'_, f32>,
+) -> PyResult<Bound<'py, PyArrayDyn<f32>>> {
+    let mut image = linear_image(image)?;
+    let clipped = linear_image(clipped)?;
+    py.detach(|| seiza_stacking::neutralize_clipped(&mut image, &clipped))
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    image_array(py, &image)
+}
+
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyColorCalibration>()?;
     module.add_function(wrap_pyfunction!(gaia_photometry_cone, module)?)?;
@@ -614,6 +647,7 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyCalibratedStretch>()?;
     module.add_function(wrap_pyfunction!(calibrate_color_image, module)?)?;
     module.add_function(wrap_pyfunction!(calibrate_and_stretch, module)?)?;
+    module.add_function(wrap_pyfunction!(neutralize_clipped, module)?)?;
     module.add("SOLAR_BP_RP", SOLAR_BP_RP)?;
     Ok(())
 }

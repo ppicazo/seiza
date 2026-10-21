@@ -2947,6 +2947,66 @@ pub unsafe extern "C" fn seiza_color_calibration_apply(
 }
 
 #[unsafe(no_mangle)]
+/// Render neutral, in place, the pixels of an interleaved linear RGB image
+/// a stack's clipped raw samples reached: each pixel's channels rise toward
+/// its brightest channel by a smooth step of its clipped fraction. Run it
+/// after colour calibration, on the calibrated image. `clipped` is the mono
+/// map [`seiza_live_stacker_clipped_fraction`] gives, `clipped_width` by
+/// `clipped_height` floats, on the image's grid or one it is a whole
+/// multiple of, such as a drizzled stack's.
+///
+/// # Safety
+/// `data` must point to `length` writable floats, `width * height * 3` of
+/// them, and `clipped` to `clipped_width * clipped_height` readable floats.
+/// When non-null, `error_out` must point to writable storage for one
+/// pointer.
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn seiza_color_neutralize_clipped(
+    data: *mut f32,
+    length: usize,
+    width: usize,
+    height: usize,
+    clipped: *const f32,
+    clipped_width: usize,
+    clipped_height: usize,
+    error_out: *mut *mut c_char,
+) -> bool {
+    clear_error(error_out);
+    ffi_result(error_out, || {
+        let (samples, mut image) = unsafe { rgb_image_from_ffi(data, length, width, height)? };
+        let clipped = unsafe { clipped_map_from_ffi(clipped, clipped_width, clipped_height)? }
+            .ok_or("a clipped map is required")?;
+        seiza_stacking::neutralize_clipped(&mut image, &clipped)
+            .map_err(|error| error.to_string())?;
+        samples.copy_from_slice(&image.data);
+        Ok(())
+    })
+    .is_some()
+}
+
+/// A clipped map from a C host: `None` for a null pointer.
+///
+/// # Safety
+/// A non-null `clipped` must point to `width * height` readable floats.
+unsafe fn clipped_map_from_ffi(
+    clipped: *const f32,
+    width: usize,
+    height: usize,
+) -> Result<Option<seiza_stacking::LinearImage>, String> {
+    if clipped.is_null() {
+        return Ok(None);
+    }
+    let length = width
+        .checked_mul(height)
+        .filter(|&length| length > 0)
+        .ok_or("the clipped map's size is not usable")?;
+    let values = unsafe { std::slice::from_raw_parts(clipped, length) };
+    seiza_stacking::LinearImage::new(width, height, 1, values.to_vec())
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
+#[unsafe(no_mangle)]
 /// Colour calibrate an interleaved linear RGB image in place against Gaia
 /// DR3 star colours: place the Gaia stars through the image's solution, fit
 /// the gains, and apply them.
@@ -3039,9 +3099,56 @@ pub unsafe extern "C" fn seiza_color_calibrate_and_stretch_json(
     stretch_json: *const c_char,
     error_out: *mut *mut c_char,
 ) -> *mut c_char {
+    unsafe {
+        seiza_color_calibrate_and_stretch_clipped_json(
+            data,
+            length,
+            width,
+            height,
+            wcs_json,
+            gaia_json,
+            catalog_path,
+            options_json,
+            stretch_json,
+            ptr::null(),
+            0,
+            0,
+            error_out,
+        )
+    }
+}
+
+#[unsafe(no_mangle)]
+/// [`seiza_color_calibrate_and_stretch_json`], rendering neutral before the
+/// stretch the pixels a stack's clipped raw samples reached, as
+/// [`seiza_color_neutralize_clipped`] does. `clipped` is the mono map
+/// [`seiza_live_stacker_clipped_fraction`] gives, `clipped_width` by
+/// `clipped_height` floats, on the image's grid or one it is a whole
+/// multiple of; null for none.
+///
+/// # Safety
+/// As [`seiza_color_calibrate_and_stretch_json`]; a non-null `clipped` must
+/// point to `clipped_width * clipped_height` readable floats.
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn seiza_color_calibrate_and_stretch_clipped_json(
+    data: *mut f32,
+    length: usize,
+    width: usize,
+    height: usize,
+    wcs_json: *const c_char,
+    gaia_json: *const c_char,
+    catalog_path: *const c_char,
+    options_json: *const c_char,
+    stretch_json: *const c_char,
+    clipped: *const f32,
+    clipped_width: usize,
+    clipped_height: usize,
+    error_out: *mut *mut c_char,
+) -> *mut c_char {
     clear_error(error_out);
     ffi_result(error_out, || {
         let (samples, image) = unsafe { rgb_image_from_ffi(data, length, width, height)? };
+        let clipped = unsafe { clipped_map_from_ffi(clipped, clipped_width, clipped_height)? };
         let inputs = GaiaColorInputs::parse(wcs_json, gaia_json, catalog_path, options_json)?;
         let stretch: StretchConfigRequest =
             serde_json::from_str(&required_str(stretch_json, "stretch")?)
@@ -3052,6 +3159,7 @@ pub unsafe extern "C" fn seiza_color_calibrate_and_stretch_json(
             inputs.gaia(),
             &inputs.options.calibration_options(),
             &stretch.into_stack(),
+            clipped.as_ref(),
         )
         .map_err(|error| error.to_string())?;
         samples.copy_from_slice(&result.image.data);
@@ -4476,6 +4584,42 @@ pub unsafe extern "C" fn seiza_live_stacker_coverage(
             stacker.stacker.view().coverage.as_ptr()
         })
     }
+}
+
+#[unsafe(no_mangle)]
+/// Copy how much of each pixel's integrated observations came from clipped
+/// raw pixels, from 0 to 1, into `out`: one float per pixel of the stack's
+/// grid, row by row, for [`seiza_color_neutralize_clipped`]. Returns true
+/// when it copied the map, and false with no error when no integrated frame
+/// clipped, or their saturation level was unknown. Fails, setting
+/// `error_out`, when `out` holds fewer than `width * height` floats.
+///
+/// # Safety
+/// `stacker` must be null or a live `SeizaLiveStacker` pointer, `out` must
+/// point to `length` writable floats, and a non-null `error_out` to
+/// writable storage for one pointer.
+pub unsafe extern "C" fn seiza_live_stacker_clipped_fraction(
+    stacker: *const SeizaLiveStacker,
+    out: *mut f32,
+    length: usize,
+    error_out: *mut *mut c_char,
+) -> bool {
+    clear_error(error_out);
+    ffi_result(error_out, || {
+        let stacker = unsafe { stacker.as_ref() }.ok_or("stacker is required")?;
+        let Some(map) = stacker.stacker.clipped_fraction() else {
+            return Ok(false);
+        };
+        if out.is_null() || length < map.data.len() {
+            return Err(format!(
+                "the clipped map needs {} floats, not {length}",
+                map.data.len()
+            ));
+        }
+        unsafe { std::slice::from_raw_parts_mut(out, map.data.len()) }.copy_from_slice(&map.data);
+        Ok(true)
+    })
+    .unwrap_or(false)
 }
 
 #[unsafe(no_mangle)]
@@ -16864,6 +17008,52 @@ fi
     /// An image made from a solved frame by a half turn and a crop: the C
     /// API carries the frame's solution onto it, calibrates against Gaia
     /// rows, stretches, and reports why when it cannot calibrate.
+    #[test]
+    fn color_neutralize_clipped_cabi_renders_clipped_pixels_neutral() {
+        let mut data = vec![700.0_f32, 800.0, 780.0, 10.0, 20.0, 15.0];
+        let clipped = [1.0_f32, 0.0];
+        let mut error = ptr::null_mut();
+        assert!(unsafe {
+            seiza_color_neutralize_clipped(
+                data.as_mut_ptr(),
+                data.len(),
+                2,
+                1,
+                clipped.as_ptr(),
+                2,
+                1,
+                &mut error,
+            )
+        });
+        assert!(error.is_null());
+        assert_eq!(data[..3], [800.0; 3]);
+        assert_eq!(data[3..], [10.0, 20.0, 15.0]);
+        // A map whose width does not divide the image's.
+        let wide = [0.0_f32; 3];
+        assert!(!unsafe {
+            seiza_color_neutralize_clipped(
+                data.as_mut_ptr(),
+                data.len(),
+                2,
+                1,
+                wide.as_ptr(),
+                3,
+                1,
+                &mut error,
+            )
+        });
+        assert!(!error.is_null());
+        unsafe { seiza_string_free(error) };
+        // No stacker, no map.
+        let mut out = [0.0_f32; 2];
+        error = ptr::null_mut();
+        assert!(!unsafe {
+            seiza_live_stacker_clipped_fraction(ptr::null(), out.as_mut_ptr(), 2, &mut error)
+        });
+        assert!(!error.is_null());
+        unsafe { seiza_string_free(error) };
+    }
+
     #[test]
     fn color_calibrate_and_stretch_cabi_follows_a_derived_solution() {
         let (width, height) = (1200, 1000);

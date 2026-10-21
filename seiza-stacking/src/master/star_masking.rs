@@ -82,41 +82,9 @@ pub(super) struct SaturationSeeds {
 }
 
 fn saturation_level(frame: &FitsFrame, options: &FlatStarMaskingOptions) -> Option<f32> {
-    if let Some(level) = options.saturation_level {
-        return Some(level);
-    }
-    let number = |name: &str| {
-        frame
-            .headers
-            .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case(name))
-            .and_then(|(_, value)| value.as_f64())
-    };
-    for name in ["SATURATE", "SATLEVEL"] {
-        if let Some(level) = number(name).filter(|value| value.is_finite() && *value > 0.0) {
-            return (level <= f64::from(f32::MAX)).then_some(level as f32);
-        }
-    }
-    let bits = number("BITPIX")?;
-    let (minimum, maximum) = match bits {
-        8.0 => (0.0, 255.0),
-        16.0 => (-32768.0, 32767.0),
-        32.0 => (-2147483648.0, 2147483647.0),
-        _ => return None,
-    };
-    let scale = number("BSCALE").unwrap_or(1.0);
-    let offset = number("BZERO").unwrap_or(0.0);
-    let level = if scale > 0.0 {
-        maximum * scale + offset
-    } else {
-        minimum * scale + offset
-    };
-    (scale.is_finite()
-        && scale != 0.0
-        && level.is_finite()
-        && level > 0.0
-        && level <= f64::from(f32::MAX))
-    .then_some(level as f32)
+    options
+        .saturation_level
+        .or_else(|| crate::saturation::saturation_level(&frame.headers))
 }
 
 pub(super) fn saturation_seeds(

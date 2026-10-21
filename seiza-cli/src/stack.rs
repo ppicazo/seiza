@@ -98,6 +98,13 @@ pub(crate) struct StackArgs {
     /// Optional display-stretched PNG; never used by stacking math
     #[arg(long)]
     preview: Option<PathBuf>,
+    /// Also write, as a mono 32-bit FITS on the stack's grid, how much of each
+    /// pixel came from frames whose raw pixels clipped at the sensor's
+    /// saturation level, from 0 to 1, for `color-calibrate --clipped`, which
+    /// renders those pixels neutral rather than tinted. The level comes from
+    /// SATURATE or SATLEVEL, or the frames' integer encoding
+    #[arg(long)]
+    clipped: Option<PathBuf>,
     /// JSON admission/provenance report with SHA-256 input identities
     #[arg(long)]
     report: Option<PathBuf>,
@@ -398,6 +405,7 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
         ("stack output", Some(options.output.as_path())),
         ("preview output", options.preview.as_deref()),
         ("report output", options.report.as_deref()),
+        ("clipped map output", options.clipped.as_deref()),
     ] {
         if let Some(path) = path {
             path_roles.push((role.into(), path));
@@ -878,6 +886,8 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
     }
 
     let reference_headers = stacker.reference_headers().to_vec();
+    // Read before reintegration drops the stacker: the live pass recorded it.
+    let clipped = options.clipped.as_ref().map(|_| stacker.clipped_fraction());
     let mut drizzled = None;
     let mut snapshot = if reintegrate {
         if let Some(reason) = stacker.reintegration_unavailable() {
@@ -966,6 +976,25 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
                     snapshot.accepted_frames, snapshot.rejected_frames,
                 ),
             );
+        }
+    }
+    if let (Some(path), Some(clipped)) = (options.clipped.as_ref(), clipped) {
+        match clipped {
+            Some(map) => {
+                seiza_stacking::write_linear_image_fits_f32(path, &map, &[], &[])?;
+                crate::common::wrote(
+                    path,
+                    format_args!(
+                        "clipped share of each pixel, {}x{}, {} pixel(s) at least half clipped",
+                        map.width,
+                        map.height,
+                        map.data.iter().filter(|&&value| value >= 0.5).count()
+                    ),
+                );
+            }
+            None => println!(
+                "no clipped map: no accepted frame clipped, or their saturation level is unknown"
+            ),
         }
     }
     if let Some(preview) = preview_path.as_ref() {

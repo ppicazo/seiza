@@ -941,6 +941,30 @@ bool seiza_color_calibration_apply(float *data,
                                    char **error_out);
 
 /*
+ Render neutral, in place, the pixels of an interleaved linear RGB image
+ a stack's clipped raw samples reached: each pixel's channels rise toward
+ its brightest channel by a smooth step of its clipped fraction. Run it
+ after colour calibration, on the calibrated image. `clipped` is the mono
+ map [`seiza_live_stacker_clipped_fraction`] gives, `clipped_width` by
+ `clipped_height` floats, on the image's grid or one it is a whole
+ multiple of, such as a drizzled stack's.
+
+ # Safety
+ `data` must point to `length` writable floats, `width * height * 3` of
+ them, and `clipped` to `clipped_width * clipped_height` readable floats.
+ When non-null, `error_out` must point to writable storage for one
+ pointer.
+ */
+bool seiza_color_neutralize_clipped(float *data,
+                                    size_t length,
+                                    size_t width,
+                                    size_t height,
+                                    const float *clipped,
+                                    size_t clipped_width,
+                                    size_t clipped_height,
+                                    char **error_out);
+
+/*
  Colour calibrate an interleaved linear RGB image in place against Gaia
  DR3 star colours: place the Gaia stars through the image's solution, fit
  the gains, and apply them.
@@ -1014,6 +1038,32 @@ char *seiza_color_calibrate_and_stretch_json(float *data,
                                              const char *options_json,
                                              const char *stretch_json,
                                              char **error_out);
+
+/*
+ [`seiza_color_calibrate_and_stretch_json`], rendering neutral before the
+ stretch the pixels a stack's clipped raw samples reached, as
+ [`seiza_color_neutralize_clipped`] does. `clipped` is the mono map
+ [`seiza_live_stacker_clipped_fraction`] gives, `clipped_width` by
+ `clipped_height` floats, on the image's grid or one it is a whole
+ multiple of; null for none.
+
+ # Safety
+ As [`seiza_color_calibrate_and_stretch_json`]; a non-null `clipped` must
+ point to `clipped_width * clipped_height` readable floats.
+ */
+char *seiza_color_calibrate_and_stretch_clipped_json(float *data,
+                                                     size_t length,
+                                                     size_t width,
+                                                     size_t height,
+                                                     const char *wcs_json,
+                                                     const char *gaia_json,
+                                                     const char *catalog_path,
+                                                     const char *options_json,
+                                                     const char *stretch_json,
+                                                     const float *clipped,
+                                                     size_t clipped_width,
+                                                     size_t clipped_height,
+                                                     char **error_out);
 
 /*
  The solution of an image made from a solved one by a pixel mapping, such
@@ -1695,6 +1745,24 @@ const float *seiza_live_stacker_mean(const SeizaLiveStacker *stacker);
  `stacker` must be null or a live `SeizaLiveStacker` pointer.
  */
 const uint32_t *seiza_live_stacker_coverage(const SeizaLiveStacker *stacker);
+
+/*
+ Copy how much of each pixel's integrated observations came from clipped
+ raw pixels, from 0 to 1, into `out`: one float per pixel of the stack's
+ grid, row by row, for [`seiza_color_neutralize_clipped`]. Returns true
+ when it copied the map, and false with no error when no integrated frame
+ clipped, or their saturation level was unknown. Fails, setting
+ `error_out`, when `out` holds fewer than `width * height` floats.
+
+ # Safety
+ `stacker` must be null or a live `SeizaLiveStacker` pointer, `out` must
+ point to `length` writable floats, and a non-null `error_out` to
+ writable storage for one pointer.
+ */
+bool seiza_live_stacker_clipped_fraction(const SeizaLiveStacker *stacker,
+                                         float *out,
+                                         size_t length,
+                                         char **error_out);
 
 /*
  Borrows the rejected-observation count for each image sample. The pointer
