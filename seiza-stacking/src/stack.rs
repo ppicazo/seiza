@@ -2629,36 +2629,49 @@ pub(crate) fn prepare_frame(
             },
         ));
     }
-    let normalization = match NormalizationMap::estimate_with_gains(
-        reference,
-        Placed::on(&registered, region, reference),
-        scale.normalization(options.normalization),
-        matches!(
-            options.normalization,
-            NormalizationMode::LocalBackground { .. }
+    let gains = matches!(
+        options.normalization,
+        NormalizationMode::LocalBackground { .. }
+    )
+    .then(|| {
+        crate::normalization::photometric_gains(
+            reference,
+            &target.reference_ceilings(reference),
+            Placed::on(&registered, region, reference),
+            &target.reference_star_positions(),
         )
-        .then(|| {
-            crate::normalization::photometric_gains(
-                reference,
-                &target.reference_ceilings(reference),
-                Placed::on(&registered, region, reference),
-                &target.reference_star_positions(),
-            )
-        })
-        .flatten()
-        .as_deref(),
-    ) {
-        Ok(normalization) => normalization,
-        Err(error) => {
-            let message = match error {
-                Error::Normalization(message) => message,
-                other => other.to_string(),
-            };
-            return Ok(PreparedFrame::Rejected(
-                FrameRejectionReason::Normalization(message),
-            ));
+    })
+    .flatten();
+    let placed = Placed::on(&registered, region, reference);
+    // An expanded canvas keeps the first value each sample received, so its
+    // background is a patchwork of single frames' skies, each with its own
+    // gradient. Matched tile by tile, every frame would take on that
+    // patchwork, and so would the stack, where the frames' own gradients
+    // otherwise average away. There local background normalization keeps
+    // its photometric gain and one offset over the frame's footprint; a
+    // reintegration fits the tiles against a reference integrated from the
+    // best frames.
+    let mode = match (scale.normalization(options.normalization), target.canvas) {
+        (NormalizationMode::LocalBackground { .. }, Some(_)) => {
+            NormalizationMode::LocalBackground {
+                tile_size: reference.width.max(reference.height),
+            }
         }
+        (mode, _) => mode,
     };
+    let normalization =
+        match NormalizationMap::estimate_with_gains(reference, placed, mode, gains.as_deref()) {
+            Ok(normalization) => normalization,
+            Err(error) => {
+                let message = match error {
+                    Error::Normalization(message) => message,
+                    other => other.to_string(),
+                };
+                return Ok(PreparedFrame::Rejected(
+                    FrameRejectionReason::Normalization(message),
+                ));
+            }
+        };
     let (minimum_gain, maximum_gain) = normalization.gain_range();
     if minimum_gain < criteria.minimum_normalization_gain
         || maximum_gain > criteria.maximum_normalization_gain

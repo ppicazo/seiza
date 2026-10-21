@@ -33,7 +33,11 @@ pub enum NormalizationMode {
     /// tile's offset is the median difference of corresponding samples,
     /// after applying the gain, so shared nebular structure cancels;
     /// tiles with too few are filled from their neighbours, and the grid is
-    /// smoothed over three tiles.
+    /// smoothed over three tiles. On an expanded canvas the live pass fits a
+    /// single tile: the canvas keeps the first value each sample received,
+    /// so its background is a patchwork of single frames' skies that
+    /// matching tile by tile would copy into the stack. A reintegration fits
+    /// the tiles against a reference integrated from the best frames.
     LocalBackground {
         /// Tile edge length in pixels; must be at least 16.
         tile_size: usize,

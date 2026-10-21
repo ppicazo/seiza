@@ -780,8 +780,13 @@ fn expansion_bounds_the_seams_a_panel_gradient_leaves() {
     let worst_offset = residuals
         .iter()
         .fold(0.0_f32, |worst, r| worst.max(r.abs()));
-    // Measured: steps of 0.00034 and an offset of 0.0019.
-    assert!(worst_step < 5.0e-4, "step {worst_step}");
+    // Measured: steps of 0.00053 and an offset of 0.0020. The live pass
+    // matches a frame to the canvas with one offset (stack.rs, prepare_frame),
+    // so a panel's gradient against its neighbour's is no longer absorbed
+    // tile by tile: steps were 0.00034 while it was. Tile by tile, every
+    // frame took on the sky of the frames that filled the canvas first, which
+    // on a 362-frame mosaic left lumps three times as large as these steps.
+    assert!(worst_step < 7.0e-4, "step {worst_step}");
     assert!(worst_offset < 2.5e-3, "offset {worst_offset}");
     // The anchor panel, away from the gradient's panel, is untouched.
     assert!(residuals[..25].iter().all(|r| r.abs() < 1.0e-5));
