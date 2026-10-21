@@ -96,3 +96,104 @@ fn stretch_cli_refuses_to_overwrite_its_input() {
     assert!(String::from_utf8_lossy(&result.stderr).contains("same file"));
     assert_eq!(std::fs::read(input).unwrap(), original);
 }
+
+/// A stack as `seiza stack` writes it: an RGB sky of about 3300 ADU with
+/// noise, a few bright stars, and NaN where no frame covered the canvas.
+fn physical_mosaic(path: &std::path::Path) {
+    let (width, height) = (160_usize, 120_usize);
+    let mut data = Vec::with_capacity(width * height * 3);
+    for y in 0..height {
+        for x in 0..width {
+            for channel in 0..3 {
+                let value = if x + y < 40 {
+                    f32::NAN
+                } else if (x % 37 == 18) && (y % 29 == 14) {
+                    50_000.0
+                } else {
+                    3300.0
+                        + channel as f32 * 40.0
+                        + ((x * 7919 + y * 104_729 + channel) % 41) as f32
+                };
+                data.push(value);
+            }
+        }
+    }
+    write_f32_image(
+        path,
+        width,
+        height,
+        F32ImageData::RgbInterleaved(&data),
+        &[],
+    )
+    .unwrap();
+}
+
+/// The data-driven stretches place the sky from its own statistics, so a
+/// stack in ADU comes out as a sky, not as a black or white sheet.
+#[test]
+fn stretch_cli_maps_physical_samples_for_data_driven_models() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("mosaic.fits");
+    physical_mosaic(&input);
+    for model in ["auto-mtf", "median-anchor", "layered"] {
+        let output = directory.path().join(format!("{model}.png"));
+        let result = Command::new(env!("CARGO_BIN_EXE_seiza"))
+            .args([
+                "stretch",
+                input.to_str().unwrap(),
+                "--output",
+                output.to_str().unwrap(),
+                model,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{model}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let preview = image::open(&output).unwrap().to_luma8();
+        let mut sky = preview
+            .enumerate_pixels()
+            .filter(|(x, y, _)| x + y >= 40)
+            .map(|(_, _, pixel)| pixel.0[0])
+            .collect::<Vec<_>>();
+        sky.sort_unstable();
+        let median = sky[sky.len() / 2];
+        assert!((15..=160).contains(&median), "{model}: sky median {median}");
+        let white = sky.iter().filter(|&&value| value == 255).count();
+        assert!(white * 20 < sky.len(), "{model}: {white} white pixels");
+    }
+}
+
+/// Explicit levels are read in the samples' own units unless asked
+/// otherwise, so a linear stretch between two ADU levels still works.
+#[test]
+fn stretch_cli_keeps_explicit_levels_in_sample_units() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("mosaic.fits");
+    let output = directory.path().join("linear.png");
+    physical_mosaic(&input);
+    let result = Command::new(env!("CARGO_BIN_EXE_seiza"))
+        .args([
+            "stretch",
+            input.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "linear",
+            "--black",
+            "3300",
+            "--white",
+            "3400",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let preview = image::open(&output).unwrap().to_luma8();
+    let middle = preview.get_pixel(100, 100).0[0];
+    assert!((40..=250).contains(&middle), "{middle}");
+}

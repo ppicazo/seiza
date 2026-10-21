@@ -175,12 +175,14 @@ fn color_calibrate_cli_recovers_channel_gains_from_a_gaia_csv() {
     assert!(stdout.contains("gains R"), "{stdout}");
     let shown = image::open(&display).unwrap().to_rgb8();
     assert_eq!(shown.dimensions(), (width as u32, height as u32));
-    // The sky, calibrated and linked, comes out grey.
+    // The sky, calibrated and linked, comes out grey, and its ADU are
+    // mapped to the curve's range first, so it is neither black nor white.
     let corner = shown.get_pixel(5, 5);
     assert!(
         corner.0.iter().max().unwrap() - corner.0.iter().min().unwrap() <= 6,
         "{corner:?}"
     );
+    assert!((15..=200).contains(&corner.0[1]), "{corner:?}");
 
     // Too few stars: the display is still written, and the reason printed.
     let few = directory.path().join("few.csv");
