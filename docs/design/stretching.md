@@ -196,7 +196,13 @@ an explicit output-format decision, not an incidental refactor.
 - Foraxx uses the shared Auto-MTF resolver for its required stretched working
   channels; the resulting composition remains explicitly display-referred.
 - `seiza stretch` exposes every current model as an explicit subcommand,
-  through the shape-aware methods.
+  through the shape-aware methods. Its `--sample-domain` (default `auto`)
+  maps a stack's ADU onto 0 to 1 before a model that takes its levels from
+  the data (percentile asinh, Auto-MTF, median anchor, layered): their
+  curves place highlights at 1, so ADU fed straight in come out black or
+  white. Explicit levels (linear, asinh, MTF, GHS) stay in the samples'
+  own units unless `--sample-domain physical` asks otherwise.
+  `seiza color-calibrate --display` does the same for its display stretch.
 - The C ABI renders its stretch configuration through the shape-aware
   methods, so `{"type": "layered", …}` works there.
 - Python `seiza.stretch` accepts the same models and returns display-referred

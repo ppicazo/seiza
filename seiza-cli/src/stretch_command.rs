@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use seiza_stretch::{
-    ColorStrategy, GhsParams, ImageShape, LayeredParams, MedianAnchorParams, StretchConfig,
-    StretchModel, StretchParams,
+    ColorStrategy, GhsParams, ImageShape, LayeredParams, MedianAnchorParams, SampleDomain,
+    SampleNormalization, StretchConfig, StretchModel, StretchParams,
 };
 use std::path::PathBuf;
 
@@ -16,6 +16,9 @@ pub(crate) struct StretchArgs {
     /// How RGB channels share statistics and transfer curves
     #[arg(long, value_enum, default_value = "linked")]
     color_strategy: ColorStrategyArg,
+    /// What the samples measure: the stretch curves work between 0 and 1
+    #[arg(long, value_enum, default_value = "auto")]
+    sample_domain: SampleDomainArg,
     /// Maximum pooled scalar samples retained by data-driven models
     #[arg(long, default_value_t = crate::preview::MAXIMUM_SAMPLES)]
     max_analysis_samples: usize,
@@ -41,6 +44,85 @@ impl From<ColorStrategyArg> for ColorStrategy {
             ColorStrategyArg::LuminancePreserving => Self::LuminancePreserving,
         }
     }
+}
+
+/// What an image's samples measure, relative to the 0 to 1 range the
+/// stretch curves work in.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum SampleDomainArg {
+    /// Physical when every model takes its levels from the data and a
+    /// sample lies beyond -1 to 2, as in a stack in ADU; unit otherwise
+    Auto,
+    /// The samples already lie between 0 and 1
+    Unit,
+    /// Physical values: their finite range is mapped to 0 to 1 first
+    Physical,
+}
+
+/// How far past 0 to 1 a sample may lie before `auto` reads the image as
+/// physical; background subtraction and calibration leave unit images
+/// a little outside it.
+const UNIT_DOMAIN_SLACK: f32 = 1.0;
+
+impl SampleDomainArg {
+    /// Map `data`'s finite range onto 0 to 1 in place when this domain,
+    /// for these models, calls for it, keeping NaN coverage masks. Returns
+    /// whether it did.
+    pub(crate) fn prepare(
+        self,
+        data: &mut [f32],
+        channels: usize,
+        models: &[&StretchModel],
+    ) -> Result<bool> {
+        let physical = match self {
+            Self::Unit => false,
+            Self::Physical => true,
+            Self::Auto => {
+                models.iter().all(|model| reads_levels_from_data(model))
+                    && data.iter().any(|value| {
+                        value.is_finite()
+                            && !(-UNIT_DOMAIN_SLACK..=1.0 + UNIT_DOMAIN_SLACK).contains(value)
+                    })
+            }
+        };
+        if !physical {
+            return Ok(false);
+        }
+        let (black, white) = data
+            .iter()
+            .filter(|value| value.is_finite())
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(low, high), &value| {
+                (low.min(value), high.max(value))
+            });
+        SampleDomain::PhysicalLinear {
+            normalization: SampleNormalization::ExplicitRange { black, white },
+        }
+        .resolve(data, channels)
+        .and_then(|domain| domain.apply_in_place(data, channels))
+        .context("could not map the samples to the unit range")?;
+        Ok(true)
+    }
+
+    fn summary(self, mapped: bool) -> &'static str {
+        match (self, mapped) {
+            (_, true) => ", physical samples mapped to 0-1",
+            (Self::Auto, false) => "",
+            (_, false) => ", unit samples",
+        }
+    }
+}
+
+/// Whether a model places its black point, midtones and highlights from
+/// the image's statistics, rather than from levels the caller gave in the
+/// samples' own units.
+fn reads_levels_from_data(model: &StretchModel) -> bool {
+    matches!(
+        model,
+        StretchModel::PercentileAsinh { .. }
+            | StretchModel::AutoMtf(_)
+            | StretchModel::MedianAnchor(_)
+            | StretchModel::Layered(_)
+    )
 }
 
 impl ColorStrategyArg {
@@ -351,12 +433,17 @@ pub(crate) fn run(args: StretchArgs) -> Result<()> {
         ("stretch input".into(), args.input.as_path()),
         ("stretch output".into(), args.output.as_path()),
     ])?;
-    let frame = crate::common::open_frame(&args.input, "stretch input")?;
+    let mut frame = crate::common::open_frame(&args.input, "stretch input")?;
     let config = StretchConfig {
         model: args.model.model(),
         color_strategy: args.color_strategy.into(),
         max_analysis_samples: args.max_analysis_samples,
     };
+    let mapped = args.sample_domain.prepare(
+        &mut frame.image.data,
+        frame.image.channels,
+        &[&config.model],
+    )?;
     let plan = config
         .resolve_for(&frame.image.data, frame.image.channels)
         .context("could not resolve stretch model")?;
@@ -374,9 +461,10 @@ pub(crate) fn run(args: StretchArgs) -> Result<()> {
     crate::common::wrote(
         &args.output,
         format_args!(
-            "{}, {}, display-referred",
+            "{}, {}{}, display-referred",
             args.model.summary(),
             args.color_strategy.summary(),
+            args.sample_domain.summary(mapped),
         ),
     );
     Ok(())

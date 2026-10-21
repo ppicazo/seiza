@@ -32,6 +32,10 @@ pub(crate) struct ColorCalibrateArgs {
     /// linked Auto-MTF)
     #[arg(long, requires = "display")]
     stretch: Option<String>,
+    /// What the samples measure, for the display stretch, whose curves
+    /// work between 0 and 1. The calibrated FITS keeps the input's units
+    #[arg(long, value_enum, default_value = "auto", requires = "display")]
+    sample_domain: crate::stretch_command::SampleDomainArg,
     /// Gaia BP-RP colour to render neutral; the default is the Sun's (G2V)
     #[arg(long, default_value_t = SOLAR_BP_RP)]
     white_bp_rp: f32,
@@ -131,22 +135,42 @@ pub(crate) fn run(args: ColorCalibrateArgs) -> Result<()> {
         }
         Some(display) => {
             let stretch = display_stretch(args.stretch.as_deref())?;
+            let mut shown = frame.image.clone();
+            let models = stretch
+                .stages()
+                .iter()
+                .map(|stage| &stage.model)
+                .collect::<Vec<_>>();
+            let mapped = args
+                .sample_domain
+                .prepare(&mut shown.data, shown.channels, &models)?;
             let (pixels, outcome) = match &gaia {
                 Ok(gaia) => {
                     let result = calibrate_and_stretch(
-                        frame.image.clone(),
+                        shown,
                         wcs.as_ref(),
                         gaia.colors(),
                         &options,
                         &stretch,
                     )
                     .context("display stretch failed")?;
-                    (result.image.data, result.calibration)
+                    // The display's offsets are in mapped units; the FITS
+                    // keeps the input's, so it takes a calibration of its own.
+                    let outcome = match result.calibration {
+                        ColorCalibrationOutcome::Calibrated(_) if mapped => calibrate_color_image(
+                            &mut frame.image.clone(),
+                            wcs.as_ref(),
+                            gaia.colors(),
+                            &options,
+                        ),
+                        outcome => outcome,
+                    };
+                    (result.image.data, outcome)
                 }
                 Err(skip) => {
                     let shape = ImageShape::new(width, height, 3);
                     let output = stretch
-                        .apply_f32_image(&frame.image.data, shape)
+                        .apply_f32_image(&shown.data, shape)
                         .context("display stretch failed")?;
                     (output.data, ColorCalibrationOutcome::Skipped(skip.clone()))
                 }
