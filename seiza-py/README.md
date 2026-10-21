@@ -416,7 +416,10 @@ for frame in result.frames:
 `"local-background"`, which keeps one gain per channel and matches each tile's
 background to the reference's to reduce seams. Offsets use the median of
 differences at corresponding sky positions, after applying the gain, so
-shared nebular structure cancels before the background fit. Mosaic
+shared nebular structure cancels before the background fit. On an expanding
+mosaic canvas, which keeps the first value each sample received, the live pass
+fits one background offset per frame instead, so the stack does not take on
+the sky of whichever frames filled the canvas first. Mosaic
 reintegration builds this reference from the best exposures covering each
 part of the sky, up to twenty per sample. It preserves their recorded spatial
 corrections and fits remaining additive differences, keeping the gains and

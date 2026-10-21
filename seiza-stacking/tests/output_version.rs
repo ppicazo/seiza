@@ -116,12 +116,36 @@ const LENS_MOSAIC_SIBLINGS: &[f64] = &[
     1.0160000e3,
 ];
 #[rustfmt::skip]
+const MOSAIC_CHANGING_GRADIENTS: &[f64] = &[2.5618486e2, 5.0731940e2, 5.8631538e3, 9.9515686e1, 1.0304424e2, 1.0594209e2, 3.6188834e2, 1.1663352e2, 9.9784561e1, 1.5832272e2, 2.3292229e3, 1.4172540e2, 1.1663142e2, 1.0048741e2, 1.0461007e2, 3.6352579e2, 3.1940692e2, 1.1519485e2, 9.7367989e1, 1.0164168e2, 1.0775472e2, 1.1233539e2, 1.4158466e2, 6.1375110e2, 1.1946843e2, 1.2367524e2, 4.9480072e2, 2.2657356e2];
 const MOSAIC_BACKGROUND_REFERENCE: &[f64] = &[
-    2.5424472e2, 5.0670040e2, 5.8689067e3, 9.8747879e1, 1.0245188e2, 1.0222964e2,
-    3.1747110e2, 1.1775324e2, 9.9335533e1, 1.5773985e2, 2.3785571e3, 1.3038365e2,
-    1.1800996e2, 1.0039601e2, 1.0475277e2, 3.5828067e2, 3.2288803e2, 1.1710192e2,
-    9.7660767e1, 1.0216107e2, 1.0425126e2, 1.0714961e2, 1.4859462e2, 6.1411127e2,
-    1.2025009e2, 1.2104958e2, 4.7897787e2, 2.4683353e2,
+    2.5444598e2,
+    5.0681991e2,
+    5.8689082e3,
+    9.8751671e1,
+    1.0244911e2,
+    1.0171320e2,
+    3.1581039e2,
+    1.1710111e2,
+    9.9339058e1,
+    1.5773672e2,
+    2.3780955e3,
+    1.2924583e2,
+    1.1780296e2,
+    1.0039929e2,
+    1.0475031e2,
+    3.5805563e2,
+    3.2299777e2,
+    1.1788648e2,
+    9.7663734e1,
+    1.0216030e2,
+    1.0442368e2,
+    1.0878123e2,
+    1.5059869e2,
+    6.1411371e2,
+    1.2025177e2,
+    1.2162159e2,
+    4.8166986e2,
+    2.4971623e2,
 ];
 #[rustfmt::skip]
 const SHARED_NEBULA_BACKGROUND: &[f64] = &[
@@ -922,6 +946,44 @@ fn a_mosaic_background_reference_keeps_its_output() {
     );
 }
 
+/// Two interleaved mosaic panels whose every exposure has its own sky
+/// gradient, as light pollution moves through a night. The live pass must
+/// let those gradients average away rather than copy the skies of the
+/// canvas's first frames into the stack.
+#[test]
+fn a_mosaic_with_changing_gradients_keeps_its_live_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = changing_gradient_panels(&directory);
+    let mut options = StackOptions {
+        normalization: NormalizationMode::LocalBackground { tile_size: 32 },
+        rejection: RejectionMode::None,
+        ..StackOptions::default()
+    };
+    options.acceptance.minimum_overlap_fraction = 0.1;
+    let mut stacker = LiveStacker::with_expanding_reference(
+        &paths,
+        CalibrationMasters::default(),
+        options,
+        usize::MAX,
+        |_, _, _, _| Continue::Yes,
+    )
+    .unwrap();
+    for (index, path) in paths.iter().enumerate() {
+        assert!(
+            matches!(
+                stacker.push_fits(path).unwrap(),
+                FrameDisposition::Accepted(_)
+            ),
+            "changing-gradient frame {index} was not accepted"
+        );
+    }
+    check(
+        "MOSAIC_CHANGING_GRADIENTS",
+        &summary(&stacker.snapshot().unwrap().image),
+        MOSAIC_CHANGING_GRADIENTS,
+    );
+}
+
 /// The same broad nebular emission is present in both images, while the
 /// sky gradient differs. Local offsets must compare corresponding samples
 /// so the nebula itself does not become a background correction.
@@ -1452,6 +1514,39 @@ fn narrow_mosaic_panels(directory: &tempfile::TempDir) -> Vec<PathBuf> {
         }
     }
     paths
+}
+
+/// Twelve exposures of each of [`mosaic_panels`]' two panels, interleaved,
+/// each with a linear sky gradient of its own direction.
+fn changing_gradient_panels(directory: &tempfile::TempDir) -> Vec<PathBuf> {
+    let originals = mosaic_panels(directory);
+    let panels = [0, 2].map(|index| {
+        seiza_image_io::read_astronomy(&originals[index])
+            .unwrap()
+            .image
+            .into_physical_f32()
+    });
+    let (width, height) = MOSAIC_PANEL;
+    (0..24)
+        .map(|frame| {
+            // Successive golden angles spread the directions evenly.
+            let angle = frame as f32 * 2.399_963;
+            let (gx, gy) = (30.0 * angle.cos(), 30.0 * angle.sin());
+            let data = panels[frame % 2]
+                .iter()
+                .enumerate()
+                .map(|(index, &sample)| {
+                    let x = (index % width) as f32 / width as f32 - 0.5;
+                    let y = (index / width) as f32 / height as f32 - 0.5;
+                    sample + gx * x + gy * y + noise(index, frame, 0.2)
+                })
+                .collect::<Vec<_>>();
+            let path = directory.path().join(format!("gradient-{frame}.fits"));
+            let image = LinearImage::new(width, height, 1, data).unwrap();
+            write_processed_image_fits_f32(&path, &image, &[], &[]).unwrap();
+            path
+        })
+        .collect()
 }
 
 fn uneven_mosaic_panels(directory: &tempfile::TempDir) -> Vec<PathBuf> {
