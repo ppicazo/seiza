@@ -320,8 +320,16 @@ const PAIRING_PIXELS: [f64; 4] = [6.0, 4.0, 3.0, 2.0];
 
 /// The distortion must take at least this fraction off the residual, and at
 /// least [`MINIMUM_IMPROVEMENT_PIXELS`], or the frames keep their similarities.
-const MAXIMUM_RESIDUAL_RATIO: f64 = 0.7;
-const MINIMUM_IMPROVEMENT_PIXELS: f64 = 0.1;
+///
+/// Star noise alone, with nothing for a lens to explain, leaves the residual
+/// within a fraction of a percent of the similarities': over the thousands
+/// of pairs the overlaps give, a radial distortion's few terms cannot fit
+/// noise. A sharp lens with mild distortion, though, takes only a fifth or so
+/// off a residual that star centroids keep near 0.3 px: a Seestar S50 mosaic
+/// went from 0.369 to 0.287 px, and its stack, corrected, fitted Gaia at
+/// 0.33" rather than 0.62", with stars up to 5% tighter in its corners.
+const MAXIMUM_RESIDUAL_RATIO: f64 = 0.9;
+const MINIMUM_IMPROVEMENT_PIXELS: f64 = 0.05;
 
 /// Bounds on a plausible distortion, as fractions of the frame's half
 /// diagonal: how far it may move a star, and how far its axis may lie from
@@ -1051,10 +1059,20 @@ mod tests {
     fn mosaic(
         projection: Option<Projection>,
     ) -> (LensDistortion, Vec<Pose>, Vec<Vec<DetectedStar>>) {
+        mosaic_with(projection, (0.012, 0.002), 0.1)
+    }
+
+    /// [`mosaic`] through a lens of radial terms `(k1, k2)`, its stars
+    /// scattered uniformly over `jitter` pixels.
+    fn mosaic_with(
+        projection: Option<Projection>,
+        (k1, k2): (f64, f64),
+        jitter: f64,
+    ) -> (LensDistortion, Vec<Pose>, Vec<Vec<DetectedStar>>) {
         let (width, height) = (2000, 1300);
         let mut lens = LensDistortion::none(width, height);
-        lens.k1 = 0.012;
-        lens.k2 = 0.002;
+        lens.k1 = k1;
+        lens.k2 = k2;
         lens.center_x += 40.0;
         lens.center_y += 60.0;
         let offsets = [0.0, 1040.0, 2080.0];
@@ -1109,7 +1127,7 @@ mod tests {
                         let (u, v) = pose.inverse(projection, x, y)?;
                         let (u, v) = lens.distort(u, v);
                         (u >= 0.0 && v >= 0.0 && u < width as f64 && v < height as f64)
-                            .then(|| star(u + (next() - 0.5) * 0.1, v + (next() - 0.5) * 0.1))
+                            .then(|| star(u + (next() - 0.5) * jitter, v + (next() - 0.5) * jitter))
                     })
                     .collect()
             })
@@ -1117,14 +1135,17 @@ mod tests {
         (lens, poses, frames)
     }
 
-    fn check(projection: Option<Projection>) {
-        let (lens, poses, stars) = mosaic(projection);
-        let (width, height) = (2000, 1300);
-        // What a planner would find: each frame's similarity to the anchor
-        // fitted across the whole frame, distortion and all.
-        let frames = poses
+    /// What a planner would find: each frame's similarity to the anchor
+    /// fitted across the whole frame, distortion and all.
+    fn planned<'a>(
+        projection: Option<Projection>,
+        lens: &LensDistortion,
+        poses: &[Pose],
+        stars: &'a [Vec<DetectedStar>],
+    ) -> Vec<LensFrame<'a>> {
+        poses
             .iter()
-            .zip(&stars)
+            .zip(stars)
             .map(|(pose, stars)| {
                 let raw = stars.iter().map(|s| (s.x, s.y)).collect::<Vec<_>>();
                 let sky = raw
@@ -1139,7 +1160,13 @@ mod tests {
                     placement: fit_similarity(&raw, &sky).unwrap(),
                 }
             })
-            .collect::<Vec<_>>();
+            .collect()
+    }
+
+    fn check(projection: Option<Projection>) {
+        let (lens, poses, stars) = mosaic(projection);
+        let (width, height) = (2000, 1300);
+        let frames = planned(projection, &lens, &poses, &stars);
         let fit = estimate(&frames, width, height, projection.map(|p| p.focal)).unwrap();
         assert!(fit.overall_rms < 0.1, "{fit:?}");
         assert!(fit.undistorted_rms > 1.0, "{fit:?}");
@@ -1168,6 +1195,40 @@ mod tests {
             center_x: 999.5,
             center_y: 649.5,
         }));
+    }
+
+    /// A mild lens, its stars scattered as centroids scatter: the distortion
+    /// takes a fifth off the residual, and is fitted, close to the truth.
+    #[test]
+    fn estimate_fits_a_mild_lens_behind_star_noise() {
+        let (lens, poses, stars) = mosaic_with(None, (0.0012, 0.0), 0.6);
+        let frames = planned(None, &lens, &poses, &stars);
+        let fit = estimate(&frames, 2000, 1300, None).unwrap();
+        let ratio = fit.overall_rms / fit.undistorted_rms;
+        assert!(ratio > 0.75 && ratio < 0.85, "{fit:?}");
+        assert!(fit.undistorted_rms - fit.overall_rms < 0.1, "{fit:?}");
+        for (x, y) in [
+            (0.0, 0.0),
+            (1999.0, 0.0),
+            (0.0, 1299.0),
+            (1999.0, 1299.0),
+            (1000.0, 650.0),
+        ] {
+            let (u, v) = fit.distortion.undistort(x, y);
+            let (tu, tv) = lens.undistort(x, y);
+            // The fit may absorb part of the distortion in the poses' scale,
+            // so compare its departure from the frame's own similarity.
+            let shift = (u - x).hypot(v - y) - (tu - x).hypot(tv - y);
+            assert!(shift.abs() < 0.6, "({x}, {y}): {shift}");
+        }
+    }
+
+    /// The same star noise with no lens behind it: nothing to fit.
+    #[test]
+    fn estimate_declines_star_noise_alone() {
+        let (lens, poses, stars) = mosaic_with(None, (0.0, 0.0), 0.6);
+        let frames = planned(None, &lens, &poses, &stars);
+        assert!(estimate(&frames, 2000, 1300, None).is_none());
     }
 
     #[test]

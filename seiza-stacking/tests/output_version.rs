@@ -117,6 +117,40 @@ const LENS_MOSAIC_SIBLINGS: &[f64] = &[
 ];
 #[rustfmt::skip]
 const MOSAIC_CHANGING_GRADIENTS: &[f64] = &[2.5618486e2, 5.0731940e2, 5.8631538e3, 9.9515686e1, 1.0304424e2, 1.0594209e2, 3.6188834e2, 1.1663352e2, 9.9784561e1, 1.5832272e2, 2.3292229e3, 1.4172540e2, 1.1663142e2, 1.0048741e2, 1.0461007e2, 3.6352579e2, 3.1940692e2, 1.1519485e2, 9.7367989e1, 1.0164168e2, 1.0775472e2, 1.1233539e2, 1.4158466e2, 6.1375110e2, 1.1946843e2, 1.2367524e2, 4.9480072e2, 2.2657356e2];
+const MILD_LENS_MOSAIC: &[f64] = &[
+    1.2961286e2,
+    1.6208965e2,
+    4.5229419e3,
+    1.1021458e2,
+    9.6230270e1,
+    9.4510620e1,
+    9.8815392e1,
+    8.9425873e1,
+    9.1626221e1,
+    9.0163712e1,
+    1.0253673e2,
+    1.0871326e2,
+    1.3086557e2,
+    1.0036616e2,
+    1.0005003e2,
+    1.4361838e2,
+    1.1466187e2,
+    1.0847977e2,
+    1.1012643e2,
+    9.3992554e1,
+    1.2721870e2,
+    9.7976517e1,
+    5.2863477e2,
+    1.1205984e2,
+    1.1021914e2,
+    9.6290451e1,
+    1.0917767e2,
+    9.0285599e1,
+    1.0000000e0,
+    8.0000000e0,
+    9.0300000e2,
+    7.0300000e2,
+];
 const MOSAIC_BACKGROUND_REFERENCE: &[f64] = &[
     2.5444598e2,
     5.0681991e2,
@@ -984,6 +1018,53 @@ fn a_mosaic_with_changing_gradients_keeps_its_live_output() {
     );
 }
 
+/// Four panels in a square through a telephoto lens with mild distortion,
+/// its stars as faint as a short exposure's. The distortion takes less than a
+/// fifth off the residual the panels' similarities leave, which star
+/// centroids keep near 0.3 px: real, and enough to soften a mosaic's corners.
+#[test]
+fn a_mildly_distorted_lens_mosaic_keeps_its_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = lens_panels(&directory, (0.003, 0.0), 40.0, 8000, 1, (2, 2), 20.0);
+    let mut options = StackOptions {
+        normalization: NormalizationMode::None,
+        ..StackOptions::default()
+    };
+    options.acceptance.minimum_overlap_fraction = 0.1;
+    let mut stacker = LiveStacker::with_expanding_reference(
+        &paths,
+        CalibrationMasters::default(),
+        options,
+        usize::MAX,
+        |_, _, _, _| Continue::Yes,
+    )
+    .unwrap();
+    let lens = stacker.expanded_lens().is_some();
+    for (index, path) in paths.iter().enumerate() {
+        assert!(
+            matches!(
+                stacker.push_fits(path).unwrap(),
+                FrameDisposition::Accepted(_)
+            ),
+            "mild lens mosaic frame {index} was not accepted"
+        );
+    }
+    let mut snapshot = stacker.snapshot().unwrap();
+    for sample in &mut snapshot.image.data {
+        if !sample.is_finite() {
+            *sample = 0.0;
+        }
+    }
+    let mut fingerprint = summary(&snapshot.image);
+    fingerprint.extend([
+        f64::from(u8::from(lens)),
+        f64::from(snapshot.accepted_frames),
+        snapshot.image.width as f64,
+        snapshot.image.height as f64,
+    ]);
+    check("MILD_LENS_MOSAIC", &fingerprint, MILD_LENS_MOSAIC);
+}
+
 /// The same broad nebular emission is present in both images, while the
 /// sky gradient differs. Local offsets must compare corresponding samples
 /// so the nebula itself does not become a background correction.
@@ -1405,40 +1486,65 @@ fn mosaic_panels(directory: &tempfile::TempDir) -> Vec<PathBuf> {
 /// rather than translated on a flat plane, so panel-edge registration has
 /// a measurable nonlinear component after the lens rebuilds the canvas.
 fn projected_lens_panels(directory: &tempfile::TempDir) -> Vec<PathBuf> {
-    let (width, height) = (600, 400);
-    let (cx, cy) = (323.5, 181.5);
-    let focal = 2400.0_f64;
+    lens_panels(directory, (0.02, 0.004), 5.0, 4000, 1, (3, 1), 1.0)
+}
+
+/// [`projected_lens_panels`] through a lens whose radial terms, in units of
+/// the squared half diagonal, are `(k1, k2)`, with `stars` stars over sky
+/// noise of `sigma`, every length `scale` times as long.
+fn lens_panels(
+    directory: &tempfile::TempDir,
+    (k1, k2): (f64, f64),
+    sigma: f32,
+    stars: usize,
+    scale: usize,
+    (rows, columns): (usize, usize),
+    telephoto: f64,
+) -> Vec<PathBuf> {
+    let size = scale as f64;
+    let (width, height) = (600 * scale, 400 * scale);
+    let (cx, cy) = (323.5 * size, 181.5 * size);
+    let focal = 2400.0 * size * telephoto;
     let radius_squared = (width * width + height * height) as f64 * 0.25;
     let mut state = 7_u32;
     let mut next = || {
         state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
         (state >> 8) as f64 / (1 << 24) as f64
     };
-    let stars = (0..4000)
+    let field = (0..stars)
         .map(|_| {
             (
-                -10.0 + next() * 620.0,
-                -10.0 + next() * 1050.0,
+                (-10.0 + next() * (600 + (columns - 1) * 300 + 20) as f64) * size,
+                (-10.0 + next() * (400 + (rows - 1) * 300 + 50) as f64) * size,
                 200.0 + 5.0 / (0.01 + next()).powf(1.5),
             )
         })
         .collect::<Vec<_>>();
     let mut paths = Vec::new();
-    for panel in 0..3 {
+    for panel in 0..rows * columns {
+        let (row, column) = (panel / columns, panel % columns);
+        // A second column turns the camera about the frame's vertical axis.
+        let (sin_x, cos_x) = ((column as f64 * 300.0 * size) / focal).atan().sin_cos();
         for dither in 0..2 {
             let frame = panel * 2 + dither;
-            let angle = ((panel as f64 * 300.0 + dither as f64 * 2.3) / focal).atan();
+            let angle = ((row as f64 * 300.0 * size + dither as f64 * 2.3) / focal).atan();
             let (sin, cos) = angle.sin_cos();
             let mut data = (0..width * height)
-                .map(|index| 100.0 + noise(index, frame, 5.0))
+                .map(|index| 100.0 + noise(index, frame, sigma))
                 .collect::<Vec<_>>();
-            for &(sky_x, sky_y, peak) in &stars {
+            for &(sky_x, sky_y, peak) in &field {
+                let ray_x = sky_x - cx - dither as f64 * 3.1;
                 let ray_y = sky_y - cy;
-                let depth = sin * ray_y + cos * focal;
-                let u = focal * (sky_x - cx - dither as f64 * 3.1) / depth;
+                let mut depth = sin * ray_y + cos * focal;
+                let mut across = ray_x;
+                if column > 0 {
+                    (across, depth) =
+                        (cos_x * ray_x - sin_x * depth, sin_x * ray_x + cos_x * depth);
+                }
+                let u = focal * across / depth;
                 let v = focal * (cos * ray_y - sin * focal) / depth;
                 let q = (u * u + v * v) / radius_squared;
-                let factor = 1.0 + 0.02 * q + 0.004 * q * q;
+                let factor = 1.0 + k1 * q + k2 * q * q;
                 let (sx, sy) = (cx + u * factor, cy + v * factor);
                 if sx < -5.0 || sy < -5.0 || sx > width as f64 + 5.0 || sy > height as f64 + 5.0 {
                     continue;
@@ -1455,8 +1561,8 @@ fn projected_lens_panels(directory: &tempfile::TempDir) -> Vec<PathBuf> {
             let path = directory.path().join(format!("lens-{panel}-{dither}.fits"));
             let image = LinearImage::new(width, height, 1, data).unwrap();
             let headers = [
-                ("FOCALLEN".into(), HeaderValue::Float(12.0)),
-                ("XPIXSZ".into(), HeaderValue::Float(5.0)),
+                ("FOCALLEN".into(), HeaderValue::Float(12.0 * telephoto)),
+                ("XPIXSZ".into(), HeaderValue::Float(5.0 / size)),
             ];
             write_processed_image_fits_f32(&path, &image, &headers, &[]).unwrap();
             paths.push(path);
