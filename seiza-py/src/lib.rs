@@ -107,10 +107,11 @@ impl From<DetectedStar> for Star {
 }
 
 enum CatalogBackend {
-    /// A star tile file, and the proper motions beside it when it has them.
+    /// A star tile file, and the proper motions beside it when it has them;
+    /// boxed, as the tile file's index dwarfs an in-memory catalog's handle.
     Tiles(
-        seiza::catalog::TileCatalog,
-        Option<seiza::catalog::ProperMotions>,
+        Box<seiza::catalog::TileCatalog>,
+        Option<Box<seiza::catalog::ProperMotions>>,
     ),
     Memory(MemoryCatalog),
 }
@@ -118,7 +119,7 @@ enum CatalogBackend {
 impl CatalogBackend {
     fn as_trait(&self) -> &(dyn StarCatalogTrait + Sync) {
         match self {
-            Self::Tiles(catalog, _) => catalog,
+            Self::Tiles(catalog, _) => catalog.as_ref(),
             Self::Memory(catalog) => catalog,
         }
     }
@@ -128,7 +129,7 @@ impl CatalogBackend {
     fn at_epoch(&self, epoch: Option<f64>) -> SearchedCatalog<'_> {
         match self {
             Self::Tiles(catalog, motions) => SearchedCatalog::Dated(
-                seiza::catalog::DatedCatalog::new(catalog, motions.as_ref(), epoch),
+                seiza::catalog::DatedCatalog::new(catalog, motions.as_deref(), epoch),
             ),
             Self::Memory(catalog) => SearchedCatalog::Memory(catalog),
         }
@@ -195,7 +196,7 @@ impl PyStarCatalog {
                 ))
             })?;
         Ok(Self {
-            backend: CatalogBackend::Tiles(catalog, motions),
+            backend: CatalogBackend::Tiles(Box::new(catalog), motions.map(Box::new)),
         })
     }
 
