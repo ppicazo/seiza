@@ -943,7 +943,8 @@ bool seiza_color_calibration_apply(float *data,
 /*
  Render neutral, in place, the pixels of an interleaved linear RGB image
  a stack's clipped raw samples reached: each pixel's channels rise toward
- its brightest channel by a smooth step of its clipped fraction. Run it
+ its brightest channel by a smooth step of its clipped fraction, the map
+ feathered over a few pixels so a neutral core fades into its halo. Run it
  after colour calibration, on the calibrated image. `clipped` is the mono
  map [`seiza_live_stacker_clipped_fraction`] gives, `clipped_width` by
  `clipped_height` floats, on the image's grid or one it is a whole

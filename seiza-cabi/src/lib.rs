@@ -2949,7 +2949,8 @@ pub unsafe extern "C" fn seiza_color_calibration_apply(
 #[unsafe(no_mangle)]
 /// Render neutral, in place, the pixels of an interleaved linear RGB image
 /// a stack's clipped raw samples reached: each pixel's channels rise toward
-/// its brightest channel by a smooth step of its clipped fraction. Run it
+/// its brightest channel by a smooth step of its clipped fraction, the map
+/// feathered over a few pixels so a neutral core fades into its halo. Run it
 /// after colour calibration, on the calibrated image. `clipped` is the mono
 /// map [`seiza_live_stacker_clipped_fraction`] gives, `clipped_width` by
 /// `clipped_height` floats, on the image's grid or one it is a whole
@@ -17093,34 +17094,37 @@ fi
     /// rows, stretches, and reports why when it cannot calibrate.
     #[test]
     fn color_neutralize_clipped_cabi_renders_clipped_pixels_neutral() {
-        let mut data = vec![700.0_f32, 800.0, 780.0, 10.0, 20.0, 15.0];
-        let clipped = [1.0_f32, 0.0];
+        // A clipped core, then sky beyond the feather's reach.
+        let mut data = [700.0_f32, 800.0, 780.0].to_vec();
+        data.extend([10.0_f32, 20.0, 15.0].repeat(8));
+        let mut clipped = [0.0_f32; 9];
+        clipped[0] = 1.0;
         let mut error = ptr::null_mut();
         assert!(unsafe {
             seiza_color_neutralize_clipped(
                 data.as_mut_ptr(),
                 data.len(),
-                2,
+                9,
                 1,
                 clipped.as_ptr(),
-                2,
+                9,
                 1,
                 &mut error,
             )
         });
         assert!(error.is_null());
         assert_eq!(data[..3], [800.0; 3]);
-        assert_eq!(data[3..], [10.0, 20.0, 15.0]);
+        assert_eq!(data[8 * 3..], [10.0, 20.0, 15.0]);
         // A map whose width does not divide the image's.
-        let wide = [0.0_f32; 3];
+        let wide = [0.0_f32; 2];
         assert!(!unsafe {
             seiza_color_neutralize_clipped(
                 data.as_mut_ptr(),
                 data.len(),
-                2,
+                9,
                 1,
                 wide.as_ptr(),
-                3,
+                2,
                 1,
                 &mut error,
             )

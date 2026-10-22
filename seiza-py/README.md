@@ -396,7 +396,8 @@ unknown (it comes from `SATURATE`, `SATLEVEL`, or the frames' integer
 encoding). Pass it as `clipped=` to `calibrate_and_stretch`, or to
 `seiza.neutralize_clipped(calibrated, clipped)` after `calibration.apply`,
 and those pixels come out neutral: each pixel's channels rise toward its
-brightest, fully from a share of one half. A drizzled stack takes the live
+brightest, fully from a share of one half, and the map is feathered over a
+few pixels so a white core fades into its star's halo. A drizzled stack takes the live
 stack's map as it is; each of its pixels reads the map pixel it lies in.
 
 ## Image stacking
