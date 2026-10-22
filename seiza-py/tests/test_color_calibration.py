@@ -191,13 +191,18 @@ def test_calibrate_and_stretch_still_stretches_when_it_cannot_calibrate(tmp_path
 def test_neutralize_clipped_renders_a_stacks_clipped_pixels_neutral():
     tinted = [700.0, 800.0, 780.0]
     sky = [10.0, 20.0, 15.0]
-    image = np.array([[tinted, sky]], dtype=np.float32)
-    neutral = seiza.neutralize_clipped(image, np.array([[1.0, 0.0]], dtype=np.float32))
+    # A clipped core and its halo, then sky beyond the feather's reach.
+    image = np.array([[tinted, tinted] + [sky] * 7], dtype=np.float32)
+    clipped = np.zeros((1, 9), dtype=np.float32)
+    clipped[0, 0] = 1.0
+    neutral = seiza.neutralize_clipped(image, clipped)
     np.testing.assert_array_equal(neutral[0, 0], [800.0, 800.0, 800.0])
-    np.testing.assert_array_equal(neutral[0, 1], sky)
+    # The feather reaches the core's neighbour part way.
+    assert 700.0 < neutral[0, 1, 0] < 800.0
+    np.testing.assert_array_equal(neutral[0, 8], sky)
     np.testing.assert_array_equal(image[0, 0], tinted)
     with pytest.raises(ValueError, match="does not fit"):
-        seiza.neutralize_clipped(image, np.zeros((1, 3), dtype=np.float32))
+        seiza.neutralize_clipped(image, np.zeros((1, 2), dtype=np.float32))
 
     # A map that clips nothing leaves calibrate_and_stretch's result alone.
     field, wcs, gaia = synthetic_field()

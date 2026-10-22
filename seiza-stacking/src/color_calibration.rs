@@ -274,6 +274,14 @@ pub fn apply_color_gains(samples: &mut [f32], gains: [f32; 3], offsets: [f32; 3]
 /// level in each channel, which colour calibration's gains would tint. Run
 /// it after calibration, on the calibrated image.
 ///
+/// A star clipped in every frame has a core whose fraction steps from one
+/// to nothing within a pixel or two, and a neutral core set hard against
+/// its coloured halo reads as a disc pasted on. So the map is feathered
+/// first: each pixel takes the larger of its own fraction and the
+/// fraction blurred over [`CLIPPED_FEATHER`], which leaves a fully clipped
+/// core fully neutral and fades the neutral into the halo over a few
+/// pixels.
+///
 /// `clipped` is a mono map of the image's grid, or of a grid it is a whole
 /// multiple of, such as a drizzled stack's: each pixel reads the map's pixel
 /// it lies in. Channels only rise; pixels with a non-finite sample, and
@@ -300,17 +308,21 @@ pub fn neutralize_clipped(image: &mut LinearImage, clipped: &LinearImage) -> Res
     let (x_scale, y_scale) = (image.width / clipped.width, image.height / clipped.height);
     let (start, end) = CLIPPED_FADE;
     let width = image.width;
+    let feathered = feathered(clipped);
     image
         .data
         .par_chunks_mut(width * 3)
         .enumerate()
         .for_each(|(y, row)| {
-            let map_row = &clipped.data[(y / y_scale) * clipped.width..][..clipped.width];
+            let start_of_row = (y / y_scale) * clipped.width;
+            let map_row = &clipped.data[start_of_row..][..clipped.width];
+            let feathered_row = &feathered[start_of_row..][..clipped.width];
             for (x, pixel) in row.as_chunks_mut::<3>().0.iter_mut().enumerate() {
-                let fraction = map_row[x / x_scale];
-                if !fraction.is_finite() || pixel.iter().any(|value| !value.is_finite()) {
+                if !map_row[x / x_scale].is_finite() || pixel.iter().any(|value| !value.is_finite())
+                {
                     continue;
                 }
+                let fraction = feathered_row[x / x_scale];
                 let t = ((fraction - start) / (end - start)).clamp(0.0, 1.0);
                 let weight = t * t * (3.0 - 2.0 * t);
                 if weight <= 0.0 {
@@ -330,6 +342,76 @@ pub fn neutralize_clipped(image: &mut LinearImage, clipped: &LinearImage) -> Res
 /// clipped core reaches every frame; a pixel a few frames clipped in, at a
 /// star's edge, keeps most of its colour.
 const CLIPPED_FADE: (f32, f32) = (0.05, 0.5);
+
+/// The radius, in map pixels, of the box [`neutralize_clipped`] blurs its
+/// map with, twice: about a Gaussian of two pixels' sigma, reaching four.
+const CLIPPED_FEATHER: usize = 2;
+
+/// `map` with each fraction raised to its blur over [`CLIPPED_FEATHER`]
+/// where that is larger, reading a non-finite fraction as none.
+fn feathered(map: &LinearImage) -> Vec<f32> {
+    let (width, height) = (map.width, map.height);
+    let base = map
+        .data
+        .iter()
+        .map(|&value| {
+            if value.is_finite() {
+                value.clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut blurred = base.clone();
+    for _ in 0..2 {
+        blurred = box_blur(&blurred, width, height, CLIPPED_FEATHER);
+    }
+    base.iter()
+        .zip(&blurred)
+        .map(|(&value, &blur)| value.max(blur))
+        .collect()
+}
+
+/// The mean of each value's `(2 radius + 1)`-square box, the box cut short
+/// at the edges, rows then columns.
+fn box_blur(values: &[f32], width: usize, height: usize, radius: usize) -> Vec<f32> {
+    let line = |input: &[f32], output: &mut [f32]| {
+        let length = input.len();
+        let mut sum = input[..radius.min(length)].iter().sum::<f32>();
+        for (index, value) in output.iter_mut().enumerate() {
+            if index + radius < length {
+                sum += input[index + radius];
+            }
+            if index > radius {
+                sum -= input[index - radius - 1];
+            }
+            let count = (index + radius + 1).min(length) - index.saturating_sub(radius);
+            *value = sum / count as f32;
+        }
+    };
+    let mut rows = vec![0.0_f32; values.len()];
+    rows.par_chunks_mut(width)
+        .zip(values.par_chunks(width))
+        .for_each(|(output, input)| line(input, output));
+    let mut transposed = vec![0.0_f32; values.len()];
+    for (y, row) in rows.chunks(width).enumerate() {
+        for (x, &value) in row.iter().enumerate() {
+            transposed[x * height + y] = value;
+        }
+    }
+    let mut columns = vec![0.0_f32; values.len()];
+    columns
+        .par_chunks_mut(height)
+        .zip(transposed.par_chunks(height))
+        .for_each(|(output, input)| line(input, output));
+    let mut blurred = vec![0.0_f32; values.len()];
+    for (x, column) in columns.chunks(height).enumerate() {
+        for (y, &value) in column.iter().enumerate() {
+            blurred[y * width + x] = value;
+        }
+    }
+    blurred
+}
 
 /// Fit channel gains (and background offsets) that render a star of the
 /// white reference's colour neutral, from catalogue stars on the image.
@@ -1416,15 +1498,25 @@ mod tests {
     /// whole fraction of the image's size is read at its own scale.
     #[test]
     fn neutralize_clipped_fades_clipped_pixels_to_their_brightest_channel() {
-        // Two pixels wide, one high: a tinted clipped core, then sky.
+        // A row of nine: a tinted clipped core and halo, then sky.
         let tinted = [700.0_f32, 800.0, 780.0];
         let sky = [10.0_f32, 20.0, 15.0];
-        let mut image =
-            LinearImage::new(2, 1, 3, tinted.iter().chain(&sky).copied().collect()).unwrap();
-        let map = LinearImage::new(2, 1, 1, vec![1.0, 0.0]).unwrap();
+        let mut row = tinted.repeat(2);
+        row.extend(sky.repeat(7));
+        let mut image = LinearImage::new(9, 1, 3, row).unwrap();
+        let mut marks = vec![0.0_f32; 9];
+        marks[0] = 1.0;
+        let map = LinearImage::new(9, 1, 1, marks).unwrap();
         neutralize_clipped(&mut image, &map).unwrap();
         assert_eq!(image.data[..3], [800.0; 3]);
-        assert_eq!(image.data[3..], sky);
+        // The feather reaches the core's neighbour part way.
+        assert!(
+            image.data[3] > 700.0 && image.data[3] < 800.0,
+            "{:?}",
+            &image.data[3..6]
+        );
+        // Beyond the feather's reach, the sky keeps its colour.
+        assert_eq!(image.data[8 * 3..], sky);
 
         // Partly clipped: raised toward the brightest channel, not all the way.
         let mut image = LinearImage::new(1, 1, 3, tinted.to_vec()).unwrap();

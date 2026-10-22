@@ -621,7 +621,8 @@ fn calibrate_and_stretch(
 /// Render neutral the pixels of a linear `(height, width, 3)` image a
 /// stack's clipped raw samples reached, and return the result: each pixel's
 /// channels rise toward its brightest channel by a smooth step of its
-/// clipped fraction, none at 5% and all the way from 50%. Run it after
+/// clipped fraction, none at 5% and all the way from 50%, the map feathered
+/// over a few pixels so a neutral core fades into its halo. Run it after
 /// colour calibration. `clipped` is the `(height, width)` map
 /// `LiveStacker.clipped_fraction()` gives, on the image's grid or one it is
 /// a whole multiple of, such as a drizzled stack's.
