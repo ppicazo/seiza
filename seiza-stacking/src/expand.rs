@@ -120,6 +120,14 @@ const LENS_STARS: usize = 8_000;
 /// stands for, over the frame, before the lens model is abandoned.
 const MAXIMUM_GEOMETRY_ERROR_PIXELS: f64 = 0.02;
 
+/// How far the polynomial seeding a joined frame's registration through the
+/// lens may stray from its fitted pose. The seed only predicts where each
+/// star lies, for pairing within the registrar's 2 px, and the stars then
+/// fit the warp, so it need not place pixels as a panel start does; a seed
+/// it refused cost the frame a second blind match. On 129 Seestar frames,
+/// the poses' polynomials missed the start's bound by up to 0.05 px on 70.
+const SEED_GEOMETRY_ERROR_PIXELS: f64 = 0.2;
+
 /// Columns and rows of the grid of a panel start's pixels its polynomial is
 /// fitted through.
 const GEOMETRY_GRID: (usize, usize) = (24, 16);
@@ -2138,6 +2146,7 @@ impl Plan {
             &grid,
             &validation,
             scale,
+            SEED_GEOMETRY_ERROR_PIXELS,
         )
         .ok()?;
         Some(RegistrationResult {
@@ -2214,6 +2223,7 @@ impl Plan {
             &grid,
             &validation,
             options.scale(),
+            MAXIMUM_GEOMETRY_ERROR_PIXELS,
         )?;
         let warp = polynomial
             .translated(region_x, region_y)
@@ -2320,9 +2330,10 @@ impl Plan {
             seed.warp = seed
                 .warp
                 .map(|warp| warp.translated(self.origin.0, self.origin.1));
-            let result = self.windows[window].refine_warp(seed, &stars).ok_or_else(|| {
-                Error::Registration("projected registration has too few reliable stars to refine; frame was not integrated".into())
-            })?;
+            let (result, window) =
+                self.register_seeded(seed, &stars, (width, height), &lens).ok_or_else(|| {
+                    Error::Registration("projected registration has too few reliable stars to refine; frame was not integrated".into())
+                })?;
             Some((admissible(result, options)?, window, 1.0))
         } else {
             None
@@ -2355,6 +2366,58 @@ impl Plan {
             self.windows[window].warp(&mut registration, &stars);
         }
         Ok(through_lens(registration, Some(lens)))
+    }
+
+    /// Register a joined frame's undistorted `stars` from the `seed` its
+    /// first placement and its panel start's pose predict, in place of a
+    /// second blind match. The seed pairs stars on every panel, and the
+    /// panel pairing the most takes the frame: a frame's own panel may share
+    /// only a strip of it with the frame. The similarity then follows that
+    /// panel's star-fitted warp across the `size` frame, where the seed's
+    /// came from a pose fitted before the lens and can sit pixels off, and the
+    /// warp is fitted through it as an unseeded registration's is.
+    fn register_seeded(
+        &self,
+        seed: RegistrationResult,
+        stars: &[DetectedStar],
+        (width, height): (usize, usize),
+        lens: &LensDistortion,
+    ) -> Option<(RegistrationResult, usize)> {
+        let (mut result, window) = self
+            .windows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, window)| Some((window.refine_warp(seed.clone(), stars)?, index)))
+            .max_by_key(|(result, _)| result.matched_stars)?;
+        if let Some(warp) = &result.warp {
+            let (from, to): (Vec<_>, Vec<_>) = (0..=GEOMETRY_GRID.1)
+                .flat_map(|row| (0..=GEOMETRY_GRID.0).map(move |column| (row, column)))
+                .map(|(row, column)| {
+                    let (u, v) = lens.undistort(
+                        (width - 1) as f64 * column as f64 / GEOMETRY_GRID.0 as f64,
+                        (height - 1) as f64 * row as f64 / GEOMETRY_GRID.1 as f64,
+                    );
+                    let (x, y) = result.transform.apply(u, v);
+                    (warp.apply(x, y), (x, y))
+                })
+                .unzip();
+            if let Some(transform) = crate::lens::fit_similarity(&from, &to) {
+                result.transform = transform;
+            }
+        }
+        let mut refitted = RegistrationResult {
+            warp: None,
+            ..result.clone()
+        };
+        self.windows[window].warp(&mut refitted, stars);
+        Some((
+            if refitted.warp.is_some() {
+                refitted
+            } else {
+                result
+            },
+            window,
+        ))
     }
 
     /// Move the canvas into a larger one, `dx` and `dy` from its origin.
@@ -2466,15 +2529,16 @@ fn point_bounds(points: &[(f64, f64)]) -> (f64, f64, f64, f64) {
 
 /// Keep the simplest approximation meeting the same accuracy bound on both
 /// the fit nodes and independent nodes between them: in working pixels,
-/// binned at `scale`, [`MAXIMUM_GEOMETRY_ERROR_PIXELS`] of the sensor's.
+/// binned at `scale`, `limit` of the sensor's.
 fn fit_panel_geometry(
     width: usize,
     height: usize,
     grid: &[crate::registration::PointPair],
     validation: &[crate::registration::PointPair],
     scale: Scale,
+    limit: f64,
 ) -> Result<PolynomialWarp> {
-    let limit = scale.length(MAXIMUM_GEOMETRY_ERROR_PIXELS);
+    let limit = scale.length(limit);
     let mut worst = f64::INFINITY;
     for order in [2, 3] {
         let Some(warp) = PolynomialWarp::fit(order, width, height, grid) else {
@@ -2973,7 +3037,15 @@ mod tests {
             let (a, b) = quadratic.apply(x, y);
             (a - u).hypot(b - v) > MAXIMUM_GEOMETRY_ERROR_PIXELS
         }));
-        let warp = fit_panel_geometry(width, height, &grid, &validation, Scale::NATIVE).unwrap();
+        let warp = fit_panel_geometry(
+            width,
+            height,
+            &grid,
+            &validation,
+            Scale::NATIVE,
+            MAXIMUM_GEOMETRY_ERROR_PIXELS,
+        )
+        .unwrap();
         assert_eq!(warp.order(), 3);
         warp.validate().unwrap();
         // Saved warps, including the compact context payload, must replay
@@ -2992,7 +3064,17 @@ mod tests {
         // Independent checks must also be allowed to veto the fit.
         let mut inconsistent = validation.clone();
         inconsistent[0].1.0 += 1.0;
-        assert!(fit_panel_geometry(width, height, &grid, &inconsistent, Scale::NATIVE).is_err());
+        assert!(
+            fit_panel_geometry(
+                width,
+                height,
+                &grid,
+                &inconsistent,
+                Scale::NATIVE,
+                MAXIMUM_GEOMETRY_ERROR_PIXELS,
+            )
+            .is_err()
+        );
     }
 
     fn optical_frame(camera: &str, filter: &str, date: &str) -> FitsFrame {
