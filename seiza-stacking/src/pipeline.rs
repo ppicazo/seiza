@@ -897,6 +897,7 @@ fn prepare_decoded(
     }
     // Recorded after the rescale, which a replay repeats.
     let source = crate::replay::FrameSource::of(&frame);
+    let clipped = crate::saturation::raw_clip_mask(&frame);
     let (frame, cfa) = match crate::stack::prepare_light(
         frame,
         half.calibration,
@@ -921,6 +922,7 @@ fn prepare_decoded(
         frame.image,
         cfa,
         half.frame_cache.filter(|_| source.is_some()),
+        crate::stack::developed_clip_mask(clipped, cfa, half.options),
     )?
     .with_source(source))
 }

@@ -265,6 +265,72 @@ pub fn apply_color_gains(samples: &mut [f32], gains: [f32; 3], offsets: [f32; 3]
     Ok(())
 }
 
+/// Render neutral the pixels a stack's clipped raw samples reached, as
+/// [`crate::LiveStacker::clipped_fraction`] gives them: each pixel's
+/// channels rise toward its brightest channel by a smooth step of its
+/// clipped fraction, from none at [`CLIPPED_FADE`]'s first fraction to all
+/// the way at its second. A clipped sample records only that the sky was at
+/// least that bright, and a stack leaves a clipped star core at a different
+/// level in each channel, which colour calibration's gains would tint. Run
+/// it after calibration, on the calibrated image.
+///
+/// `clipped` is a mono map of the image's grid, or of a grid it is a whole
+/// multiple of, such as a drizzled stack's: each pixel reads the map's pixel
+/// it lies in. Channels only rise; pixels with a non-finite sample, and
+/// those the map does not reach, are left as they are. Fails unless the
+/// image is RGB and the map mono, with each of its sides dividing the
+/// image's.
+pub fn neutralize_clipped(image: &mut LinearImage, clipped: &LinearImage) -> Result<()> {
+    if image.channels != 3 {
+        return Err(Error::Color(
+            "only an RGB image's clipped pixels can be rendered neutral".into(),
+        ));
+    }
+    if clipped.channels != 1
+        || clipped.width == 0
+        || clipped.height == 0
+        || !image.width.is_multiple_of(clipped.width)
+        || !image.height.is_multiple_of(clipped.height)
+    {
+        return Err(Error::Color(format!(
+            "a {}x{} clipped map does not fit a {}x{} image",
+            clipped.width, clipped.height, image.width, image.height
+        )));
+    }
+    let (x_scale, y_scale) = (image.width / clipped.width, image.height / clipped.height);
+    let (start, end) = CLIPPED_FADE;
+    let width = image.width;
+    image
+        .data
+        .par_chunks_mut(width * 3)
+        .enumerate()
+        .for_each(|(y, row)| {
+            let map_row = &clipped.data[(y / y_scale) * clipped.width..][..clipped.width];
+            for (x, pixel) in row.chunks_exact_mut(3).enumerate() {
+                let fraction = map_row[x / x_scale];
+                if !fraction.is_finite() || pixel.iter().any(|value| !value.is_finite()) {
+                    continue;
+                }
+                let t = ((fraction - start) / (end - start)).clamp(0.0, 1.0);
+                let weight = t * t * (3.0 - 2.0 * t);
+                if weight <= 0.0 {
+                    continue;
+                }
+                let top = pixel.iter().copied().fold(f32::MIN, f32::max);
+                for value in pixel.iter_mut() {
+                    *value += weight * (top - *value);
+                }
+            }
+        });
+    Ok(())
+}
+
+/// The clipped fractions over which [`neutralize_clipped`] fades a pixel to
+/// neutral: none at or below the first, all the way from the second. A
+/// clipped core reaches every frame; a pixel a few frames clipped in, at a
+/// star's edge, keeps most of its colour.
+const CLIPPED_FADE: (f32, f32) = (0.05, 0.5);
+
 /// Fit channel gains (and background offsets) that render a star of the
 /// white reference's colour neutral, from catalogue stars on the image.
 ///
@@ -711,8 +777,12 @@ pub fn calibrate_and_stretch(
     gaia: GaiaColors<'_>,
     options: &ColorCalibrationOptions,
     stretch: &StretchStack,
+    clipped: Option<&LinearImage>,
 ) -> Result<CalibratedStretch> {
     let calibration = calibrate_color_image(&mut image, wcs, gaia, options);
+    if let Some(clipped) = clipped {
+        neutralize_clipped(&mut image, clipped)?;
+    }
     let mut linked_stages = Vec::new();
     let relinked;
     let stretch = if calibration.calibration().is_some() {
@@ -1341,6 +1411,51 @@ mod tests {
         assert!(apply_color_gains(&mut [1.0; 3], [f32::INFINITY, 1.0, 1.0], [0.0; 3]).is_err());
     }
 
+    /// A clipped core comes out neutral, untouched sky keeps its colour, a
+    /// partly clipped pixel rises part way and never falls, and a map at a
+    /// whole fraction of the image's size is read at its own scale.
+    #[test]
+    fn neutralize_clipped_fades_clipped_pixels_to_their_brightest_channel() {
+        // Two pixels wide, one high: a tinted clipped core, then sky.
+        let tinted = [700.0_f32, 800.0, 780.0];
+        let sky = [10.0_f32, 20.0, 15.0];
+        let mut image =
+            LinearImage::new(2, 1, 3, tinted.iter().chain(&sky).copied().collect()).unwrap();
+        let map = LinearImage::new(2, 1, 1, vec![1.0, 0.0]).unwrap();
+        neutralize_clipped(&mut image, &map).unwrap();
+        assert_eq!(image.data[..3], [800.0; 3]);
+        assert_eq!(image.data[3..], sky);
+
+        // Partly clipped: raised toward the brightest channel, not all the way.
+        let mut image = LinearImage::new(1, 1, 3, tinted.to_vec()).unwrap();
+        let map = LinearImage::new(1, 1, 1, vec![0.25]).unwrap();
+        neutralize_clipped(&mut image, &map).unwrap();
+        for (channel, (&value, &before)) in image.data.iter().zip(&tinted).enumerate() {
+            assert!(value >= before && value <= 800.0, "{channel}: {value}");
+        }
+        assert!(image.data[0] > 700.0 && image.data[0] < 800.0);
+
+        // A 2x2 image read from a 1x1 map, as a drizzled stack is.
+        let mut image = LinearImage::new(2, 2, 3, tinted.repeat(4)).unwrap();
+        let map = LinearImage::new(1, 1, 1, vec![1.0]).unwrap();
+        neutralize_clipped(&mut image, &map).unwrap();
+        assert!(image.data.iter().all(|&value| value == 800.0));
+
+        // A map that does not divide the image, or an image not RGB.
+        let mut image = LinearImage::new(3, 1, 3, vec![1.0; 9]).unwrap();
+        assert!(
+            neutralize_clipped(
+                &mut image,
+                &LinearImage::new(2, 1, 1, vec![0.0; 2]).unwrap()
+            )
+            .is_err()
+        );
+        let mut mono = LinearImage::new(1, 1, 1, vec![1.0]).unwrap();
+        assert!(
+            neutralize_clipped(&mut mono, &LinearImage::new(1, 1, 1, vec![1.0]).unwrap()).is_err()
+        );
+    }
+
     #[test]
     fn proper_motion_moves_the_star_to_the_observation_epoch() {
         let wcs =
@@ -1508,6 +1623,7 @@ mod tests {
             GaiaColors::CatalogPath(Some(directory.path())),
             &ColorCalibrationOptions::default(),
             &auto_stretch(),
+            None,
         )
         .unwrap();
         let calibration = result.calibration.calibration().expect("calibrated");
@@ -1583,7 +1699,7 @@ mod tests {
         let options = ColorCalibrationOptions::default();
 
         let calibrated =
-            calibrate_and_stretch(image.clone(), Some(&wcs), gaia, &options, &stack).unwrap();
+            calibrate_and_stretch(image.clone(), Some(&wcs), gaia, &options, &stack, None).unwrap();
         assert!(calibrated.calibration.calibration().is_some());
         assert_eq!(calibrated.linked_stages, vec![0]);
         // Linked, the calibrated sky stays one grey.
@@ -1595,7 +1711,8 @@ mod tests {
 
         // Without a solution nothing is calibrated, and the stage runs per
         // channel as asked.
-        let skipped = calibrate_and_stretch(image.clone(), None, gaia, &options, &stack).unwrap();
+        let skipped =
+            calibrate_and_stretch(image.clone(), None, gaia, &options, &stack, None).unwrap();
         assert!(skipped.linked_stages.is_empty());
         let as_asked = stack
             .apply_f32_image(&image.data, ImageShape::new(image.width, image.height, 3))
@@ -1616,7 +1733,8 @@ mod tests {
             .data;
         let reason = |wcs: Option<&seiza::Wcs>, gaia: GaiaColors<'_>| {
             let result =
-                calibrate_and_stretch(image.clone(), wcs, gaia, &options, &auto_stretch()).unwrap();
+                calibrate_and_stretch(image.clone(), wcs, gaia, &options, &auto_stretch(), None)
+                    .unwrap();
             assert_eq!(result.image.data, uncalibrated);
             match result.calibration {
                 ColorCalibrationOutcome::Skipped(skip) => skip.reason,

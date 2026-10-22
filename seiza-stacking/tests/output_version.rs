@@ -151,6 +151,38 @@ const MILD_LENS_MOSAIC: &[f64] = &[
     9.0300000e2,
     7.0300000e2,
 ];
+const CLIPPED_BAYER_MAP: &[f64] = &[
+    1.3575466e-2,
+    1.0238972e-1,
+    1.0000000e0,
+    0.0000000e0,
+    0.0000000e0,
+    0.0000000e0,
+    0.0000000e0,
+    0.0000000e0,
+    0.0000000e0,
+    0.0000000e0,
+    0.0000000e0,
+    0.0000000e0,
+    0.0000000e0,
+    0.0000000e0,
+    0.0000000e0,
+    0.0000000e0,
+    0.0000000e0,
+    0.0000000e0,
+    0.0000000e0,
+    0.0000000e0,
+    0.0000000e0,
+    0.0000000e0,
+    0.0000000e0,
+    0.0000000e0,
+    0.0000000e0,
+    0.0000000e0,
+    0.0000000e0,
+    0.0000000e0,
+    4.1703831e2,
+    3.9800000e2,
+];
 const MOSAIC_BACKGROUND_REFERENCE: &[f64] = &[
     2.5444598e2,
     5.0681991e2,
@@ -1063,6 +1095,41 @@ fn a_mildly_distorted_lens_mosaic_keeps_its_output() {
         snapshot.image.height as f64,
     ]);
     check("MILD_LENS_MOSAIC", &fingerprint, MILD_LENS_MOSAIC);
+}
+
+/// Dithered Bayer frames whose bright stars clip at the level their
+/// headers declare: the stack's map of where its frames clipped, carried
+/// through the demosaic and registration as each frame was.
+#[test]
+fn a_clipped_bayer_stack_keeps_its_clipped_map() {
+    let directory = tempfile::tempdir().unwrap();
+    let bayer = [("BAYERPAT".to_string(), HeaderValue::String("RGGB".into()))];
+    let saturate = [WriteHeaderCard::new("SATURATE", HeaderValue::Float(3000.0))];
+    let paths = SHIFTS[..6]
+        .iter()
+        .enumerate()
+        .map(|(frame, &(dx, dy))| {
+            let mut image = bayer_field(dx, dy, frame);
+            for value in &mut image.data {
+                *value = value.min(3000.0);
+            }
+            let path = directory.path().join(format!("clipped-{frame}.fits"));
+            write_processed_image_fits_f32(&path, &image, &bayer, &saturate).unwrap();
+            path
+        })
+        .collect::<Vec<_>>();
+    let mut stacker =
+        LiveStacker::open_fits(&paths[0], None, None, None, None, StackOptions::default()).unwrap();
+    for path in &paths[1..] {
+        admit(stacker.push_fits(path).unwrap());
+    }
+    let map = stacker.clipped_fraction().expect("the bright stars clip");
+    let mut fingerprint = summary(&map);
+    fingerprint.extend([
+        map.data.iter().map(|&value| f64::from(value)).sum::<f64>(),
+        map.data.iter().filter(|&&value| value >= 0.5).count() as f64,
+    ]);
+    check("CLIPPED_BAYER_MAP", &fingerprint, CLIPPED_BAYER_MAP);
 }
 
 /// The same broad nebular emission is present in both images, while the

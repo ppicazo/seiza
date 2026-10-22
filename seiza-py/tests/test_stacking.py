@@ -1302,3 +1302,24 @@ def test_superpixel_mapping_channel_sites_survive_context(tmp_path, bin_factor):
     stacker.save_context(context)
     reopened = seiza.LiveStacker.open_context(context)
     assert reopened.reference_mapping["channel_sites"] == sites
+
+
+def test_live_stacker_records_where_frames_clipped(tmp_path):
+    # 16-bit frames clip at 65535, which their encoding declares.
+    image = np.clip(synthetic_star_field(), 0, 65535).astype(np.uint16)
+    clipped = image.copy()
+    clipped[118:120, 91:93] = 65535
+    first = tmp_path / "light-001.fits"
+    second = tmp_path / "light-002.fits"
+    fits.writeto(first, image, overwrite=True)
+    fits.writeto(second, clipped, overwrite=True)
+
+    stacker = seiza.LiveStacker(first, options=no_adjustment_options())
+    assert stacker.clipped_fraction() is None
+    assert stacker.push_fits(second).accepted
+    fraction = stacker.clipped_fraction()
+    assert fraction.shape == image.shape and fraction.dtype == np.float32
+    # One of the two observations clipped at the core; none in the sky.
+    assert 0.3 <= fraction[118:120, 91:93].min() and fraction.max() <= 0.5
+    assert fraction[:20, :20].max() == 0.0
+    assert seiza.LiveStacker.from_array(synthetic_star_field()).clipped_fraction() is None

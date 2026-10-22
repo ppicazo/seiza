@@ -67,6 +67,7 @@ mod reference;
 mod registration;
 mod replay;
 mod residual_flat;
+mod saturation;
 mod snr;
 mod stack;
 mod tasks;
@@ -90,8 +91,8 @@ pub use color_calibration::{
     CalibratedStretch, ColorCalibration, ColorCalibrationOptions, ColorCalibrationOutcome,
     ColorCalibrationSkip, ColorCalibrationSkipReason, ColorFit, ColorReferenceStar,
     ColorStarMeasurement, GaiaColorSource, GaiaColors, SOLAR_BP_RP, apply_color_gains,
-    calibrate_and_stretch, calibrate_color, calibrate_color_image, place_gaia_sources,
-    transform_wcs,
+    calibrate_and_stretch, calibrate_color, calibrate_color_image, neutralize_clipped,
+    place_gaia_sources, transform_wcs,
 };
 pub use cosmetic::{ImpulseFilterOptions, suppress_impulses};
 pub use crop::{

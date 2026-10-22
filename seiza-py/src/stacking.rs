@@ -1684,6 +1684,20 @@ impl PyLiveStacker {
         Ok(PyStackSnapshot::of(stacker, snapshot))
     }
 
+    /// How much of each pixel's integrated observations came from clipped
+    /// raw pixels, from 0 to 1, as a `(height, width)` array on the stack's
+    /// grid, for `neutralize_clipped`; `None` when no integrated frame
+    /// clipped, or their saturation level was unknown.
+    fn clipped_fraction<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Option<Bound<'py, numpy::PyArrayDyn<f32>>>> {
+        let stacker = self.active()?;
+        py.detach(|| stacker.clipped_fraction())
+            .map(|map| crate::arrays::image_array(py, &map))
+            .transpose()
+    }
+
     /// Write the running stack as linear 32-bit FITS (or XISF for a
     /// ``.xisf`` path), with the reference frame's headers, and carry on
     /// stacking. Lighter than ``snapshot().write_fits(path)``: it copies only

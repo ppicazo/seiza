@@ -4,7 +4,7 @@ use seiza_fits::{HeaderValue, WriteHeaderCard};
 use seiza_stacking::{
     ColorCalibration, ColorCalibrationOptions, ColorCalibrationOutcome, ColorCalibrationSkip,
     ColorCalibrationSkipReason, GaiaColorSource, GaiaColors, SOLAR_BP_RP, calibrate_and_stretch,
-    calibrate_color_image, write_processed_image_fits_f32,
+    calibrate_color_image, neutralize_clipped, write_processed_image_fits_f32,
 };
 use seiza_stretch::{ImageShape, StretchConfig, StretchParams, StretchStack};
 use std::path::{Path, PathBuf};
@@ -36,6 +36,11 @@ pub(crate) struct ColorCalibrateArgs {
     /// work between 0 and 1. The calibrated FITS keeps the input's units
     #[arg(long, value_enum, default_value = "auto", requires = "display")]
     sample_domain: crate::stretch_command::SampleDomainArg,
+    /// The clipped map `seiza stack --clipped` wrote for this image's stack:
+    /// the pixels it marks, where the sensor saturated, come out neutral in
+    /// the calibrated FITS and the display instead of tinted by the gains
+    #[arg(long)]
+    clipped: Option<PathBuf>,
     /// Gaia BP-RP colour to render neutral; the default is the Sun's (G2V)
     #[arg(long, default_value_t = SOLAR_BP_RP)]
     white_bp_rp: f32,
@@ -123,6 +128,26 @@ pub(crate) fn run(args: ColorCalibrateArgs) -> Result<()> {
         ..ColorCalibrationOptions::default()
     };
 
+    let clipped = args
+        .clipped
+        .as_deref()
+        .map(|path| crate::common::open_frame(path, "clipped map").map(|frame| frame.image))
+        .transpose()?;
+    if let Some(map) = &clipped {
+        // Refuse a map of another image before any output is written.
+        if map.channels != 1
+            || map.width == 0
+            || map.height == 0
+            || !width.is_multiple_of(map.width)
+            || !height.is_multiple_of(map.height)
+        {
+            anyhow::bail!(
+                "the {}x{} clipped map does not fit this {width}x{height} image",
+                map.width,
+                map.height
+            );
+        }
+    }
     let outcome = match &args.display {
         None => {
             let gaia = gaia.expect("only --display goes on without Gaia colours");
@@ -152,6 +177,7 @@ pub(crate) fn run(args: ColorCalibrateArgs) -> Result<()> {
                         gaia.colors(),
                         &options,
                         &stretch,
+                        clipped.as_ref(),
                     )
                     .context("display stretch failed")?;
                     // The display's offsets are in mapped units; the FITS
@@ -168,6 +194,9 @@ pub(crate) fn run(args: ColorCalibrateArgs) -> Result<()> {
                     (result.image.data, outcome)
                 }
                 Err(skip) => {
+                    if let Some(map) = &clipped {
+                        neutralize_clipped(&mut shown, map)?;
+                    }
                     let shape = ImageShape::new(width, height, 3);
                     let output = stretch
                         .apply_f32_image(&shown.data, shape)
@@ -192,10 +221,16 @@ pub(crate) fn run(args: ColorCalibrateArgs) -> Result<()> {
         ColorCalibrationOutcome::Calibrated(calibration) => {
             report_calibration(&calibration);
             calibration.apply(&mut frame.image)?;
+            if let Some(map) = &clipped {
+                neutralize_clipped(&mut frame.image, map)?;
+            }
             write_calibrated(&args, &frame, &calibration)
         }
         ColorCalibrationOutcome::Skipped(skip) => {
             println!("not colour calibrated: {}", skip.detail);
+            if let Some(map) = &clipped {
+                neutralize_clipped(&mut frame.image, map)?;
+            }
             write_processed_image_fits_f32(&args.output, &frame.image, &frame.headers, &[])
                 .with_context(|| format!("could not write {}", args.output.display()))?;
             if let Some(path) = &args.report {

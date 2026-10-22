@@ -386,6 +386,19 @@ print(result.calibration.status, result.calibration.reason)
 display = result.image  # (h, w, 3) float32 in [0, 1]
 ```
 
+A sensor clips each channel at its full scale, and a stack, scaling each
+frame's channels apart, leaves a clipped star core at a different level in
+each channel, which the colour gains then tint, often blue. A live stack
+records where its frames' raw pixels clipped: `stacker.clipped_fraction()`
+returns each pixel's clipped share of its observations, from 0 to 1, as a
+`(h, w)` array, or `None` when no frame clipped or the saturation level is
+unknown (it comes from `SATURATE`, `SATLEVEL`, or the frames' integer
+encoding). Pass it as `clipped=` to `calibrate_and_stretch`, or to
+`seiza.neutralize_clipped(calibrated, clipped)` after `calibration.apply`,
+and those pixels come out neutral: each pixel's channels rise toward its
+brightest, fully from a share of one half. A drizzled stack takes the live
+stack's map as it is; each of its pixels reads the map pixel it lies in.
+
 ## Image stacking
 
 The wheel includes the same linear calibration, registration, normalization,

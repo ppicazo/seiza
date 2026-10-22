@@ -342,6 +342,7 @@ fn a_frame_is_resampled_over_its_footprint_alone() {
             frame.image.clone(),
             None,
             None,
+            None,
         )
         .unwrap();
         let PreparedFrame::Ready(ready) = prepared else {
