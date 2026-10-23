@@ -859,6 +859,11 @@ pub struct Registrar {
     reference_stars: Vec<DetectedStar>,
     reference_index: StarSpatialIndex,
     reference_triangles: Vec<Triangle>,
+    /// [`Self::reference_triangles`]' indices by their first ratio, and
+    /// those ratios, for [`Self::register_similarity_stars`] to find the
+    /// triangles a source triangle can match by binary search.
+    triangles_by_ratio: Vec<usize>,
+    first_ratios: Vec<f64>,
     /// Up to [`DISTORTION_STARS`] reference stars, brightest first, for a
     /// polynomial fit; empty for a similarity model.
     dense_stars: Vec<DetectedStar>,
@@ -943,6 +948,14 @@ impl Registrar {
                 "reference stars do not form a usable nondegenerate triangle".into(),
             ));
         }
+        let mut triangles_by_ratio = (0..reference_triangles.len()).collect::<Vec<_>>();
+        triangles_by_ratio.sort_by(|&left, &right| {
+            reference_triangles[left].ratios[0].total_cmp(&reference_triangles[right].ratios[0])
+        });
+        let first_ratios = triangles_by_ratio
+            .iter()
+            .map(|&index| reference_triangles[index].ratios[0])
+            .collect();
         let reference_index =
             StarSpatialIndex::new(&reference_stars, options.match_tolerance_pixels);
         let maximum_drift_pixels = options.effective_maximum_drift_pixels(width, height);
@@ -952,6 +965,8 @@ impl Registrar {
             reference_stars,
             reference_index,
             reference_triangles,
+            triangles_by_ratio,
+            first_ratios,
             dense_stars,
             dense_index,
             maximum_drift_pixels,
@@ -1089,31 +1104,9 @@ impl Registrar {
         }
 
         let source_triangles = triangles(source_stars, self.options.triangle_stars);
-        let mut candidates = Vec::new();
-        for source_triangle in &source_triangles {
-            for reference_triangle in &self.reference_triangles {
-                let error = (source_triangle.ratios[0] - reference_triangle.ratios[0]).abs()
-                    + (source_triangle.ratios[1] - reference_triangle.ratios[1]).abs();
-                if error > self.options.descriptor_tolerance * 2.0 {
-                    continue;
-                }
-                if let Some(transform) = transform_from_triangles(
-                    source_triangle,
-                    reference_triangle,
-                    source_stars,
-                    &self.reference_stars,
-                ) && (transform.scale - 1.0).abs() <= self.options.scale_tolerance
-                    && transform.displacement_at(self.width as f64 * 0.5, self.height as f64 * 0.5)
-                        <= self.maximum_drift_pixels
-                {
-                    candidates.push((error, transform));
-                }
-            }
-        }
-        candidates.sort_by(|left, right| left.0.total_cmp(&right.0));
-        candidates.truncate(self.options.maximum_candidates);
+        let candidates = self.triangle_candidates(&source_triangles, source_stars);
 
-        for (_, candidate) in candidates {
+        for candidate in candidates {
             retain_scored_transform(
                 &mut best,
                 candidate,
@@ -1130,6 +1123,82 @@ impl Registrar {
             ))
         })?;
         self.refine_registration(best, source_stars)
+    }
+
+    /// The best similarities by triangle ratio error, at most
+    /// `maximum_candidates` of them, among pairs of a source and a reference
+    /// triangle whose ratios agree within the tolerance and whose similarity
+    /// is admissible: as a scan of every source triangle against every
+    /// reference triangle, stably sorted by error, would give them.
+    fn triangle_candidates(
+        &self,
+        source_triangles: &[Triangle],
+        source_stars: &[DetectedStar],
+    ) -> Vec<SimilarityTransform> {
+        let tolerance = self.options.descriptor_tolerance * 2.0;
+        let wanted = self.options.maximum_candidates;
+        // Pairs within `limit`, in the scan's order. A pair's first ratios
+        // differ by no more than its error, so only the reference triangles
+        // in that window of first ratios are read; a margin keeps rounding
+        // in the bounds from dropping a pair the full test admits.
+        let pairs_within = |limit: f64| {
+            let mut pairs = Vec::new();
+            let mut window = Vec::new();
+            for (source_index, source_triangle) in source_triangles.iter().enumerate() {
+                let [first, second] = source_triangle.ratios;
+                let low = self
+                    .first_ratios
+                    .partition_point(|&ratio| ratio < first - limit - 1.0e-9);
+                let high = self
+                    .first_ratios
+                    .partition_point(|&ratio| ratio <= first + limit + 1.0e-9);
+                window.clear();
+                window.extend_from_slice(&self.triangles_by_ratio[low..high]);
+                window.sort_unstable();
+                for &reference_index in &window {
+                    let reference = &self.reference_triangles[reference_index];
+                    let error =
+                        (first - reference.ratios[0]).abs() + (second - reference.ratios[1]).abs();
+                    if error <= limit {
+                        pairs.push((error, source_index, reference_index));
+                    }
+                }
+            }
+            pairs
+        };
+        // Fit the pairs best first, stably, and keep the admissible ones;
+        // only those taken are fitted.
+        let admissible = |mut pairs: Vec<(f64, usize, usize)>| {
+            pairs.sort_by(|left, right| left.0.total_cmp(&right.0));
+            pairs
+                .into_iter()
+                .filter_map(|(_, source_index, reference_index)| {
+                    transform_from_triangles(
+                        &source_triangles[source_index],
+                        &self.reference_triangles[reference_index],
+                        source_stars,
+                        &self.reference_stars,
+                    )
+                    .filter(|transform| {
+                        (transform.scale - 1.0).abs() <= self.options.scale_tolerance
+                            && transform
+                                .displacement_at(self.width as f64 * 0.5, self.height as f64 * 0.5)
+                                <= self.maximum_drift_pixels
+                    })
+                })
+                .take(wanted)
+                .collect::<Vec<_>>()
+        };
+        // A quarter of the tolerance usually holds enough: about 830,000
+        // pairs of 9,400 triangles each agree within the whole of it, and
+        // only the best few hundred are wanted. When it does hold `wanted`
+        // admissible pairs, every pair ranking above the last of them lies
+        // within it too, so they are the whole scan's best.
+        let narrow = admissible(pairs_within(tolerance * 0.25));
+        if narrow.len() == wanted {
+            return narrow;
+        }
+        admissible(pairs_within(tolerance))
     }
 
     /// The polynomial warp [`Self::register_stars`] fits around `transform`,
@@ -2288,7 +2357,13 @@ fn translation_candidates(
     maximum_drift_pixels: f64,
 ) -> Vec<SimilarityTransform> {
     let bin_size = options.match_tolerance_pixels * 2.0;
-    let mut votes = HashMap::<(i32, i32), TranslationVote>::new();
+    // The votes are ordered by an explicit sort below, so the hash only
+    // needs to be quick, and sized for every pair it never rehashes: 160,000
+    // pairs for 200 stars against 800, nearly each in a bin of its own.
+    let mut votes = rustc_hash::FxHashMap::<(i32, i32), TranslationVote>::with_capacity_and_hasher(
+        source.len() * reference.len(),
+        Default::default(),
+    );
     for source in source {
         for reference in reference {
             let translation_x = reference.x - source.x;
@@ -4173,6 +4248,97 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// The windowed, best-first search finds the same candidates, in the
+    /// same order, as scanning every pair of triangles and fitting each,
+    /// whether the narrow window holds enough or the whole tolerance is read,
+    /// and on a lattice, whose congruent triangles tie, in the scan's order.
+    #[test]
+    fn triangle_candidates_match_a_scan_of_every_pair() {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1_u64 << 53) as f64
+        };
+        let scattered = (0..80)
+            .map(|_| star(20.0 + 960.0 * next(), 20.0 + 960.0 * next()))
+            .collect::<Vec<_>>();
+        let turn = SimilarityTransform {
+            translation_x: 31.5,
+            translation_y: -17.25,
+            rotation_radians: 0.3,
+            scale: 1.0,
+        };
+        let turned = scattered
+            .iter()
+            .map(|reference| {
+                let (x, y) = turn.inverse_apply(reference.x, reference.y);
+                star(x + 0.3 * (next() - 0.5), y + 0.3 * (next() - 0.5))
+            })
+            .collect::<Vec<_>>();
+        let lattice = (0..48)
+            .map(|index| {
+                star(
+                    100.0 + 110.0 * (index % 8) as f64,
+                    120.0 + 130.0 * (index / 8) as f64,
+                )
+            })
+            .collect::<Vec<_>>();
+        let shifted = lattice
+            .iter()
+            .map(|reference| star(reference.x - 12.0, reference.y + 7.0))
+            .collect::<Vec<_>>();
+        for ((reference, source), maximum_candidates) in
+            [(&scattered, &turned), (&lattice, &shifted)]
+                .into_iter()
+                .flat_map(|field| [64, 384, 1_000_000].map(|count| (field, count)))
+        {
+            let options = RegistrationOptions {
+                triangle_stars: 30,
+                maximum_candidates,
+                ..RegistrationOptions::default()
+            };
+            let registrar =
+                Registrar::from_stars(1000, 1000, reference.to_vec(), options, Scale::NATIVE)
+                    .unwrap();
+            let source_stars = &source[..source.len().min(registrar.options.maximum_stars)];
+            let source_triangles = triangles(source_stars, registrar.options.triangle_stars);
+            let mut scanned = Vec::new();
+            for source_triangle in &source_triangles {
+                for reference_triangle in &registrar.reference_triangles {
+                    let error = (source_triangle.ratios[0] - reference_triangle.ratios[0]).abs()
+                        + (source_triangle.ratios[1] - reference_triangle.ratios[1]).abs();
+                    if error > registrar.options.descriptor_tolerance * 2.0 {
+                        continue;
+                    }
+                    if let Some(transform) = transform_from_triangles(
+                        source_triangle,
+                        reference_triangle,
+                        source_stars,
+                        &registrar.reference_stars,
+                    ) && (transform.scale - 1.0).abs() <= registrar.options.scale_tolerance
+                        && transform.displacement_at(500.0, 500.0) <= registrar.maximum_drift_pixels
+                    {
+                        scanned.push((error, transform));
+                    }
+                }
+            }
+            scanned.sort_by(|left, right| left.0.total_cmp(&right.0));
+            scanned.truncate(maximum_candidates);
+            let expected = scanned
+                .into_iter()
+                .map(|(_, transform)| transform)
+                .collect::<Vec<_>>();
+            assert!(!expected.is_empty());
+            assert_eq!(
+                registrar.triangle_candidates(&source_triangles, source_stars),
+                expected,
+                "{maximum_candidates} candidates"
+            );
         }
     }
 }
