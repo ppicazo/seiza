@@ -2023,7 +2023,6 @@ dependencies = [
  "multiversion",
  "postcard",
  "rayon",
- "rustc-hash",
  "seiza",
  "seiza-calibration",
  "seiza-fits",
