@@ -10,7 +10,7 @@ use seiza_fits::{HeaderValue, WriteHeaderCard};
 use seiza_stacking::{
     BatchStackOptions, CalibrationMasters, CfaIntegration, Continue, DefectDetectionOptions,
     Demosaic, DrizzleOptions, FrameAcceptanceCriteria, FrameDisposition, FrameWeighting,
-    ImpulseFilterOptions, Interpolation, LinearImage, LiveStacker, MasterBuildOptions,
+    GpuOptions, ImpulseFilterOptions, Interpolation, LinearImage, LiveStacker, MasterBuildOptions,
     MasterFrameKind, NormalizationMode, RegistrationModel, RejectionMode, StackOptions,
     StackSnapshot, build_master_from_fits, detect_defects, write_master_fits_f32,
     write_processed_image_fits_f32,
@@ -355,6 +355,42 @@ const HOST_INTEGRATED: &[f64] = &[
     1.0901280e2, 1.0415617e2, 1.0412110e2, 1.0803335e2, 1.0816547e2, 1.1112226e2,
     1.0462069e2, 1.0627757e2, 1.0888474e2, 1.1139577e2, 1.1152663e2, 1.0536192e2,
     1.6954681e2, 1.0875781e2, 1.1115813e2, 1.1303532e2,
+];
+
+#[rustfmt::skip]
+const LARGE_LIVE: &[f64] = &[
+    1.3779775e2, 4.2943252e2, 1.8050789e4, 9.7606865e1, 1.0074303e2, 1.0332143e2,
+    1.0640565e2, 1.0970185e2, 1.0199506e2, 1.0470235e2, 1.0888734e2, 1.1169503e2,
+    1.1423000e2, 1.0608360e2, 1.0971593e2, 1.1210521e2, 1.1694767e2, 1.1877633e2,
+    1.1073438e2, 1.1466586e2, 1.1635000e2, 1.1988004e2, 1.2327108e2, 1.1514570e2,
+    1.1829337e2, 1.2178257e2, 1.2421250e2, 1.2779749e2,
+];
+
+#[rustfmt::skip]
+const LARGE_BAYER: &[f64] = &[
+    4.3709554e2, 7.3621421e2, 2.6103078e4, 3.2695387e2, 5.3528112e2, 1.8510148e4,
+    2.1808718e2, 3.5899090e2, 1.2386176e4, 4.0050531e2, 3.0018240e2, 2.0045538e2,
+    3.9962393e2, 2.9976782e2, 1.9975221e2, 3.9953403e2, 3.0012613e2, 1.9953230e2,
+    3.9951831e2, 2.9954590e2, 1.9981696e2, 4.0076828e2, 2.9883420e2, 1.9905986e2,
+    3.9881314e2, 2.9911264e2, 2.0006700e2, 3.9864709e2, 3.0036853e2, 1.9870906e2,
+    4.0169772e2, 3.0038361e2, 2.0111650e2, 4.0058640e2, 3.0095898e2, 2.0120891e2,
+    4.0081522e2, 3.0000491e2, 2.0044273e2, 4.0016983e2, 2.9984689e2, 1.9977567e2,
+    3.9921402e2, 2.9975696e2, 1.9996878e2, 3.9955930e2, 2.9950284e2, 1.9945724e2,
+    4.0122397e2, 3.0141617e2, 2.0101453e2, 3.9955362e2, 3.0063062e2, 2.0016751e2,
+    3.9889505e2, 3.0023480e2, 2.0014856e2, 4.0034567e2, 3.0036606e2, 2.0079869e2,
+    3.9922552e2, 2.9927734e2, 1.9887303e2, 3.9959268e2, 2.9980222e2, 1.9983990e2,
+    3.9948978e2, 2.9909891e2, 1.9988362e2, 3.9961865e2, 2.9905649e2, 1.9947746e2,
+    3.9930807e2, 2.9961392e2, 2.0005275e2, 3.9946231e2, 3.0006506e2, 2.0044939e2,
+    4.0022821e2, 3.0036121e2, 2.0021049e2, 4.0079575e2, 2.9973444e2, 1.9990431e2,
+];
+
+#[rustfmt::skip]
+const LARGE_REINTEGRATED: &[f64] = &[
+    1.3750326e2, 4.2837601e2, 1.7889000e4, 9.7606865e1, 1.0074303e2, 1.0332143e2,
+    1.0640565e2, 1.0970185e2, 1.0199506e2, 1.0470235e2, 1.0888734e2, 1.1142345e2,
+    1.1423000e2, 1.0608360e2, 1.0971593e2, 1.1210521e2, 1.1694767e2, 1.1877633e2,
+    1.1073438e2, 1.1466586e2, 1.1635000e2, 1.1988004e2, 1.2327108e2, 1.1537320e2,
+    1.1829337e2, 1.2178257e2, 1.2421250e2, 1.2779749e2,
 ];
 
 #[rustfmt::skip]
@@ -737,6 +773,368 @@ fn registered_frames_a_host_integrates_keep_their_output() {
         &summary(&banded.snapshot.image),
         HOST_INTEGRATED,
     );
+}
+
+/// Frames large enough that, with the `gpu` feature and a GPU present,
+/// they resample there, and a reintegration whose bands integrate there:
+/// stacked on the CPU, which recorded the summaries, and where the GPU may,
+/// whose single-precision work must stay within this file's tolerance of
+/// the CPU's.
+#[test]
+fn a_stack_large_enough_for_the_gpu_keeps_its_output() {
+    large_stack(
+        false,
+        true,
+        NormalizationMode::Global,
+        LARGE_LIVE,
+        LARGE_REINTEGRATED,
+    );
+}
+
+/// Preparation runs ahead of admission, including the first batch before
+/// the lazy accumulator would previously have been offered to the GPU.
+#[test]
+fn a_pipelined_stack_large_enough_for_the_gpu_keeps_its_output() {
+    large_stack(
+        true,
+        true,
+        NormalizationMode::Global,
+        LARGE_LIVE,
+        LARGE_REINTEGRATED,
+    );
+}
+
+#[test]
+fn a_locally_normalized_pipelined_stack_large_enough_for_the_gpu_keeps_its_output() {
+    large_stack(
+        true,
+        true,
+        NormalizationMode::LocalBackground { tile_size: 256 },
+        LARGE_LOCAL_LIVE,
+        LARGE_LOCAL_REINTEGRATED,
+    );
+}
+
+#[test]
+fn a_live_only_pipelined_stack_large_enough_for_the_gpu_keeps_its_output() {
+    large_stack(
+        true,
+        false,
+        NormalizationMode::Global,
+        LARGE_LIVE,
+        LARGE_REINTEGRATED,
+    );
+}
+
+#[test]
+fn a_live_only_locally_normalized_pipelined_stack_large_enough_for_the_gpu_keeps_its_output() {
+    large_stack(
+        true,
+        false,
+        NormalizationMode::LocalBackground { tile_size: 256 },
+        LARGE_LOCAL_LIVE,
+        LARGE_LOCAL_REINTEGRATED,
+    );
+}
+
+// First recorded with lazy accumulator startup, before preparation began
+// with resident moments. Local background fits exercise a grid of offsets.
+#[rustfmt::skip]
+const LARGE_LOCAL_LIVE: &[f64] = &[
+    1.3754521e2, 4.2678341e2, 1.7932547e4, 9.7603149e1, 1.0072701e2, 1.0332149e2, 1.0637009e2,
+    1.0963932e2, 1.0196701e2, 1.0466370e2, 1.0884956e2, 1.1161555e2, 1.1412208e2, 1.0603079e2,
+    1.0965089e2, 1.1204286e2, 1.1683111e2, 1.1863527e2, 1.1065800e2, 1.1457457e2, 1.1625290e2,
+    1.1974577e2, 1.2310165e2, 1.1479590e2, 1.1817994e2, 1.2165116e2, 1.2404044e2, 1.2759380e2,
+];
+#[rustfmt::skip]
+const LARGE_LOCAL_REINTEGRATED: &[f64] = &[
+    1.3728293e2, 4.2654226e2, 1.7932539e4, 9.7631035e1, 1.0074255e2, 1.0330618e2, 1.0636744e2,
+    1.0964255e2, 1.0198824e2, 1.0467348e2, 1.0883335e2, 1.1135132e2, 1.1413447e2, 1.0604317e2,
+    1.0965260e2, 1.1202531e2, 1.1683836e2, 1.1865505e2, 1.1066511e2, 1.1457175e2, 1.1623668e2,
+    1.1975120e2, 1.2311982e2, 1.1527016e2, 1.1817233e2, 1.2163953e2, 1.2405253e2, 1.2762001e2,
+];
+
+fn large_stack(
+    pipelined: bool,
+    retain: bool,
+    normalization: NormalizationMode,
+    live_expected: &[f64],
+    reintegrated_expected: &[f64],
+) {
+    let stars = large_stars();
+    let directory = tempfile::tempdir().unwrap();
+    let paths = SHIFTS
+        .iter()
+        .enumerate()
+        .map(|(frame, &(dx, dy))| {
+            let gain = 0.97 + 0.01 * frame as f32;
+            let mut data: Vec<f32> = (0..LARGE_WIDTH * LARGE_HEIGHT)
+                .map(|index| {
+                    let (x, y) = ((index % LARGE_WIDTH) as f32, (index / LARGE_WIDTH) as f32);
+                    let sky = 100.0 + 0.01 * x + 0.02 * y;
+                    let light = large_star_light(&stars, (x, y), (dx, dy));
+                    gain * (sky + light) + noise(index, frame, 3.0)
+                })
+                .collect();
+            // A satellite trail in the first frame, which only the
+            // reintegration can take out.
+            if frame == 0 {
+                for x in 0..LARGE_WIDTH {
+                    data[(100 + x / 2) * LARGE_WIDTH + x] += 2_000.0;
+                }
+            }
+            let path = directory.path().join(format!("large-{frame}.fits"));
+            let image = LinearImage::new(LARGE_WIDTH, LARGE_HEIGHT, 1, data).unwrap();
+            let cards = [
+                WriteHeaderCard::new("IMAGETYP", HeaderValue::String("LIGHT".into())),
+                WriteHeaderCard::new("EXPTIME", HeaderValue::Float(60.0)),
+            ];
+            write_processed_image_fits_f32(&path, &image, &[], &cards).unwrap();
+            path
+        })
+        .collect::<Vec<_>>();
+    for (on, gpu) in [
+        ("CPU", GpuOptions::cpu()),
+        ("GPU", GpuOptions::default()),
+        (
+            "traced GPU",
+            GpuOptions {
+                trace: true,
+                ..GpuOptions::default()
+            },
+        ),
+    ] {
+        eprintln!("on the {on}");
+        let options = StackOptions {
+            gpu,
+            normalization,
+            ..StackOptions::default()
+        };
+        let mut stacker =
+            LiveStacker::open_fits(&paths[0], None, None, None, None, options.clone()).unwrap();
+        if retain {
+            stacker.retain_frames_for_reintegration(None).unwrap();
+        }
+        if pipelined {
+            let report = stacker
+                .push_fits_pipelined(
+                    &paths[1..],
+                    &seiza_stacking::PipelineOptions {
+                        workers: Some(2),
+                        ..Default::default()
+                    },
+                    |_, result| {
+                        admit(result.unwrap());
+                        Continue::Yes
+                    },
+                )
+                .unwrap();
+            assert_eq!(report.integrated, paths.len() - 1);
+        } else {
+            for path in &paths[1..] {
+                admit(stacker.push_fits(path).unwrap());
+            }
+        }
+        check(
+            if matches!(normalization, NormalizationMode::LocalBackground { .. }) {
+                "LARGE_LOCAL_LIVE"
+            } else {
+                "LARGE_LIVE"
+            },
+            &summary(&stacker.snapshot().unwrap().image),
+            live_expected,
+        );
+        // Exercise both one band and repeated buffer reuse, including a
+        // shorter final band. Each full band still reaches the GPU's
+        // minimum work size. Changing band boundaries changes no arithmetic.
+        if !retain {
+            continue;
+        }
+        for band_memory_bytes in [
+            BatchStackOptions::default().band_memory_bytes,
+            2 * 173 * LARGE_WIDTH * paths.len() * std::mem::size_of::<f32>(),
+        ] {
+            let reintegrated = stacker
+                .reintegrate(
+                    &BatchStackOptions {
+                        band_memory_bytes,
+                        gpu: options.gpu,
+                        ..BatchStackOptions::default()
+                    },
+                    |_, _, _| {},
+                )
+                .unwrap();
+            check(
+                if matches!(normalization, NormalizationMode::LocalBackground { .. }) {
+                    "LARGE_LOCAL_REINTEGRATED"
+                } else {
+                    "LARGE_REINTEGRATED"
+                },
+                &summary(&reintegrated.snapshot.image),
+                reintegrated_expected,
+            );
+        }
+    }
+}
+
+/// RGGB lights as large as [`a_stack_large_enough_for_the_gpu_keeps_its_output`]'s,
+/// which with a GPU present demosaic there (VNG) as well as resample: a
+/// colour stack, on the CPU, which recorded the summary, and where the GPU
+/// may, within this file's tolerance of the CPU's.
+#[test]
+fn a_debayered_stack_large_enough_for_the_gpu_keeps_its_output() {
+    const SKY: [f32; 3] = [400.0, 300.0, 200.0];
+    const COLOR: [f32; 3] = [1.0, 0.8, 0.6];
+    let stars = large_stars();
+    let directory = tempfile::tempdir().unwrap();
+    let bayer = [("BAYERPAT".to_string(), HeaderValue::String("RGGB".into()))];
+    let paths = SHIFTS[..6]
+        .iter()
+        .enumerate()
+        .map(|(frame, &(dx, dy))| {
+            let data: Vec<f32> = (0..LARGE_WIDTH * LARGE_HEIGHT)
+                .map(|index| {
+                    let (x, y) = (index % LARGE_WIDTH, index / LARGE_WIDTH);
+                    let channel = [[0, 1], [1, 2]][y & 1][x & 1];
+                    let light = large_star_light(&stars, (x as f32, y as f32), (dx, dy));
+                    SKY[channel] + COLOR[channel] * light + noise(index, frame, 4.0)
+                })
+                .collect();
+            let image = LinearImage::new(LARGE_WIDTH, LARGE_HEIGHT, 1, data).unwrap();
+            let path = directory.path().join(format!("large-bayer-{frame}.fits"));
+            write_processed_image_fits_f32(&path, &image, &bayer, &[]).unwrap();
+            path
+        })
+        .collect::<Vec<_>>();
+    for (on, gpu) in [("CPU", GpuOptions::cpu()), ("GPU", GpuOptions::default())] {
+        eprintln!("on the {on}");
+        let options = StackOptions {
+            gpu,
+            ..StackOptions::default()
+        };
+        let snapshot = fits_stack(&paths, options);
+        check("LARGE_BAYER", &summary(&snapshot.image), LARGE_BAYER);
+    }
+}
+
+const LARGE_WIDTH: usize = 1280;
+const LARGE_HEIGHT: usize = 960;
+
+/// Full-size raw lights carry clipping through GPU resampling as well as
+/// the stack's mean. Isolated saturated pixels give the mask actual work.
+#[test]
+fn a_large_stack_keeps_its_clipped_fraction() {
+    let stars = large_stars();
+    let frames = SHIFTS[..4]
+        .iter()
+        .enumerate()
+        .map(|(frame, &(dx, dy))| {
+            let mut data = (0..LARGE_WIDTH * LARGE_HEIGHT)
+                .map(|index| {
+                    let point = ((index % LARGE_WIDTH) as f32, (index / LARGE_WIDTH) as f32);
+                    100.0 + large_star_light(&stars, point, (dx, dy)) + noise(index, frame, 3.0)
+                })
+                .collect::<Vec<_>>();
+            if frame > 0 {
+                for y in 410..416 {
+                    for x in 610..616 {
+                        data[y * LARGE_WIDTH + x] = 65535.0;
+                    }
+                }
+            }
+            seiza_stacking::FitsFrame {
+                image: LinearImage::new(LARGE_WIDTH, LARGE_HEIGHT, 1, data).unwrap(),
+                headers: vec![
+                    ("BITPIX".into(), HeaderValue::Integer(16)),
+                    ("BZERO".into(), HeaderValue::Float(32768.0)),
+                ],
+                exposure_seconds: None,
+                bayer: None,
+                source: None,
+                bounds: None,
+            }
+        })
+        .collect::<Vec<_>>();
+    for gpu in [GpuOptions::cpu(), GpuOptions::default()] {
+        let mut stacker = LiveStacker::new(
+            frames[0].clone(),
+            CalibrationMasters::default(),
+            StackOptions {
+                gpu,
+                normalization: NormalizationMode::None,
+                rejection: RejectionMode::None,
+                ..StackOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(stacker.clipped_fraction().is_none());
+        for frame in &frames[1..] {
+            admit(stacker.push(frame.clone()).unwrap());
+        }
+        let clipped = stacker.clipped_fraction().unwrap();
+        const LARGE_CLIPPED: &[f64] = &[
+            2.1972651e-5,
+            2.4751522e-3,
+            5.0000000e-1,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ];
+        check("LARGE_CLIPPED", &summary(&clipped), LARGE_CLIPPED);
+    }
+}
+
+/// Two hundred stars over a large frame, from a small integer generator.
+fn large_stars() -> Vec<(f32, f32, f32)> {
+    let mut state = 0x6a09_e667_u32;
+    let mut next = || {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (state >> 8) as f32 / (1 << 24) as f32
+    };
+    (0..200)
+        .map(|_| {
+            (
+                8.0 + next() * (LARGE_WIDTH as f32 - 16.0),
+                8.0 + next() * (LARGE_HEIGHT as f32 - 16.0),
+                400.0 + next() * 20_000.0,
+            )
+        })
+        .collect()
+}
+
+/// The light of [`large_stars`] at `(x, y)` of a frame shifted by
+/// `(dx, dy)`.
+fn large_star_light(stars: &[(f32, f32, f32)], (x, y): (f32, f32), (dx, dy): (f32, f32)) -> f32 {
+    stars
+        .iter()
+        .filter(|star| (star.0 - x + dx).abs() < 8.0 && (star.1 - y + dy).abs() < 8.0)
+        .map(|&(star_x, star_y, flux)| {
+            let (sx, sy) = (x - dx - star_x, y - dy - star_y);
+            flux * (-(sx * sx + sy * sy) / 4.5).exp()
+        })
+        .sum()
 }
 
 /// Lights binned by 2 after calibration and before registration, and the

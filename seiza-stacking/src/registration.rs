@@ -873,38 +873,56 @@ pub struct Registrar {
     options: RegistrationOptions,
     /// The bin factor of the frames it registers.
     scale: Scale,
+    /// Where it may detect the stars of the frames it registers.
+    gpu: crate::GpuOptions,
 }
 
 impl Registrar {
     /// Detect stars in the reference frame and prepare the matching index.
     pub fn new(reference: &LinearImage, options: RegistrationOptions) -> Result<Self> {
-        Self::at_scale(reference, &options, Scale::NATIVE)
+        Self::at_scale(
+            reference,
+            &options,
+            Scale::NATIVE,
+            &crate::GpuOptions::default(),
+        )
     }
 
     /// [`Self::new`] for a reference binned at `scale`, with `options` in
     /// native pixels as a host writes them: they, and every pixel constant
-    /// registration uses, are read on the binned grid.
+    /// registration uses, are read on the binned grid. Stars are detected
+    /// on the GPU where `gpu` allows it.
     pub(crate) fn at_scale(
         reference: &LinearImage,
         options: &RegistrationOptions,
         scale: Scale,
+        gpu: &crate::GpuOptions,
     ) -> Result<Self> {
         options.validate()?;
         let options = scale.registration(options);
-        let stars = detect(reference, &options, options.dense_star_count(), scale);
-        Self::from_stars(reference.width, reference.height, stars, options, scale)
+        let stars = detect(reference, &options, options.dense_star_count(), scale, gpu);
+        Self::from_stars(
+            reference.width,
+            reference.height,
+            stars,
+            options,
+            scale,
+            gpu,
+        )
     }
 
     /// A registrar for a `width` by `height` reference whose stars were
     /// detected already, brightest first, as [`Self::detected_stars`] gives
     /// them back. `options` are in working pixels, as
-    /// [`Scale::registration`] gives them, for frames binned at `scale`.
+    /// [`Scale::registration`] gives them, for frames binned at `scale`. The
+    /// stars of the frames it registers are detected where `gpu` allows.
     pub(crate) fn from_stars(
         width: usize,
         height: usize,
         stars: Vec<DetectedStar>,
         options: RegistrationOptions,
         scale: Scale,
+        gpu: &crate::GpuOptions,
     ) -> Result<Self> {
         options.validate()?;
         // Saved panel detections enter here without passing through the
@@ -972,6 +990,7 @@ impl Registrar {
             maximum_drift_pixels,
             options,
             scale,
+            gpu: *gpu,
         })
     }
 
@@ -1007,7 +1026,7 @@ impl Registrar {
         }
         let mut options = self.options.clone();
         options.model = RegistrationModel::Similarity;
-        Self::from_stars(width, height, stars, options, self.scale)
+        Self::from_stars(width, height, stars, options, self.scale, &self.gpu)
     }
 
     /// Positions of the reference frame's brightest stars, on its grid.
@@ -1031,6 +1050,7 @@ impl Registrar {
             &self.options,
             self.options.dense_star_count(),
             self.scale,
+            &self.gpu,
         )
     }
 
@@ -1365,6 +1385,8 @@ impl Registrar {
 /// or of an undefined reference sample are left out. `None` when fewer than
 /// the minimum matches pair up. Up to `stars` of the brightest on each side
 /// take part. `options` are in working pixels, for images binned at `scale`.
+/// The reference's stars are detected where `gpu` allows.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn refine_similarity(
     reference: &LinearImage,
     source: &LinearImage,
@@ -1373,6 +1395,7 @@ pub(crate) fn refine_similarity(
     options: &RegistrationOptions,
     stars: usize,
     scale: Scale,
+    gpu: &crate::GpuOptions,
 ) -> Option<RegistrationResult> {
     let margin = scale.centroid_margin(6);
     let defined = |image: &LinearImage, star: &DetectedStar| {
@@ -1388,7 +1411,7 @@ pub(crate) fn refine_similarity(
             })
         })
     };
-    let reference_stars = detect(reference, options, stars, scale)
+    let reference_stars = detect(reference, options, stars, scale, gpu)
         .into_iter()
         .filter(|star| defined(reference, star))
         .collect::<Vec<_>>();
@@ -1491,6 +1514,7 @@ pub fn resample_region_to_reference_with(
             Interpolation::Bilinear => Sampling::Bilinear,
             Interpolation::Lanczos3 => Sampling::Lanczos3,
         },
+        &crate::GpuOptions::default(),
     )
 }
 
@@ -1549,6 +1573,7 @@ pub fn resample_region_photosites(
         region,
         transform.inverse_map(),
         Sampling::NearestPhotosite(layout),
+        &crate::GpuOptions::default(),
     )
 }
 
@@ -1569,7 +1594,8 @@ impl<'a> FrameGeometry<'a> {
     }
 }
 
-/// Resample one reference-grid region through a frame's geometry.
+/// Resample one reference-grid region through a frame's geometry, on the
+/// GPU where `gpu` allows it.
 pub(crate) fn resample_region_geometry(
     source: &LinearImage,
     reference_width: usize,
@@ -1577,6 +1603,7 @@ pub(crate) fn resample_region_geometry(
     region: ReferenceRegion,
     geometry: FrameGeometry<'_>,
     sampling: Sampling,
+    gpu: &crate::GpuOptions,
 ) -> Result<LinearImage> {
     if let Sampling::NearestPhotosite(_) = sampling
         && source.channels != 3
@@ -1595,6 +1622,7 @@ pub(crate) fn resample_region_geometry(
                 region,
                 transform.inverse_map(),
                 sampling,
+                gpu,
             )
         }
         FrameGeometry::Warp(warp) => {
@@ -1606,6 +1634,77 @@ pub(crate) fn resample_region_geometry(
                 region,
                 |x, y| warp.apply(x, y),
                 sampling,
+                gpu,
+            )
+        }
+    }
+}
+
+/// [`resample_region_geometry`] of `source`, and of `mask`, its clip mask,
+/// one sample a source pixel, bilinearly, as [`resample_region_geometry`]
+/// resamples it: in one pass on the GPU, which finds every pixel's source
+/// position once for both.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resample_region_geometry_masked(
+    source: &LinearImage,
+    mask: Option<&crate::saturation::RawClip>,
+    reference_width: usize,
+    reference_height: usize,
+    region: ReferenceRegion,
+    geometry: FrameGeometry<'_>,
+    sampling: Sampling,
+    gpu: &crate::GpuOptions,
+) -> Result<(LinearImage, Option<crate::image::ClipMask>)> {
+    if let Sampling::NearestPhotosite(_) = sampling {
+        let image = resample_region_geometry(
+            source,
+            reference_width,
+            reference_height,
+            region,
+            geometry,
+            sampling,
+            gpu,
+        )?;
+        let mask = mask
+            .map(|mask| {
+                resample_region_geometry(
+                    &mask.to_dense(),
+                    reference_width,
+                    reference_height,
+                    region,
+                    geometry,
+                    Sampling::Bilinear,
+                    gpu,
+                )
+            })
+            .transpose()?;
+        return Ok((image, mask.map(crate::image::ClipMask::Dense)));
+    }
+    match geometry {
+        FrameGeometry::Similarity(transform) => {
+            transform.validate()?;
+            resample_region_with_inverse_masked(
+                source,
+                mask,
+                reference_width,
+                reference_height,
+                region,
+                transform.inverse_map(),
+                sampling,
+                gpu,
+            )
+        }
+        FrameGeometry::Warp(warp) => {
+            warp.validate()?;
+            resample_region_with_inverse_masked(
+                source,
+                mask,
+                reference_width,
+                reference_height,
+                region,
+                |x, y| warp.apply(x, y),
+                sampling,
+                gpu,
             )
         }
     }
@@ -1804,6 +1903,7 @@ pub fn resample_region_warped(
         region,
         FrameGeometry::Warp(warp),
         Sampling::from(interpolation),
+        &crate::GpuOptions::default(),
     )
 }
 
@@ -1867,6 +1967,113 @@ impl ChannelSites {
 /// at `sites`: each output pixel takes every channel from where that
 /// channel's samples put the pixel's centre, so its colours line up.
 /// Without sites it is [`resample_region_geometry`] itself.
+/// [`resample_region_sited`] of `source`, and of `mask`, its clip mask,
+/// bilinearly at the pixels' own positions, as
+/// [`resample_region_geometry_masked`] resamples it; with channel sites, the
+/// mask is resampled apart.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resample_region_sited_masked(
+    source: &LinearImage,
+    mask: Option<&crate::saturation::RawClip>,
+    reference_width: usize,
+    reference_height: usize,
+    region: ReferenceRegion,
+    geometry: FrameGeometry<'_>,
+    sampling: Sampling,
+    sites: Option<ChannelSites>,
+    gpu: &crate::GpuOptions,
+) -> Result<(LinearImage, Option<crate::image::ClipMask>)> {
+    if sites.is_some() && source.channels == 3 {
+        let image = resample_region_sited(
+            source,
+            reference_width,
+            reference_height,
+            region,
+            geometry,
+            sampling,
+            sites,
+            gpu,
+        )?;
+        let mask = mask
+            .map(|mask| {
+                resample_region_geometry(
+                    &mask.to_dense(),
+                    reference_width,
+                    reference_height,
+                    region,
+                    geometry,
+                    Sampling::Bilinear,
+                    gpu,
+                )
+            })
+            .transpose()?;
+        return Ok((image, mask.map(crate::image::ClipMask::Dense)));
+    }
+    resample_region_geometry_masked(
+        source,
+        mask,
+        reference_width,
+        reference_height,
+        region,
+        geometry,
+        sampling,
+        gpu,
+    )
+}
+
+/// The live stack's ordinary, unsited sampling, with an owned GPU result
+/// and no full image readback. The caller falls back to the existing path
+/// for unsupported geometry, small images or a failed device.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub(crate) fn resample_region_retained(
+    source: &LinearImage,
+    mask: Option<&crate::saturation::RawClip>,
+    region: ReferenceRegion,
+    geometry: FrameGeometry<'_>,
+    sampling: Sampling,
+    gpu: &crate::GpuOptions,
+) -> Option<(
+    LinearImage,
+    Option<crate::image::ClipMask>,
+    crate::gpu::GpuFrame,
+)> {
+    match geometry {
+        FrameGeometry::Similarity(transform) => transform.validate().ok()?,
+        FrameGeometry::Warp(warp) => warp.validate().ok()?,
+    }
+    let sampling = match sampling {
+        Sampling::Bilinear => crate::gpu::GpuSampling::Bilinear,
+        Sampling::Lanczos3 => {
+            let mut clamp_spans = [0.0; 4];
+            for (span, value) in clamp_spans.iter_mut().zip(lanczos_clamp_spans(source)) {
+                *span = value;
+            }
+            crate::gpu::GpuSampling::Lanczos3 { clamp_spans }
+        }
+        Sampling::NearestPhotosite(_) => return None,
+    };
+    match geometry {
+        FrameGeometry::Similarity(transform) => crate::gpu::resample_retained(
+            source,
+            mask.map(crate::saturation::RawClip::view),
+            region,
+            &transform.inverse_map(),
+            sampling,
+            gpu,
+        ),
+        FrameGeometry::Warp(warp) => crate::gpu::resample_retained(
+            source,
+            mask.map(crate::saturation::RawClip::view),
+            region,
+            &|x, y| warp.apply(x, y),
+            sampling,
+            gpu,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resample_region_sited(
     source: &LinearImage,
     reference_width: usize,
@@ -1875,6 +2082,7 @@ pub(crate) fn resample_region_sited(
     geometry: FrameGeometry<'_>,
     sampling: Sampling,
     sites: Option<ChannelSites>,
+    gpu: &crate::GpuOptions,
 ) -> Result<LinearImage> {
     let Some(ChannelSites(sites)) = sites.filter(|_| source.channels == 3) else {
         return resample_region_geometry(
@@ -1884,6 +2092,7 @@ pub(crate) fn resample_region_sited(
             region,
             geometry,
             sampling,
+            gpu,
         );
     };
     if let Sampling::NearestPhotosite(_) = sampling {
@@ -1910,6 +2119,7 @@ pub(crate) fn resample_region_sited(
                         region,
                         |x, y| shifted(inverse(x, y)),
                         sampling,
+                        gpu,
                     )
                 }
                 FrameGeometry::Warp(warp) => {
@@ -1921,6 +2131,7 @@ pub(crate) fn resample_region_sited(
                         region,
                         |x, y| shifted(warp.apply(x, y)),
                         sampling,
+                        gpu,
                     )
                 }
             }
@@ -2042,6 +2253,7 @@ pub fn resample_region_to_reference_affine(
         region,
         transform.inverse_map(),
         Sampling::Bilinear,
+        &crate::GpuOptions::default(),
     )
 }
 
@@ -2052,7 +2264,58 @@ fn resample_region_with_inverse(
     region: ReferenceRegion,
     inverse: impl Fn(f64, f64) -> (f64, f64) + Sync,
     sampling: Sampling,
+    gpu: &crate::GpuOptions,
 ) -> Result<LinearImage> {
+    resample_region_with_inverse_masked(
+        source,
+        None,
+        reference_width,
+        reference_height,
+        region,
+        inverse,
+        sampling,
+        gpu,
+    )
+    .map(|(image, _)| image)
+}
+
+/// [`resample_region_with_inverse`] of `source`, and of `mask` bilinearly,
+/// in one pass on the GPU where `gpu` allows it, or else one after the
+/// other.
+#[allow(clippy::too_many_arguments)]
+fn resample_region_with_inverse_masked(
+    source: &LinearImage,
+    mask: Option<&crate::saturation::RawClip>,
+    reference_width: usize,
+    reference_height: usize,
+    region: ReferenceRegion,
+    inverse: impl Fn(f64, f64) -> (f64, f64) + Sync,
+    sampling: Sampling,
+    gpu: &crate::GpuOptions,
+) -> Result<(LinearImage, Option<crate::image::ClipMask>)> {
+    // The mask alone, as `resample_region_with_inverse` resamples it
+    // bilinearly where the GPU's joint pass did not take it; the region is
+    // the frame's, checked below.
+    let mask_alone = |mask: &LinearImage| -> Result<LinearImage> {
+        #[cfg(feature = "gpu")]
+        if let Some((image, _)) = crate::gpu::resample_masked(
+            mask,
+            None,
+            region,
+            &inverse,
+            crate::gpu::GpuSampling::Bilinear,
+            gpu,
+        ) {
+            return Ok(image);
+        }
+        resample_region_on_cpu(
+            mask,
+            region,
+            &inverse,
+            Sampling::Bilinear,
+            &vec![0.0; mask.channels],
+        )
+    };
     if reference_width == 0 || reference_height == 0 {
         return Err(Error::Registration(
             "resampling reference dimensions must be non-zero".into(),
@@ -2077,20 +2340,71 @@ fn resample_region_with_inverse(
         ));
     }
     let channels = source.channels;
-    let sample_count = region
+    // Checked here, so both paths can size their output plainly.
+    region
         .width
         .checked_mul(region.height)
         .and_then(|pixels| pixels.checked_mul(channels))
         .ok_or_else(|| Error::Registration("resampling output dimensions overflow".into()))?;
-    let row_samples = region
-        .width
-        .checked_mul(channels)
-        .ok_or_else(|| Error::Registration("resampling row dimensions overflow".into()))?;
     let clamp_spans = match sampling {
         Sampling::Lanczos3 => lanczos_clamp_spans(source),
         _ => vec![0.0; channels],
     };
-    let mut data = vec![f32::NAN; sample_count];
+    #[cfg(feature = "gpu")]
+    {
+        let gpu_sampling = match sampling {
+            Sampling::Lanczos3 => {
+                let mut spans = [0.0_f32; 4];
+                for (span, &value) in spans.iter_mut().zip(&clamp_spans) {
+                    *span = value;
+                }
+                Some(crate::gpu::GpuSampling::Lanczos3 { clamp_spans: spans })
+            }
+            Sampling::Bilinear => Some(crate::gpu::GpuSampling::Bilinear),
+            Sampling::NearestPhotosite(_) => None,
+        };
+        if let Some(gpu_sampling) = gpu_sampling
+            && let Some((image, resampled_mask)) = crate::gpu::resample_clipped(
+                source,
+                mask.map(crate::saturation::RawClip::view),
+                region,
+                &inverse,
+                gpu_sampling,
+                gpu,
+            )
+        {
+            let resampled_mask = match (resampled_mask, mask) {
+                (Some(resampled), _) => Some(resampled),
+                (None, Some(mask)) => {
+                    Some(crate::image::ClipMask::Dense(mask_alone(&mask.to_dense())?))
+                }
+                (None, None) => None,
+            };
+            return Ok((image, resampled_mask));
+        }
+    }
+    #[cfg(not(feature = "gpu"))]
+    let _ = gpu;
+    let image = resample_region_on_cpu(source, region, &inverse, sampling, &clamp_spans)?;
+    Ok((
+        image,
+        mask.map(|mask| mask_alone(&mask.to_dense()))
+            .transpose()?
+            .map(crate::image::ClipMask::Dense),
+    ))
+}
+
+/// [`resample_region_with_inverse`]'s CPU path, for a checked region.
+pub(crate) fn resample_region_on_cpu(
+    source: &LinearImage,
+    region: ReferenceRegion,
+    inverse: &(impl Fn(f64, f64) -> (f64, f64) + Sync),
+    sampling: Sampling,
+    clamp_spans: &[f32],
+) -> Result<LinearImage> {
+    let channels = source.channels;
+    let row_samples = region.width * channels;
+    let mut data = vec![f32::NAN; row_samples * region.height];
     data.par_chunks_mut(row_samples)
         .enumerate()
         .for_each(|(y, output_row)| {
@@ -2098,9 +2412,9 @@ fn resample_region_with_inverse(
                 source,
                 region.x,
                 region.y + y,
-                &inverse,
+                inverse,
                 sampling,
-                &clamp_spans,
+                clamp_spans,
                 output_row,
             );
         });
@@ -2241,7 +2555,7 @@ fn resample_row<F>(
 /// The share of the positive lobes' contribution the negative lobes may
 /// reach before a 1-D Lanczos pass drops them, as PixInsight's clamping
 /// threshold does.
-const LANCZOS_CLAMPING: f32 = 0.3;
+pub(crate) const LANCZOS_CLAMPING: f32 = 0.3;
 
 /// How many times a frame's photosite noise the taps of a 1-D Lanczos pass
 /// must span, highest to lowest, before [`LANCZOS_CLAMPING`] may drop the
@@ -2281,7 +2595,7 @@ const LANCZOS_CLAMPING_NOISE_SPAN: f32 = 5.0;
 /// [`crate::snr::photosite_noise`], which a demosaic does not lower, or
 /// zero, clamping as the share test alone says, where the image is too
 /// small to measure its noise.
-fn lanczos_clamp_spans(source: &LinearImage) -> Vec<f32> {
+pub(crate) fn lanczos_clamp_spans(source: &LinearImage) -> Vec<f32> {
     match crate::snr::photosite_noise(source) {
         Some(noise) => noise
             .into_iter()
@@ -2371,8 +2685,14 @@ const LANCZOS_STEPS: usize = 1024;
 /// sample a fraction `t` (0..1) to the left, from a table of 1/1024-pixel
 /// steps.
 fn lanczos3_weights(t: f32) -> [f32; 6] {
+    lanczos3_table()[((t * LANCZOS_STEPS as f32 + 0.5) as usize).min(LANCZOS_STEPS)]
+}
+
+/// [`lanczos3_weights`]' table: the weights at every 1/1024-pixel step from
+/// 0 to 1, which the GPU resampler reads too.
+pub(crate) fn lanczos3_table() -> &'static [[f32; 6]] {
     static TABLE: std::sync::OnceLock<Vec<[f32; 6]>> = std::sync::OnceLock::new();
-    let table = TABLE.get_or_init(|| {
+    TABLE.get_or_init(|| {
         (0..=LANCZOS_STEPS)
             .map(|step| {
                 let t = step as f64 / LANCZOS_STEPS as f64;
@@ -2392,8 +2712,7 @@ fn lanczos3_weights(t: f32) -> [f32; 6] {
                 weights.map(|weight| (weight / total) as f32)
             })
             .collect()
-    });
-    table[((t * LANCZOS_STEPS as f32 + 0.5) as usize).min(LANCZOS_STEPS)]
+    })
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -2506,24 +2825,33 @@ pub(crate) fn detect_stars(
     options: &RegistrationOptions,
     max_stars: usize,
     scale: Scale,
+    gpu: &crate::GpuOptions,
 ) -> Vec<DetectedStar> {
-    detect(image, options, max_stars, scale)
+    detect(image, options, max_stars, scale, gpu)
 }
 
+/// The stars of `image`, detected on the GPU where `gpu` allows it.
 fn detect(
     image: &LinearImage,
     options: &RegistrationOptions,
     max_stars: usize,
     scale: Scale,
+    gpu: &crate::GpuOptions,
 ) -> Vec<DetectedStar> {
-    let mut luma = image.luminance();
-    normalize_for_detection(&mut luma);
     let config = scale.detection(DetectConfig {
         backend: DetectBackend::F32,
         sigma: options.detection_sigma,
         max_stars,
         ..DetectConfig::default()
     });
+    #[cfg(feature = "gpu")]
+    if let Some(stars) = crate::gpu::detect_stars(image, &config, gpu) {
+        return stars;
+    }
+    #[cfg(not(feature = "gpu"))]
+    let _ = gpu;
+    let mut luma = image.luminance();
+    normalize_for_detection(&mut luma);
     seiza::detect_stars_luma_f32(&luma, image.width as u32, image.height as u32, &config)
 }
 
@@ -2802,6 +3130,146 @@ pub(crate) fn test_distortion(x: f64, y: f64) -> (f64, f64) {
 mod tests {
     use super::*;
 
+    /// A frame large enough for the GPU: sky with a gradient and noise,
+    /// 600 stars from faint to near saturation, some touching, a trail and
+    /// a block of NaN; `channels` interleaved, each colour its own weight.
+    #[cfg(feature = "gpu")]
+    fn detection_field(width: usize, height: usize, channels: usize) -> LinearImage {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64 ^ channels as u64;
+        let mut uniform = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1_u64 << 53) as f64
+        };
+        let stars: Vec<(f64, f64, f64, f64)> = (0..600)
+            .map(|_| {
+                (
+                    uniform() * width as f64,
+                    uniform() * height as f64,
+                    10.0_f64.powf(1.3 + uniform() * 3.0),
+                    0.8 + uniform() * 1.6,
+                )
+            })
+            .collect();
+        let mut data = vec![0.0_f32; width * height * channels];
+        for (pixel, samples) in data.chunks_exact_mut(channels).enumerate() {
+            let (x, y) = ((pixel % width) as f64, (pixel / width) as f64);
+            let mut light = 0.0;
+            for &(sx, sy, peak, sigma) in &stars {
+                let (dx, dy) = (x - sx, y - sy);
+                if dx.abs() < 9.0 && dy.abs() < 9.0 {
+                    light += peak * (-(dx * dx + dy * dy) / (2.0 * sigma * sigma)).exp();
+                }
+            }
+            if (y - 0.3 * x - 100.0).abs() < 1.0 {
+                light += 300.0;
+            }
+            for (channel, sample) in samples.iter_mut().enumerate() {
+                let noise = (uniform() + uniform() + uniform() - 1.5) * 12.0;
+                let gain = 1.0 - 0.25 * channel as f64;
+                *sample = (gain * (500.0 + 0.02 * x + light) + noise).min(60_000.0) as f32;
+            }
+        }
+        for y in 700..712 {
+            data[(y * width + 200) * channels..(y * width + 230) * channels].fill(f32::NAN);
+        }
+        LinearImage::new(width, height, channels, data).unwrap()
+    }
+
+    /// The CPU's detection, as `detect` makes it without a GPU.
+    #[cfg(feature = "gpu")]
+    fn detected_on_the_cpu(image: &LinearImage, config: &DetectConfig) -> Vec<DetectedStar> {
+        let mut luma = image.luminance();
+        normalize_for_detection(&mut luma);
+        seiza::detect_stars_luma_f32(&luma, image.width as u32, image.height as u32, config)
+    }
+
+    /// The GPU detects the CPU's stars: bit for bit where normalizing the
+    /// frame changes nothing, as on a frame already spanning 0 to 1; and,
+    /// where it rounds in f32 against the CPU's f64, the same stars within a
+    /// thousandth of a pixel but where a pixel on the threshold falls the
+    /// other way.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_detection_matches_the_cpu() {
+        let Some(adapter) = crate::gpu::adapter_description() else {
+            eprintln!("no GPU: GPU detection not compared");
+            return;
+        };
+        eprintln!("comparing detection on {adapter}");
+        let config = DetectConfig {
+            backend: DetectBackend::F32,
+            sigma: RegistrationOptions::default().detection_sigma,
+            max_stars: 500,
+            ..DetectConfig::default()
+        };
+        // Spanning exactly 0 to 1, so normalizing changes nothing.
+        let mut unit = detection_field(1100, 1000, 1);
+        let (low, high) = unit
+            .data
+            .iter()
+            .filter(|value| value.is_finite())
+            .fold((f32::MAX, f32::MIN), |(low, high), &v| {
+                (low.min(v), high.max(v))
+            });
+        for value in &mut unit.data {
+            *value = (*value - low) / (high - low);
+        }
+        unit.data[0] = 0.0;
+        unit.data[1] = 1.0;
+        let cpu = detected_on_the_cpu(&unit, &config);
+        let gpu = crate::gpu::detect_stars(&unit, &config, &crate::GpuOptions::default())
+            .expect("the GPU detects");
+        assert!(cpu.len() > 300, "{} stars", cpu.len());
+        assert_eq!(cpu.len(), gpu.len());
+        for (a, b) in cpu.iter().zip(&gpu) {
+            assert_eq!(
+                (
+                    a.x.to_bits(),
+                    a.y.to_bits(),
+                    a.flux.to_bits(),
+                    a.peak.to_bits(),
+                    a.area
+                ),
+                (
+                    b.x.to_bits(),
+                    b.y.to_bits(),
+                    b.flux.to_bits(),
+                    b.peak.to_bits(),
+                    b.area
+                ),
+            );
+        }
+        for channels in [1, 3] {
+            let image = detection_field(1101, 1003, channels);
+            let cpu = detected_on_the_cpu(&image, &config);
+            let gpu = crate::gpu::detect_stars(&image, &config, &crate::GpuOptions::default())
+                .expect("the GPU detects");
+            let (mut same, mut close, mut worst) = (0, 0, 0.0_f64);
+            for star in &cpu {
+                let nearest = gpu
+                    .iter()
+                    .map(|other| (other.x - star.x).hypot(other.y - star.y))
+                    .fold(f64::INFINITY, f64::min);
+                same += usize::from(nearest == 0.0);
+                if nearest < 1e-3 {
+                    close += 1;
+                    worst = worst.max(nearest);
+                }
+            }
+            eprintln!(
+                "{channels} channel(s): {} CPU stars, {} GPU, {same} identical, {close} within \
+                 a thousandth of a pixel (at most {worst:.1e})",
+                cpu.len(),
+                gpu.len()
+            );
+            assert!(cpu.len() > 300);
+            assert!(cpu.len().abs_diff(gpu.len()) * 100 <= cpu.len());
+            assert!(close * 100 >= cpu.len() * 98);
+        }
+    }
+
     fn star(x: f64, y: f64) -> DetectedStar {
         DetectedStar {
             x,
@@ -2875,10 +3343,19 @@ mod tests {
             },
             geometry,
             sampling,
+            &crate::GpuOptions::default(),
         )
         .unwrap();
-        let bounded =
-            resample_region_geometry(source, width, height, region, geometry, sampling).unwrap();
+        let bounded = resample_region_geometry(
+            source,
+            width,
+            height,
+            region,
+            geometry,
+            sampling,
+            &crate::GpuOptions::default(),
+        )
+        .unwrap();
         let placed = crate::image::Placed::on(&bounded, region, &whole);
         let (mut same, mut beyond) = (true, false);
         for (index, &sample) in whole.data.iter().enumerate() {
@@ -3029,6 +3506,7 @@ mod tests {
                         ..RegistrationOptions::default()
                     },
                     Scale::NATIVE,
+                    &crate::GpuOptions::default(),
                 )
                 .unwrap();
                 let old = registrar.warp_stars(SimilarityTransform::IDENTITY, &source);
@@ -3307,7 +3785,7 @@ mod tests {
             crate::Demosaic::Vng,
         ] {
             let source = noisy_sky(512, 512, sky, sigma, 1, |_, _| 0.0)
-                .debayer_with(layout, demosaic)
+                .debayer_with(layout, demosaic, &crate::GpuOptions::default())
                 .unwrap();
             let noise = crate::snr::photosite_noise(&source).unwrap();
             for (channel, &noise) in noise.iter().enumerate() {
@@ -3566,7 +4044,11 @@ mod tests {
             .collect();
         let frame = LinearImage::new(width, height, 1, mosaic)
             .unwrap()
-            .debayer_with(rggb, crate::Demosaic::Superpixel)
+            .debayer_with(
+                rggb,
+                crate::Demosaic::Superpixel,
+                &crate::GpuOptions::default(),
+            )
             .unwrap();
         let (w, h) = (frame.width, frame.height);
         let region = ReferenceRegion {
@@ -3597,6 +4079,7 @@ mod tests {
                 FrameGeometry::Similarity(transform),
                 Sampling::Bilinear,
                 Some(sites),
+                &crate::GpuOptions::default(),
             )
             .unwrap();
             let unsited = resample_region_sited(
@@ -3607,6 +4090,7 @@ mod tests {
                 FrameGeometry::Similarity(transform),
                 Sampling::Bilinear,
                 None,
+                &crate::GpuOptions::default(),
             )
             .unwrap();
             let mut compared = 0;
@@ -4287,6 +4771,7 @@ mod tests {
                                 region,
                                 transform.inverse_map(),
                                 sampling,
+                                &crate::GpuOptions::default(),
                             )
                             .unwrap();
                             let expected = resample_per_channel(
@@ -4305,6 +4790,7 @@ mod tests {
                             region,
                             |x, y| warp.apply(x, y),
                             sampling,
+                            &crate::GpuOptions::default(),
                         )
                         .unwrap();
                         let expected = resample_per_channel(
@@ -4363,7 +4849,14 @@ mod tests {
                 for sampling in [Sampling::Bilinear, Sampling::Lanczos3] {
                     for sited in [None, Some(sites)] {
                         let resampled = resample_region_sited(
-                            &source, 100, 90, region, geometry, sampling, sited,
+                            &source,
+                            100,
+                            90,
+                            region,
+                            geometry,
+                            sampling,
+                            sited,
+                            &crate::GpuOptions::default(),
                         )
                         .unwrap();
                         let covered =
@@ -4458,9 +4951,15 @@ mod tests {
                 maximum_candidates,
                 ..RegistrationOptions::default()
             };
-            let registrar =
-                Registrar::from_stars(1000, 1000, reference.to_vec(), options, Scale::NATIVE)
-                    .unwrap();
+            let registrar = Registrar::from_stars(
+                1000,
+                1000,
+                reference.to_vec(),
+                options,
+                Scale::NATIVE,
+                &crate::GpuOptions::default(),
+            )
+            .unwrap();
             let source_stars = &source[..source.len().min(registrar.options.maximum_stars)];
             let source_triangles = triangles(source_stars, registrar.options.triangle_stars);
             let mut scanned = Vec::new();

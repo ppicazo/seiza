@@ -49,13 +49,24 @@ pub struct BatchStackOptions {
     /// Reintegration reads every frame's scratch file in bands of rows and
     /// runs all three passes on one band of every frame before it reads the
     /// next, so each file is read once rather than three times and the
-    /// per-pixel statistics stay in the processor's caches. It holds two
-    /// bands of every frame, one being integrated and one being read: within
-    /// half this memory each, at most 128 MiB each, and never less than a
-    /// row. A stack whose frames are read whole first, to fit their
-    /// normalization again, reads as many at once as half this memory holds,
-    /// from two to four. The result does not depend on it.
+    /// per-pixel statistics stay in the processor's caches. Each input band
+    /// fits within half this memory, at most 128 MiB on the CPU and 512 MiB
+    /// on a GPU, limited further by the device's storage bindings, and
+    /// never less than a row. The CPU holds two bands, one being integrated
+    /// and one being read. A stack whose frames are read whole first, to
+    /// fit their normalization again, reads as many at once as half this
+    /// memory holds, from two to four. GPU integration fills two reusable
+    /// device band sets from bounded decoded rows, through two upload bands
+    /// on a discrete GPU, without additional full CPU input bands. Device
+    /// outputs use those same rows. The result does not depend on it.
     pub band_memory_bytes: usize,
+    /// Which passes may run on the GPU: here the rejection passes of
+    /// [`integrate_registered_frames_banded`], as
+    /// [`crate::GpuOptions::integration`] says. [`crate::LiveStacker::reintegrate`]
+    /// prepares and integrates its frames under the stack's
+    /// [`crate::StackOptions::gpu`] narrowed by these: a pass runs on the GPU
+    /// only where both allow it.
+    pub gpu: crate::GpuOptions,
 }
 
 /// Bytes of frame bands reintegration holds by default.
@@ -70,6 +81,7 @@ impl Default for BatchStackOptions {
             frame_weights: None,
             scratch_directory: None,
             band_memory_bytes: DEFAULT_BAND_MEMORY_BYTES,
+            gpu: crate::GpuOptions::default(),
         }
     }
 }
@@ -384,7 +396,7 @@ pub(crate) fn validate_options(frame_count: usize, options: &BatchStackOptions) 
             ));
         }
     }
-    Ok(())
+    options.gpu.validate()
 }
 
 /// The three passes, one whole frame at a time, over frames of `C` channels
@@ -577,6 +589,22 @@ impl Outputs {
             },
             coverage: vec![0; samples],
             rejected: vec![0; samples],
+        }
+    }
+
+    /// The outputs for `range` as one band, for the GPU's band kernel.
+    #[cfg(feature = "gpu")]
+    pub(crate) fn band(&mut self, range: std::ops::Range<usize>) -> crate::gpu::BandOutputs<'_> {
+        crate::gpu::BandOutputs {
+            mean: &mut self.mean[range.clone()],
+            variance: &mut self.variance[range.clone()],
+            weight: if self.weight.is_empty() {
+                &mut []
+            } else {
+                &mut self.weight[range.clone()]
+            },
+            coverage: &mut self.coverage[range.clone()],
+            rejected: &mut self.rejected[range],
         }
     }
 
@@ -1064,6 +1092,42 @@ impl Rejection {
         }
     }
 
+    /// These constants in single precision, by sample count, for the GPU's
+    /// band kernel.
+    #[cfg(feature = "gpu")]
+    pub(crate) fn gpu_tables(&self) -> crate::gpu::BandTables {
+        let counts = self.thresholds.len();
+        crate::gpu::BandTables {
+            thresholds: self
+                .thresholds
+                .iter()
+                .map(|&(low, high)| [low as f32, high as f32])
+                .collect(),
+            factors: (0..counts)
+                .map(|count| {
+                    let trimmed = count as u32 >= TRIMMED_FIRST_ESTIMATE;
+                    [
+                        self.peer_factor[count] as f32,
+                        if trimmed {
+                            self.trim_factor(count as u32, true) as f32
+                        } else {
+                            1.0
+                        },
+                        if trimmed {
+                            self.trim_factor(count as u32, false) as f32
+                        } else {
+                            1.0
+                        },
+                        0.0,
+                    ]
+                })
+                .collect(),
+            minimum_sigma: self.minimum_sigma,
+            clipped_correction: self.clipped_correction as f32,
+            precision: (PRECISION_STEPS * f64::from(f32::EPSILON)) as f32,
+        }
+    }
+
     /// The factor that corrects a trimmed first estimate of `count` samples,
     /// which also leaves out the candidate when `without_candidate`.
     fn trim_factor(&self, count: u32, without_candidate: bool) -> f64 {
@@ -1175,7 +1239,7 @@ impl FirstEstimate {
 const TRIMMED_FIRST_ESTIMATE: u32 = 10;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::{
         Arc,

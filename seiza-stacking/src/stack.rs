@@ -237,6 +237,15 @@ pub struct StackOptions {
         skip_serializing_if = "is_native_bin_factor"
     )]
     pub bin_factor: u32,
+    /// Which passes may run on the GPU, for every frame the stack is pushed
+    /// and for its reintegration, which [`crate::BatchStackOptions::gpu`]
+    /// can only narrow. They decide where the arithmetic runs, which moves
+    /// the stack by rounding at most, so
+    /// [`LiveStacker::configuration_fingerprint`] leaves them out; a saved
+    /// context keeps them. The default, every pass, is not serialized, so
+    /// existing options and contexts keep their exact bytes.
+    #[serde(default, skip_serializing_if = "crate::GpuOptions::is_default")]
+    pub gpu: crate::GpuOptions,
 }
 
 impl Default for StackOptions {
@@ -254,6 +263,7 @@ impl Default for StackOptions {
             demosaic: crate::Demosaic::default(),
             match_tolerances: seiza_calibration::MatchTolerances::default(),
             bin_factor: native_bin_factor(),
+            gpu: crate::GpuOptions::default(),
         }
     }
 }
@@ -374,7 +384,7 @@ impl StackOptions {
                     .into(),
             ));
         }
-        Ok(())
+        self.gpu.validate()
     }
 
     /// Where each channel of a light prepared from `cfa` samples the sky:
@@ -723,6 +733,10 @@ pub struct LiveStacker {
     /// frame: on a 26 MP colour reference that pass was 11% of preparing a
     /// frame.
     reference_ceilings: std::sync::OnceLock<Vec<f32>>,
+    /// Where the reference's local background tiles lie among a gathered
+    /// frame's samples, once a frame has been gathered.
+    #[cfg(feature = "gpu")]
+    fit_tiles: std::sync::OnceLock<Option<crate::normalization::GatheredTiles>>,
     accumulator: Accumulator,
     reference_headers: Vec<(String, HeaderValue)>,
     pub(crate) accepted_frames: u32,
@@ -783,7 +797,7 @@ impl LiveStacker {
             ReferenceContribution::Integrated(cfa),
         )?;
         // The reference is integrated where it lies, as it was prepared.
-        if let Some(clipped) = clipped {
+        if let Some(clipped) = clipped.map(crate::saturation::RawClip::into_dense) {
             let (width, height, channels) = (
                 stacker.reference.width,
                 stacker.reference.height,
@@ -851,9 +865,14 @@ impl LiveStacker {
             alignment.image,
             options.channel_sites(cfa),
             options.interpolation,
+            &options.gpu,
         )?;
-        let registrar =
-            Registrar::at_scale(&alignment.image, &options.registration, options.scale())?;
+        let registrar = Registrar::at_scale(
+            &alignment.image,
+            &options.registration,
+            options.scale(),
+            &options.gpu,
+        )?;
         // Use the regular registration gates, with no photometric comparison
         // to the external image. This image is a target, not an observation.
         let geometry_options = StackOptions {
@@ -887,6 +906,8 @@ impl LiveStacker {
                     canvas: None,
                     known: None,
                     ceilings: &std::sync::OnceLock::new(),
+                    #[cfg(feature = "gpu")]
+                    fit_tiles: &std::sync::OnceLock::new(),
                 },
                 &geometry_options,
                 &[],
@@ -1203,7 +1224,14 @@ impl LiveStacker {
         };
         let registrar = full_reference
             .as_ref()
-            .map(|reference| Registrar::new(reference, self.options.registration.clone()))
+            .map(|reference| {
+                Registrar::at_scale(
+                    reference,
+                    &self.options.registration,
+                    crate::binning::Scale::NATIVE,
+                    &self.options.gpu,
+                )
+            })
             .transpose()?;
         // A grid of the finer size: the reference frame itself where it was
         // read again, which the replay reads only for its shape.
@@ -1238,6 +1266,8 @@ impl LiveStacker {
             reference_noise: self.reference_noise.clone(),
             // Of the full-resolution reference, not this one's.
             reference_ceilings: std::sync::OnceLock::new(),
+            #[cfg(feature = "gpu")]
+            fit_tiles: std::sync::OnceLock::new(),
             accumulator: Accumulator::new(0, !self.options.weighting.is_equal()),
             reference_headers: crate::fits::rebinned_headers(&self.reference_headers, bin, 1),
             accepted_frames: self.accepted_frames,
@@ -1345,7 +1375,12 @@ impl LiveStacker {
                 (registrar, noise, None, None)
             }
             ReferenceContribution::Integrated(cfa) => (
-                Registrar::at_scale(&reference, &options.registration, options.scale())?,
+                Registrar::at_scale(
+                    &reference,
+                    &options.registration,
+                    options.scale(),
+                    &options.gpu,
+                )?,
                 if options.weighting.is_equal() {
                     Vec::new()
                 } else {
@@ -1368,6 +1403,7 @@ impl LiveStacker {
                 reference,
                 options.channel_sites(reference_cfa),
                 options.interpolation,
+                &options.gpu,
             )?
         } else {
             reference
@@ -1422,6 +1458,8 @@ impl LiveStacker {
             canvas_registrar,
             reference_noise,
             reference_ceilings: std::sync::OnceLock::new(),
+            #[cfg(feature = "gpu")]
+            fit_tiles: std::sync::OnceLock::new(),
             accumulator,
             reference_headers,
             accepted_frames: u32::from(reference_is_integrated),
@@ -1570,6 +1608,7 @@ impl LiveStacker {
                     restored.expanded_lens,
                     &restored.options.registration,
                     restored.options.scale(),
+                    &restored.options.gpu,
                 )
                 .and_then(|canvas| canvas.with_projections(restored.expanded_panel_projections))
             })
@@ -1584,6 +1623,7 @@ impl LiveStacker {
                     .unwrap_or(&restored.reference),
                 &restored.options.registration,
                 restored.options.scale(),
+                &restored.options.gpu,
             )
             .map_err(read_error)?,
         };
@@ -1607,14 +1647,16 @@ impl LiveStacker {
             canvas_registrar,
             reference_noise: restored.reference_noise,
             reference_ceilings: std::sync::OnceLock::new(),
-            accumulator: Accumulator {
-                mean: restored.mean,
-                m2: restored.m2,
-                count: restored.count,
-                rejected: restored.rejected,
-                weight_sum: restored.weight_sum,
-                clipped: restored.clipped,
-            },
+            #[cfg(feature = "gpu")]
+            fit_tiles: std::sync::OnceLock::new(),
+            accumulator: Accumulator::from_moments(
+                restored.mean,
+                restored.m2,
+                restored.count,
+                restored.rejected,
+                restored.weight_sum,
+                restored.clipped,
+            ),
             reference_headers: restored.reference_headers,
             accepted_frames: restored.accepted_frames,
             rejected_frames: restored.rejected_frames,
@@ -1643,6 +1685,8 @@ impl LiveStacker {
                 message: "context path must not replace a stack input or calibration master".into(),
             });
         }
+        let moments = self.accumulator.moments();
+        self.accumulator.check_kept()?;
         context::write(
             path,
             context::ContextWriteState {
@@ -1654,11 +1698,11 @@ impl LiveStacker {
                 reference: &self.reference,
                 reference_headers: &self.reference_headers,
                 reference_metadata: &self.reference_metadata,
-                mean: &self.accumulator.mean,
-                m2: &self.accumulator.m2,
-                count: &self.accumulator.count,
-                rejected: &self.accumulator.rejected,
-                weight_sum: self.accumulator.weight_sum.as_deref(),
+                mean: moments.mean,
+                m2: moments.m2,
+                count: moments.count,
+                rejected: moments.rejected,
+                weight_sum: moments.weight_sum,
                 reference_noise: &self.reference_noise,
                 accepted_frames: self.accepted_frames,
                 rejected_frames: self.rejected_frames,
@@ -1855,6 +1899,8 @@ impl LiveStacker {
                     frame.source.as_ref(),
                 )?,
                 ceilings: &self.reference_ceilings,
+                #[cfg(feature = "gpu")]
+                fit_tiles: &self.fit_tiles,
             },
             &self.options,
             &self.reference_noise,
@@ -1923,6 +1969,8 @@ impl LiveStacker {
                 canvas: self.canvas_registrar.as_ref(),
                 known: None,
                 ceilings: &self.reference_ceilings,
+                #[cfg(feature = "gpu")]
+                fit_tiles: &self.fit_tiles,
             },
             &self.options,
             &self.reference_noise,
@@ -1958,6 +2006,8 @@ impl LiveStacker {
                 options: &self.options,
                 reference_noise: &self.reference_noise,
                 reference_ceilings: &self.reference_ceilings,
+                #[cfg(feature = "gpu")]
+                fit_tiles: &self.fit_tiles,
                 frame_cache: cache_files,
             },
             IntegrationHalf {
@@ -1996,7 +2046,9 @@ impl LiveStacker {
 
     pub fn snapshot(&self) -> Result<StackSnapshot> {
         let (mut mean, variance) = self.accumulator.snapshot();
-        self.fill_photosite_gaps(&mut mean, &self.accumulator.count);
+        self.accumulator.check_kept()?;
+        let moments = self.accumulator.moments();
+        self.fill_photosite_gaps(&mut mean, moments.count);
         Ok(StackSnapshot {
             image: LinearImage::new(
                 self.reference.width,
@@ -2010,8 +2062,8 @@ impl LiveStacker {
                 self.reference.channels,
                 variance,
             )?,
-            coverage: self.accumulator.count.clone(),
-            rejected_samples: self.accumulator.rejected.clone(),
+            coverage: moments.count.to_vec(),
+            rejected_samples: moments.rejected.to_vec(),
             accepted_frames: self.accepted_frames,
             rejected_frames: self.rejected_frames,
         })
@@ -2024,7 +2076,8 @@ impl LiveStacker {
     /// not copy variance, coverage, or rejected-sample maps.
     pub fn export_snapshot(&self) -> Result<StackExportSnapshot> {
         let mut mean = self.accumulator.mean_snapshot();
-        self.fill_photosite_gaps(&mut mean, &self.accumulator.count);
+        self.accumulator.check_kept()?;
+        self.fill_photosite_gaps(&mut mean, self.accumulator.moments().count);
         Ok(StackExportSnapshot {
             image: LinearImage::new(
                 self.reference.width,
@@ -2055,13 +2108,14 @@ impl LiveStacker {
     /// frame has reached reads `NaN` with zero coverage.
     /// This is the preferred source for a live display renderer.
     pub fn view(&self) -> StackView<'_> {
+        let moments = self.accumulator.moments();
         StackView {
             width: self.reference.width,
             height: self.reference.height,
             channels: self.reference.channels,
-            mean: &self.accumulator.mean,
-            coverage: &self.accumulator.count,
-            rejected_samples: &self.accumulator.rejected,
+            mean: moments.mean,
+            coverage: moments.count,
+            rejected_samples: moments.rejected,
             accepted_frames: self.accepted_frames,
             rejected_frames: self.rejected_frames,
         }
@@ -2082,6 +2136,7 @@ impl LiveStacker {
     /// Consume the live state and move its full-frame buffers into a final
     /// snapshot. Batch callers should prefer this to avoid snapshot copies.
     pub fn into_snapshot(self) -> Result<StackSnapshot> {
+        self.accumulator.check_kept()?;
         let (mut mean, variance, coverage, rejected_samples) = self.accumulator.into_snapshot();
         if self.options.cfa_integration == CfaIntegration::BayerDrizzle {
             fill_photosite_gaps(
@@ -2304,10 +2359,10 @@ pub(crate) fn calibrate_light(
 /// demosaic and binning [`develop`] gave the frame; `None` when it had none
 /// or cannot follow.
 pub(crate) fn developed_clip_mask(
-    mask: Option<LinearImage>,
+    mask: Option<crate::saturation::RawClip>,
     cfa: Option<BayerLayout>,
     options: &StackOptions,
-) -> Option<LinearImage> {
+) -> Option<crate::saturation::RawClip> {
     crate::saturation::develop_clip_mask(mask?, cfa, options.demosaic, options.bin_factor).ok()
 }
 
@@ -2348,7 +2403,7 @@ pub(crate) fn develop(
     } else {
         options.demosaic
     };
-    let (frame, cfa) = frame.into_prepared_with_layout(demosaic)?;
+    let (frame, cfa) = frame.into_prepared_with_layout(demosaic, &options.gpu)?;
     let binned = if cfa.is_some() && demosaic == crate::Demosaic::Superpixel {
         2
     } else {
@@ -2359,11 +2414,13 @@ pub(crate) fn develop(
 
 /// `image`, whose channels sample the sky at `sites`, resampled so every
 /// channel samples its pixels' centres, as registration carries every frame
-/// it resamples; `image` itself without sites.
+/// it resamples; `image` itself without sites. Resampled on the GPU where
+/// `gpu` allows it.
 pub(crate) fn co_site(
     image: LinearImage,
     sites: Option<crate::registration::ChannelSites>,
     interpolation: crate::Interpolation,
+    gpu: &crate::GpuOptions,
 ) -> Result<LinearImage> {
     if sites.is_none() {
         return Ok(image);
@@ -2381,6 +2438,7 @@ pub(crate) fn co_site(
         crate::registration::FrameGeometry::Similarity(SimilarityTransform::IDENTITY),
         interpolation.into(),
         sites,
+        gpu,
     )
 }
 
@@ -2415,8 +2473,12 @@ fn stack_configuration_fingerprint(
     calibration: &CalibrationMasters,
     input_mode: FrameInputMode,
 ) -> Result<String> {
-    let options = serde_json::to_vec(options)
-        .map_err(|error| Error::Stack(format!("failed to fingerprint stack options: {error}")))?;
+    // Where the arithmetic runs is no part of the configuration.
+    let options = serde_json::to_vec(&StackOptions {
+        gpu: crate::GpuOptions::default(),
+        ..options.clone()
+    })
+    .map_err(|error| Error::Stack(format!("failed to fingerprint stack options: {error}")))?;
     let mut hasher = Sha256::new();
     hasher.update(b"seiza-live-stack-configuration-v1\0");
     hasher.update([match input_mode {
@@ -2537,7 +2599,18 @@ pub(crate) struct ReadyFrame {
     staged: Option<crate::replay::StagedFrame>,
     /// How much of each pixel of `region` the frame's clipped raw pixels
     /// reach, from 0 to 1, when any of them clipped.
-    clipped: Option<LinearImage>,
+    clipped: Option<crate::image::ClipMask>,
+    /// The normalization `registered` still waits for, when it was applied
+    /// to `on_gpu` instead: the CPU's copy needs it only if the frame is
+    /// integrated there after all.
+    pending_normalization: Option<NormalizationMap>,
+    /// `registered`'s samples, normalized, where the GPU resampled them, for
+    /// a live stack's accumulator there; `registered` then keeps its shape
+    /// and not its samples.
+    #[cfg(feature = "gpu")]
+    on_gpu: Option<crate::gpu::GpuFrame>,
+    /// `registered`'s finite samples.
+    finite_samples: usize,
 }
 
 impl PreparedFrame {
@@ -2560,6 +2633,9 @@ pub(crate) struct FrameRegistration<'a> {
     /// The reference's photometric ceilings once measured, for every frame
     /// prepared against the same reference.
     pub ceilings: &'a std::sync::OnceLock<Vec<f32>>,
+    /// The reference's local background tiles among gathered samples.
+    #[cfg(feature = "gpu")]
+    pub fit_tiles: &'a std::sync::OnceLock<Option<crate::normalization::GatheredTiles>>,
 }
 
 impl FrameRegistration<'_> {
@@ -2615,8 +2691,14 @@ pub(crate) fn prepare_frame(
     frame: LinearImage,
     cfa: Option<BayerLayout>,
     cache: Option<&crate::replay::CacheFiles>,
-    clipped: Option<LinearImage>,
+    clipped: Option<crate::saturation::RawClip>,
 ) -> Result<PreparedFrame> {
+    #[cfg(feature = "gpu")]
+    let mut trace = crate::gpu::Trace::new(options.gpu.trace);
+    // The frame's samples the GPU holds, for detection and resampling, go
+    // back to the pool when this returns.
+    #[cfg(feature = "gpu")]
+    let _resident = crate::gpu::ResidentScope;
     if reference.channels != frame.channels {
         return Ok(PreparedFrame::Rejected(
             FrameRejectionReason::IncompatibleImage(format!(
@@ -2638,6 +2720,8 @@ pub(crate) fn prepare_frame(
         }
     };
     let criteria = options.acceptance;
+    #[cfg(feature = "gpu")]
+    trace.mark("registration");
     // Registration measures in working pixels; gates and reports read the
     // sensor's own.
     let scale = options.scale();
@@ -2689,27 +2773,116 @@ pub(crate) fn prepare_frame(
             height: reference.height,
         },
     };
-    let mut registered = crate::registration::resample_region_sited(
-        &frame,
-        reference.width,
-        reference.height,
-        region,
-        geometry,
-        options.interpolation.into(),
-        options.channel_sites(cfa),
-    )?;
-    let finite_samples = registered
-        .data
-        .par_iter()
-        .filter(|value| value.is_finite())
-        .count();
+    // The frame's clip mask, where its raw pixels clipped, goes onto the
+    // grid as the frame does: bilinearly, so a pixel reads how much of it
+    // they reach, in the same pass where the GPU resamples.
+    let mask = clipped.filter(|mask| mask.dimensions() == (frame.width, frame.height));
+    let resample = || {
+        crate::registration::resample_region_sited_masked(
+            &frame,
+            mask.as_ref(),
+            reference.width,
+            reference.height,
+            region,
+            geometry,
+            options.interpolation.into(),
+            options.channel_sites(cfa),
+            &options.gpu,
+        )
+    };
+    let stars = if matches!(
+        options.normalization,
+        NormalizationMode::LocalBackground { .. }
+    ) {
+        target.reference_star_positions()
+    } else {
+        Vec::new()
+    };
+    #[cfg(feature = "gpu")]
+    let mut sampled = None;
+    #[cfg(feature = "gpu")]
+    let mut retained = None;
+    #[cfg(feature = "gpu")]
+    let compact = if options.gpu.enabled
+        && options.gpu.accumulator
+        && options.gpu.resampling
+        && crate::gpu::accumulating()
+        && cache.is_none()
+        && frame.data.len() >= 1 << 20
+        && region.x == 0
+        && region.y == 0
+        && (region.width, region.height) == (reference.width, reference.height)
+        && options.channel_sites(cfa).is_none()
+        && !(cfa.is_some() && options.cfa_integration == CfaIntegration::BayerDrizzle)
+    {
+        crate::gpu::gather::plan(
+            (region.width, region.height, frame.channels),
+            scale.normalization(options.normalization),
+            &stars,
+        )
+        .and_then(|plan| {
+            let (image, mask, gpu_frame) = crate::registration::resample_region_retained(
+                &frame,
+                mask.as_ref(),
+                region,
+                geometry,
+                options.interpolation.into(),
+                &options.gpu,
+            )?;
+            match gpu_frame.gather(plan, &options.gpu) {
+                Ok(samples) => {
+                    sampled = Some(samples);
+                    retained = Some(gpu_frame);
+                    Some((image, mask))
+                }
+                Err(reason) => {
+                    crate::gpu::log_once(&format!(
+                        "preparing this frame with a full readback: {reason}"
+                    ));
+                    None
+                }
+            }
+        })
+    } else {
+        None
+    };
+    #[cfg(feature = "gpu")]
+    let (mut registered, clipped) = compact.map(Ok).unwrap_or_else(resample)?;
+    #[cfg(not(feature = "gpu"))]
+    let (mut registered, clipped) = resample()?;
+    #[cfg(feature = "gpu")]
+    trace.mark("resampling");
+    // Where the GPU resampled the frame, its samples stay there for the
+    // normalization and a GPU accumulator to read, when there is one.
+    #[cfg(feature = "gpu")]
+    let mut on_gpu = retained.or_else(|| {
+        (options.gpu.accumulator && crate::gpu::accumulating())
+            .then(|| {
+                crate::gpu::take_resident(
+                    &registered.data,
+                    (registered.width, registered.height, registered.channels),
+                )
+            })
+            .flatten()
+    });
+    #[cfg(feature = "gpu")]
+    let finite_on_gpu = sampled.as_ref().map(|samples| samples.finite);
+    #[cfg(not(feature = "gpu"))]
+    let finite_on_gpu = None;
+    let finite_samples = finite_on_gpu.unwrap_or_else(|| {
+        registered
+            .data
+            .par_iter()
+            .filter(|value| value.is_finite())
+            .count()
+    });
     // On an expanded canvas, coverage is relative to the frame's own finite
     // footprint; a fixed grid measures coverage of the reference.
     let offered = if target.canvas.is_some() {
         (frame.data.iter().filter(|value| value.is_finite()).count() as f64
             * registration.transform.scale.powi(2)) as f32
     } else {
-        registered.sample_count() as f32
+        (registered.width * registered.height * registered.channels) as f32
     };
     let overlap_fraction = (finite_samples as f32 / offered.max(1.0)).min(1.0);
     if overlap_fraction < criteria.minimum_overlap_fraction {
@@ -2720,6 +2893,31 @@ pub(crate) fn prepare_frame(
             },
         ));
     }
+    let placed = Placed::on(&registered, region, reference);
+    // The fit reads each tile's gathered samples in order, from where the
+    // stack worked out they lie for its reference.
+    #[cfg(feature = "gpu")]
+    let tiles = match (sampled.as_ref(), scale.normalization(options.normalization)) {
+        (Some(samples), NormalizationMode::LocalBackground { tile_size })
+            if target.canvas.is_none() =>
+        {
+            target
+                .fit_tiles
+                .get_or_init(|| {
+                    crate::normalization::GatheredTiles::new(reference, tile_size, samples.lookup())
+                })
+                .as_ref()
+        }
+        _ => None,
+    };
+    #[cfg(feature = "gpu")]
+    let placed = Placed {
+        sampled: sampled.as_ref().map(|samples| crate::image::SampledPixels {
+            tiles,
+            ..samples.pixels()
+        }),
+        ..placed
+    };
     let gains = matches!(
         options.normalization,
         NormalizationMode::LocalBackground { .. }
@@ -2728,12 +2926,13 @@ pub(crate) fn prepare_frame(
         crate::normalization::photometric_gains(
             reference,
             target.reference_ceilings(reference),
-            Placed::on(&registered, region, reference),
-            &target.reference_star_positions(),
+            placed,
+            &stars,
         )
     })
     .flatten();
-    let placed = Placed::on(&registered, region, reference);
+    #[cfg(feature = "gpu")]
+    trace.mark("coverage and photometry");
     // An expanded canvas keeps the first value each sample received, so its
     // background is a patchwork of single frames' skies, each with its own
     // gradient. Matched tile by tile, every frame would take on that
@@ -2764,6 +2963,8 @@ pub(crate) fn prepare_frame(
             }
         };
     let (minimum_gain, maximum_gain) = normalization.gain_range();
+    #[cfg(feature = "gpu")]
+    trace.mark("normalization fit");
     if minimum_gain < criteria.minimum_normalization_gain
         || maximum_gain > criteria.maximum_normalization_gain
     {
@@ -2784,33 +2985,69 @@ pub(crate) fn prepare_frame(
     // gate turns the frame away. Under Bayer drizzle the photosites are kept
     // instead, below, with the samples of this image a background fit reads.
     let (mut staged, background) = match (cache, photosites) {
-        (Some(cache), None) => {
-            let placed = Placed::on(&registered, region, reference);
-            (
-                cache.stage(
-                    placed,
-                    cache.background_samples(placed),
-                    crate::replay::keeps_zeros(options, cfa),
-                ),
-                None,
-            )
-        }
+        (Some(cache), None) => (
+            cache.stage(
+                placed,
+                cache.background_samples(placed),
+                crate::replay::keeps_zeros(options, cfa),
+            ),
+            None,
+        ),
         (Some(cache), Some(_)) => (
             None,
             cache.background_samples(Placed::on(&registered, region, reference)),
         ),
         (None, _) => (None, None),
     };
-    if !matches!(options.normalization, NormalizationMode::None)
-        && let Err(error) = normalization.apply_region(&mut registered, region.x, region.y)
-    {
-        let message = match error {
-            Error::Normalization(message) => message,
-            other => other.to_string(),
-        };
-        return Ok(PreparedFrame::Rejected(
-            FrameRejectionReason::Normalization(message),
-        ));
+    #[cfg(feature = "gpu")]
+    trace.mark("cache");
+    // Normalized on the GPU when the frame lies there for its accumulator,
+    // and the CPU's copy only if the frame comes back to the CPU.
+    #[cfg(feature = "gpu")]
+    if photosites.is_some() {
+        on_gpu = None;
+    }
+    let mut pending_normalization = None;
+    if !matches!(options.normalization, NormalizationMode::None) {
+        #[cfg(feature = "gpu")]
+        let normalized_there = on_gpu.as_mut().is_some_and(|frame| {
+            normalization
+                .gpu_coefficients(
+                    (region.x, region.y),
+                    (registered.width, registered.height, registered.channels),
+                )
+                .is_some_and(|coefficients| {
+                    frame.normalize(&coefficients, options.gpu.trace).is_ok()
+                })
+        });
+        #[cfg(not(feature = "gpu"))]
+        let normalized_there = false;
+        if normalized_there {
+            pending_normalization = Some(normalization.clone());
+        } else {
+            #[cfg(feature = "gpu")]
+            {
+                if registered.data.is_empty() {
+                    registered.data = on_gpu
+                        .as_ref()
+                        .and_then(|frame| frame.download())
+                        .unwrap_or_default();
+                    if registered.data.is_empty() {
+                        registered = resample()?.0;
+                    }
+                }
+                on_gpu = None;
+            }
+            if let Err(error) = normalization.apply_region(&mut registered, region.x, region.y) {
+                let message = match error {
+                    Error::Normalization(message) => message,
+                    other => other.to_string(),
+                };
+                return Ok(PreparedFrame::Rejected(
+                    FrameRejectionReason::Normalization(message),
+                ));
+            }
+        }
     }
     if let Some(layout) = photosites {
         registered = crate::registration::resample_region_geometry(
@@ -2820,6 +3057,7 @@ pub(crate) fn prepare_frame(
             region,
             geometry,
             crate::registration::Sampling::NearestPhotosite(layout),
+            &options.gpu,
         )?;
         staged = cache.and_then(|cache| {
             cache.stage(
@@ -2835,6 +3073,8 @@ pub(crate) fn prepare_frame(
     // Noise is read from the calibrated frame before resampling. Bilinear
     // resampling averages neighbouring pixels by an amount that depends on
     // each frame's sub-pixel shift, which would bias the weights.
+    #[cfg(feature = "gpu")]
+    trace.mark("normalization apply");
     let (noise, weight) = if options.weighting.is_equal() {
         (Vec::new(), Vec::new())
     } else {
@@ -2862,6 +3102,11 @@ pub(crate) fn prepare_frame(
             .collect();
         (noise, weight)
     };
+    // The calibrated frame's buffers serve the next frame read.
+    crate::recycle::give(frame.data);
+    if let Some(mask) = mask {
+        mask.recycle();
+    }
     let normalization_mean_gain = normalization.mean_gain();
     let normalization_mean_offset = normalization.mean_offset();
     let mut mapping = crate::RegisteredFrameMapping::new(
@@ -2873,23 +3118,21 @@ pub(crate) fn prepare_frame(
     mapping.set_warp(registration.warp.clone())?;
     mapping.set_bin_factor(options.bin_factor);
     mapping.set_channel_sites(options.channel_sites(cfa));
-    // Where the frame's raw pixels clipped, carried onto the grid as the
-    // frame was: bilinearly, so a pixel reads how much of it they reach.
-    let clipped = match clipped {
-        Some(mask) if (mask.width, mask.height) == (frame.width, frame.height) => {
-            Some(crate::registration::resample_region_geometry(
-                &mask,
-                reference.width,
-                reference.height,
-                region,
-                geometry,
-                crate::registration::Sampling::Bilinear,
-            )?)
-        }
-        _ => None,
-    };
+    // A frame whose normalized samples lie on the GPU for its accumulator
+    // keeps no second copy here, which a frame queued for integration would
+    // hold for as long as it waits.
+    #[cfg(feature = "gpu")]
+    if on_gpu.is_some() {
+        crate::recycle::give(std::mem::take(&mut registered.data));
+    }
+    #[cfg(feature = "gpu")]
+    {
+        trace.mark("weighting and finish");
+        trace.print("prepare frame");
+    }
     Ok(PreparedFrame::Ready(Box::new(ReadyFrame {
         registered,
+        finite_samples,
         region,
         transform: registration.transform,
         matched_stars: registration.matched_stars,
@@ -2905,6 +3148,9 @@ pub(crate) fn prepare_frame(
         photosites: photosites.is_some(),
         staged,
         clipped,
+        pending_normalization,
+        #[cfg(feature = "gpu")]
+        on_gpu,
     })))
 }
 
@@ -2940,6 +3186,8 @@ pub(crate) struct PreparationHalf<'a> {
     pub(crate) options: &'a StackOptions,
     pub(crate) reference_noise: &'a [f32],
     pub(crate) reference_ceilings: &'a std::sync::OnceLock<Vec<f32>>,
+    #[cfg(feature = "gpu")]
+    pub(crate) fit_tiles: &'a std::sync::OnceLock<Option<crate::normalization::GatheredTiles>>,
     /// Where a stack kept for reintegration writes each frame's registered
     /// image.
     pub(crate) frame_cache: Option<&'a crate::replay::CacheFiles>,
@@ -2962,7 +3210,44 @@ pub(crate) struct IntegrationHalf<'a> {
     reference_height: usize,
 }
 
+/// What [`Accumulator::admit_staged`] did with a frame on the GPU.
+#[cfg(feature = "gpu")]
+enum Staged {
+    /// Admitted there or not: what classification accepted, and the
+    /// integration's counts when it was integrated.
+    Admitted((usize, Option<(usize, usize)>)),
+    /// The moments are not on the GPU, so the frame is handed back.
+    Elsewhere(crate::gpu::GpuFrame),
+    /// The GPU failed; the moments are back on the CPU.
+    Failed,
+}
+
+/// The fewest accepted samples whose `fraction` is not below `minimum`, as
+/// the frame's admission compares them, so a frame is admitted exactly when
+/// it accepts at least as many; past `u32::MAX`, more than a frame holds,
+/// when no count up to it is.
+fn admission_count(fraction: &impl Fn(usize) -> f32, minimum: f32) -> usize {
+    // `fraction` grows with the count, so the counts it falls short at come
+    // first.
+    let (mut low, mut high) = (0, u32::MAX as usize + 1);
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if fraction(middle) < minimum {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    low
+}
+
 impl IntegrationHalf<'_> {
+    /// Establish residency before preparation decides whether to keep
+    /// normalized samples on the GPU.
+    pub(crate) fn prepare_accumulator(&mut self) {
+        #[cfg(feature = "gpu")]
+        self.accumulator.offer_gpu(&self.options.gpu);
+    }
     /// Integrate one prepared frame. Must be called in submission order:
     /// whether a frame survives `minimum_integrated_fraction` depends on every
     /// frame integrated before it.
@@ -2988,40 +3273,107 @@ impl IntegrationHalf<'_> {
             photosites,
             staged,
             clipped,
+            pending_normalization,
+            #[cfg(feature = "gpu")]
+            on_gpu,
+            finite_samples,
         } = *ready;
+        let mut registered = registered;
+        #[cfg_attr(not(feature = "gpu"), allow(unused_mut))]
+        let mut pending_normalization = pending_normalization;
         let weights = (!weight.is_empty()).then_some(weight.as_slice());
-        let placed = Placed {
-            image: &registered,
-            region,
-            width: self.reference_width,
-            height: self.reference_height,
-        };
 
-        let (would_accept, _) =
-            self.accumulator
-                .classify_placed(placed, self.options.rejection, weights);
         // A photosite frame offers one sample per pixel, not one per channel.
-        // This runs on the one serial stage a pipeline waits on, so the
-        // count of a canvas frame's ~50 million samples runs in parallel.
         let offered = if self.expanded_canvas {
-            registered.data.par_iter().filter(|v| v.is_finite()).count()
+            finite_samples
         } else if photosites {
             registered.pixel_count()
         } else {
-            registered.sample_count()
+            registered.pixel_count() * registered.channels
         };
-        let integrated_fraction = would_accept as f32 / offered.max(1) as f32;
-        if integrated_fraction < self.options.acceptance.minimum_integrated_fraction {
+        let minimum = self.options.acceptance.minimum_integrated_fraction;
+        let fraction = |accepted: usize| accepted as f32 / offered.max(1) as f32;
+        let admit_at = admission_count(&fraction, minimum);
+        #[cfg(feature = "gpu")]
+        self.accumulator.offer_gpu(&self.options.gpu);
+        // The frame's normalized samples on the GPU, for the accumulator
+        // there; else the CPU's copy, normalized now if it waited.
+        #[cfg(feature = "gpu")]
+        let admitted = match on_gpu {
+            None => None,
+            Some(staged) => match self.accumulator.admit_staged(
+                Placed {
+                    image: &registered,
+                    region,
+                    width: self.reference_width,
+                    height: self.reference_height,
+                    sampled: None,
+                },
+                staged,
+                self.options.rejection,
+                weights,
+                admit_at,
+            ) {
+                Staged::Admitted(admitted) => Some(admitted),
+                // The moments are on the CPU: the frame comes back, already
+                // normalized.
+                Staged::Elsewhere(staged) => {
+                    match staged.download() {
+                        Some(samples) if registered.data.is_empty() => {
+                            registered.data = samples;
+                            pending_normalization = None;
+                        }
+                        _ if registered.data.is_empty() => {
+                            return self.reject(FrameRejectionReason::Normalization(
+                                "the GPU could not give back the frame it normalized".into(),
+                            ));
+                        }
+                        _ => {}
+                    }
+                    None
+                }
+                Staged::Failed if registered.data.is_empty() => {
+                    return self.reject(FrameRejectionReason::Normalization(
+                        "the GPU failed holding the frame it normalized".into(),
+                    ));
+                }
+                Staged::Failed => None,
+            },
+        };
+        #[cfg(not(feature = "gpu"))]
+        let admitted = None;
+        let (would_accept, integrated) = match admitted {
+            Some(admitted) => admitted,
+            None => {
+                if let Some(normalization) = &pending_normalization
+                    && let Err(error) =
+                        normalization.apply_region(&mut registered, region.x, region.y)
+                {
+                    return self.reject(FrameRejectionReason::Normalization(error.to_string()));
+                }
+                self.accumulator.admit_frame(
+                    Placed {
+                        image: &registered,
+                        region,
+                        width: self.reference_width,
+                        height: self.reference_height,
+                        sampled: None,
+                    },
+                    self.options.rejection,
+                    weights,
+                    admit_at,
+                )
+            }
+        };
+        let integrated_fraction = fraction(would_accept);
+        let Some((accepted_samples, rejected_samples)) = integrated else {
             return self.reject(FrameRejectionReason::InsufficientIntegratedSamples {
                 measured: integrated_fraction,
-                minimum: self.options.acceptance.minimum_integrated_fraction,
+                minimum,
             });
-        }
-        let (accepted_samples, rejected_samples) =
-            self.accumulator
-                .integrate_placed(placed, self.options.rejection, weights);
+        };
         if let Some(clipped) = &clipped {
-            self.accumulator.add_clipped(
+            self.accumulator.add_clipped_mask(
                 clipped,
                 region,
                 self.reference_width,
@@ -3090,17 +3442,288 @@ struct Accumulator {
     /// Per-pixel sum of how much of each integrated frame's pixel its
     /// clipped raw pixels reached; `None` until a frame with any arrives.
     clipped: Option<Vec<f32>>,
+    /// With the `gpu` feature, the moments on the GPU once a frame large
+    /// enough for it arrives; the vectors above are then empty, and
+    /// [`Self::moments`] reads the GPU's back.
+    #[cfg(feature = "gpu")]
+    gpu: Option<crate::gpu::GpuMoments>,
+    /// The GPU's moments read back, once a frame, when first asked for.
+    #[cfg(feature = "gpu")]
+    mirror: std::sync::OnceLock<crate::gpu::MomentVectors>,
+    /// Whether the GPU was offered these moments, so a stack it cannot
+    /// take does not ask every frame.
+    #[cfg(feature = "gpu")]
+    offered: bool,
+    /// The GPU lost the moments and could not give them back: what is
+    /// left is not this stack.
+    lost: std::sync::atomic::AtomicBool,
 }
 
 impl Accumulator {
     fn new(samples: usize, weighted: bool) -> Self {
+        Self::from_moments(
+            vec![0.0; samples],
+            vec![0.0; samples],
+            vec![0; samples],
+            vec![0; samples],
+            weighted.then(|| vec![0.0; samples]),
+            None,
+        )
+    }
+
+    /// An accumulator holding these moments, as a saved context restores.
+    fn from_moments(
+        mean: Vec<f32>,
+        m2: Vec<f32>,
+        count: Vec<u32>,
+        rejected: Vec<u32>,
+        weight_sum: Option<Vec<f32>>,
+        clipped: Option<Vec<f32>>,
+    ) -> Self {
         Self {
-            mean: vec![0.0; samples],
-            m2: vec![0.0; samples],
-            count: vec![0; samples],
-            rejected: vec![0; samples],
-            weight_sum: weighted.then(|| vec![0.0; samples]),
-            clipped: None,
+            mean,
+            m2,
+            count,
+            rejected,
+            weight_sum,
+            clipped,
+            #[cfg(feature = "gpu")]
+            gpu: None,
+            #[cfg(feature = "gpu")]
+            mirror: std::sync::OnceLock::new(),
+            #[cfg(feature = "gpu")]
+            offered: false,
+            lost: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// The moments, wherever they are: the GPU's are read back once a
+    /// frame, the first time they are asked for.
+    fn moments(&self) -> MomentsRef<'_> {
+        #[cfg(feature = "gpu")]
+        if let Some(gpu) = &self.gpu {
+            let mirror = self.mirror.get_or_init(|| match gpu.read() {
+                Ok(moments) => moments,
+                Err(reason) => {
+                    eprintln!("seiza-stacking: the GPU lost the live stack: {reason}");
+                    self.lost.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let samples = gpu.samples();
+                    crate::gpu::MomentVectors {
+                        mean: vec![f32::NAN; samples],
+                        m2: vec![0.0; samples],
+                        count: vec![0; samples],
+                        rejected: vec![0; samples],
+                        weight_sum: gpu.weighted().then(|| vec![0.0; samples]),
+                    }
+                }
+            });
+            return MomentsRef {
+                mean: &mirror.mean,
+                m2: &mirror.m2,
+                count: &mirror.count,
+                rejected: &mirror.rejected,
+                weight_sum: mirror.weight_sum.as_deref(),
+            };
+        }
+        MomentsRef {
+            mean: &self.mean,
+            m2: &self.m2,
+            count: &self.count,
+            rejected: &self.rejected,
+            weight_sum: self.weight_sum.as_deref(),
+        }
+    }
+
+    /// Samples the moments hold, wherever they are.
+    fn samples(&self) -> usize {
+        #[cfg(feature = "gpu")]
+        if let Some(gpu) = &self.gpu {
+            return gpu.samples();
+        }
+        self.mean.len()
+    }
+
+    /// An error when the GPU lost the moments.
+    fn check_kept(&self) -> Result<()> {
+        if self.lost.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(Error::Stack(
+                "the GPU lost the live stack's state; reintegrate or restack its frames".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Move the moments to the GPU once, when they are large enough for it
+    /// and `options` allow it.
+    #[cfg(feature = "gpu")]
+    fn offer_gpu(&mut self, options: &crate::GpuOptions) {
+        if self.offered {
+            return;
+        }
+        self.offered = true;
+        let moments = crate::gpu::MomentSlices {
+            mean: &self.mean,
+            m2: &self.m2,
+            count: &self.count,
+            rejected: &self.rejected,
+            weight_sum: self.weight_sum.as_deref(),
+        };
+        if let Some(gpu) = crate::gpu::GpuMoments::upload(moments, options) {
+            self.gpu = Some(gpu);
+            // The GPU holds them now; free the CPU's.
+            self.mean = Vec::new();
+            self.m2 = Vec::new();
+            self.count = Vec::new();
+            self.rejected = Vec::new();
+            self.weight_sum = self.weight_sum.as_ref().map(|_| Vec::new());
+        }
+    }
+
+    /// Bring the moments back from the GPU after it failed, so the CPU
+    /// carries on; when it cannot give them back, the stack is lost.
+    #[cfg(feature = "gpu")]
+    fn leave_gpu(&mut self, reason: &str) {
+        let Some(gpu) = self.gpu.take() else {
+            return;
+        };
+        let moments = match self.mirror.take() {
+            Some(mirror) => Ok(mirror),
+            None => gpu.read(),
+        };
+        match moments {
+            Ok(moments) => {
+                eprintln!("seiza-stacking: integrating on the CPU from here on: {reason}");
+                self.mean = moments.mean;
+                self.m2 = moments.m2;
+                self.count = moments.count;
+                self.rejected = moments.rejected;
+                self.weight_sum = moments.weight_sum;
+            }
+            Err(read) => {
+                eprintln!("seiza-stacking: the GPU lost the live stack: {reason}; {read}");
+                self.lost.store(true, std::sync::atomic::Ordering::Relaxed);
+                let samples = gpu.samples();
+                self.mean = vec![0.0; samples];
+                self.m2 = vec![0.0; samples];
+                self.count = vec![0; samples];
+                self.rejected = vec![0; samples];
+                self.weight_sum = gpu.weighted().then(|| vec![0.0; samples]);
+            }
+        }
+    }
+
+    /// [`Self::admit_frame`] for a frame whose samples, normalized, already
+    /// lie on the GPU as `staged`, when the moments are there too.
+    #[cfg(feature = "gpu")]
+    fn admit_staged(
+        &mut self,
+        frame: Placed<'_>,
+        staged: crate::gpu::GpuFrame,
+        rejection: RejectionMode,
+        weights: Option<&[f32]>,
+        admit_at: usize,
+    ) -> Staged {
+        let Some(gpu) = self.gpu.as_mut() else {
+            return Staged::Elsewhere(staged);
+        };
+        let unit = [1.0_f32];
+        match gpu.admit(
+            &frame.image.data,
+            Some(staged),
+            gpu_placement(frame),
+            weights.unwrap_or(&unit),
+            gpu_rejection(rejection),
+            admit_at,
+        ) {
+            Ok((accepted, integrated)) => {
+                if integrated.is_some() {
+                    // The moments changed; a copy read back before is stale.
+                    self.mirror = std::sync::OnceLock::new();
+                }
+                Staged::Admitted((accepted, integrated))
+            }
+            Err(reason) => {
+                self.leave_gpu(&reason);
+                Staged::Failed
+            }
+        }
+    }
+
+    /// Classify `frame` against the moments and, if rejection would accept
+    /// at least `admit_at` of its samples, integrate it: how many it would
+    /// accept and refuse, and the integration's accepted and rejected counts
+    /// when it was integrated. On the GPU, when the moments are there, in
+    /// one submission; else [`Self::classify_placed`] and
+    /// [`Self::integrate_placed`].
+    fn admit_frame(
+        &mut self,
+        frame: Placed<'_>,
+        rejection: RejectionMode,
+        weights: Option<&[f32]>,
+        admit_at: usize,
+    ) -> (usize, Option<(usize, usize)>) {
+        #[cfg(feature = "gpu")]
+        {
+            if let Some(gpu) = &mut self.gpu {
+                let unit = [1.0_f32];
+                match gpu.admit(
+                    &frame.image.data,
+                    None,
+                    gpu_placement(frame),
+                    weights.unwrap_or(&unit),
+                    gpu_rejection(rejection),
+                    admit_at,
+                ) {
+                    Ok((accepted, integrated)) => {
+                        if integrated.is_some() {
+                            // The moments changed; a copy read back before
+                            // is stale.
+                            self.mirror = std::sync::OnceLock::new();
+                        }
+                        return (accepted, integrated);
+                    }
+                    Err(reason) => self.leave_gpu(&reason),
+                }
+            }
+        }
+        let (accepted, _) = self.classify_placed(frame, rejection, weights);
+        let integrated =
+            (accepted >= admit_at).then(|| self.integrate_placed(frame, rejection, weights));
+        (accepted, integrated)
+    }
+
+    fn add_clipped_mask(
+        &mut self,
+        mask: &crate::image::ClipMask,
+        region: ReferenceRegion,
+        grid_width: usize,
+        channels: usize,
+    ) {
+        match mask {
+            crate::image::ClipMask::Dense(mask) => {
+                self.add_clipped(mask, region, grid_width, channels)
+            }
+            #[cfg(feature = "gpu")]
+            crate::image::ClipMask::Sparse {
+                width,
+                height,
+                entries,
+            } => {
+                if (*width, *height) != (region.width, region.height) || entries.is_empty() {
+                    return;
+                }
+                let pixels = self.samples() / channels.max(1);
+                let clipped = self.clipped.get_or_insert_with(|| vec![0.0; pixels]);
+                // Each entry names a different pixel. Frames still arrive
+                // in admission order, so these are the dense path's exact
+                // additions, with its zero and non-finite work omitted.
+                for &(index, value) in entries {
+                    if index < width * height && value.is_finite() && value > 0.0 {
+                        let at = (region.y + index / width) * grid_width + region.x + index % width;
+                        clipped[at] += value.min(1.0);
+                    }
+                }
+            }
         }
     }
 
@@ -3120,7 +3743,7 @@ impl Accumulator {
         {
             return;
         }
-        let pixels = self.mean.len() / channels.max(1);
+        let pixels = self.samples() / channels.max(1);
         let clipped = self.clipped.get_or_insert_with(|| vec![0.0; pixels]);
         clipped[region.y * grid_width..(region.y + region.height) * grid_width]
             .par_chunks_mut(grid_width)
@@ -3143,13 +3766,14 @@ impl Accumulator {
     fn clipped_fraction(&self, channels: usize) -> Option<Vec<f32>> {
         let clipped = self.clipped.as_ref()?;
         let channels = channels.max(1);
+        let moments = self.moments();
         Some(
             clipped
                 .par_iter()
                 .enumerate()
                 .map(|(pixel, &sum)| {
                     let observations =
-                        self.count[pixel * channels] + self.rejected[pixel * channels];
+                        moments.count[pixel * channels] + moments.rejected[pixel * channels];
                     if observations == 0 {
                         0.0
                     } else {
@@ -3395,24 +4019,43 @@ impl Accumulator {
 
     fn snapshot(&self) -> (Vec<f32>, Vec<f32>) {
         let mean = self.mean_snapshot();
-        let variance = self
+        let moments = self.moments();
+        let variance = moments
             .m2
             .iter()
-            .zip(&self.count)
+            .zip(moments.count)
             .map(|(&m2, &count)| finalized_variance(m2, count))
             .collect();
         (mean, variance)
     }
 
     fn mean_snapshot(&self) -> Vec<f32> {
-        self.mean
+        let moments = self.moments();
+        moments
+            .mean
             .par_iter()
-            .zip(self.count.par_iter())
+            .zip(moments.count.par_iter())
             .map(|(&mean, &count)| finalized_mean(mean, count))
             .collect()
     }
 
     fn into_snapshot(mut self) -> (Vec<f32>, Vec<f32>, Vec<u32>, Vec<u32>) {
+        #[cfg(feature = "gpu")]
+        if self.gpu.is_some() {
+            // The moments come home, from the copy read back if there is one.
+            let moments = match self.mirror.take() {
+                Some(mirror) => mirror,
+                None => {
+                    let _ = self.moments();
+                    self.mirror.take().unwrap_or_default()
+                }
+            };
+            self.mean = moments.mean;
+            self.m2 = moments.m2;
+            self.count = moments.count;
+            self.rejected = moments.rejected;
+            self.gpu = None;
+        }
         for (mean, &count) in self.mean.iter_mut().zip(&self.count) {
             *mean = finalized_mean(*mean, count);
         }
@@ -3470,6 +4113,43 @@ pub(crate) fn fill_photosite_gaps(
         .collect::<Vec<_>>();
     for (index, value) in fills {
         mean[index] = value;
+    }
+}
+
+/// A live stack's moments, borrowed from wherever they are.
+struct MomentsRef<'a> {
+    mean: &'a [f32],
+    m2: &'a [f32],
+    count: &'a [u32],
+    rejected: &'a [u32],
+    #[allow(dead_code)]
+    weight_sum: Option<&'a [f32]>,
+}
+
+/// Where `frame`'s samples land on the grid, for the GPU.
+#[cfg(feature = "gpu")]
+fn gpu_placement(frame: Placed<'_>) -> crate::gpu::FramePlacement {
+    let channels = frame.channels();
+    crate::gpu::FramePlacement {
+        first_row: frame.region.y,
+        rows: frame.region.height,
+        first_sample: frame.region.x * channels,
+        span: frame.region.width * channels,
+        grid_row: frame.width * channels,
+    }
+}
+
+/// `rejection` for the GPU.
+#[cfg(feature = "gpu")]
+fn gpu_rejection(rejection: RejectionMode) -> Option<crate::gpu::GpuRejection> {
+    match rejection {
+        RejectionMode::None => None,
+        RejectionMode::DeltaSigma(options) => Some(crate::gpu::GpuRejection {
+            low_sigma: options.low_sigma,
+            high_sigma: options.high_sigma,
+            warmup: options.warmup_samples,
+            minimum_sigma: options.minimum_sigma,
+        }),
     }
 }
 
@@ -3687,6 +4367,42 @@ mod binned_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A frame is admitted at exactly the counts whose fraction the
+    /// comparison would let through, at every minimum, odd ones included.
+    #[test]
+    fn the_admission_count_is_where_the_fraction_comparison_turns() {
+        for offered in [0_usize, 1, 2, 3, 7, 1000, 1_048_577, 78_274_944] {
+            let fraction = |accepted: usize| accepted as f32 / offered.max(1) as f32;
+            for minimum in [
+                -1.0,
+                0.0,
+                f32::MIN_POSITIVE,
+                0.1,
+                0.5,
+                1.0 / 3.0,
+                0.999_999,
+                1.0,
+                1.5,
+                f32::INFINITY,
+                f32::NAN,
+            ] {
+                let count = admission_count(&fraction, minimum);
+                for accepted in [0, 1, count.saturating_sub(1), count, count + 1, offered] {
+                    if accepted > u32::MAX as usize {
+                        continue;
+                    }
+                    // As `integrate` decides: rejected below the minimum.
+                    let refused = fraction(accepted) < minimum;
+                    assert_eq!(
+                        accepted >= count,
+                        !refused,
+                        "{offered} offered, minimum {minimum}, {accepted} accepted"
+                    );
+                }
+            }
+        }
+    }
     use crate::BayerLayout;
 
     fn stacking_star_field(width: usize, height: usize) -> LinearImage {
@@ -3774,6 +4490,120 @@ mod tests {
         stacker.save_context(&path).unwrap();
         let reopened = LiveStacker::open_context(&path).unwrap();
         assert_eq!(reopened.clipped_fraction().unwrap().data, fraction.data);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn sparse_clipping_matches_dense_across_regions_and_frame_order() {
+        let (width, height, channels) = (43, 31, 3);
+        let mut dense = Accumulator::new(width * height * channels, false);
+        let mut sparse = Accumulator::new(width * height * channels, false);
+        for frame in 0..10 {
+            let region = ReferenceRegion {
+                x: 3 + frame,
+                y: 5,
+                width: 13,
+                height: 17,
+            };
+            let data = (0..region.width * region.height)
+                .map(|index| match (index + frame) % 13 {
+                    0 => f32::NAN,
+                    1 => -0.25,
+                    2 => 2.0,
+                    3 => 1.0e-7,
+                    4 => 0.37,
+                    _ => 0.0,
+                })
+                .collect::<Vec<_>>();
+            let entries = data
+                .iter()
+                .enumerate()
+                .rev()
+                .filter(|(_, value)| value.is_finite() && **value > 0.0)
+                .map(|(index, value)| (index, *value))
+                .collect();
+            dense.add_clipped(
+                &LinearImage::new(region.width, region.height, 1, data).unwrap(),
+                region,
+                width,
+                channels,
+            );
+            sparse.add_clipped_mask(
+                &crate::image::ClipMask::Sparse {
+                    width: region.width,
+                    height: region.height,
+                    entries,
+                },
+                region,
+                width,
+                channels,
+            );
+            assert!(
+                dense
+                    .clipped
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .zip(sparse.clipped.as_ref().unwrap())
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+            );
+        }
+    }
+
+    /// A stack's GPU options decide where its arithmetic runs, not what it
+    /// stacks: its fingerprint leaves them out, and a context keeps them.
+    #[test]
+    fn gpu_options_leave_the_fingerprint_and_a_context_keeps_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let field = stacking_star_field(160, 128);
+        let open = |gpu| {
+            let frame = FitsFrame {
+                image: field.clone(),
+                headers: Vec::new(),
+                exposure_seconds: None,
+                bayer: None,
+                source: None,
+                bounds: None,
+            };
+            let options = StackOptions {
+                gpu,
+                ..StackOptions::default()
+            };
+            LiveStacker::new(frame, CalibrationMasters::default(), options).unwrap()
+        };
+        let everywhere = open(crate::GpuOptions::default());
+        let narrowed = crate::GpuOptions {
+            detection: false,
+            concurrency: 1,
+            ..crate::GpuOptions::default()
+        };
+        let stacker = open(narrowed);
+        assert_eq!(
+            stacker.configuration_fingerprint(),
+            everywhere.configuration_fingerprint()
+        );
+        let path = directory.path().join("gpu.seiza-stack");
+        stacker.save_context(&path).unwrap();
+        let reopened = LiveStacker::open_context(&path).unwrap();
+        assert_eq!(reopened.options.gpu, narrowed);
+        assert_eq!(
+            reopened.configuration_fingerprint(),
+            everywhere.configuration_fingerprint()
+        );
+        // The defaults are not written, so existing contexts keep their bytes.
+        let written = serde_json::to_value(StackOptions::default()).unwrap();
+        assert!(written.get("gpu").is_none(), "{written}");
+        assert!(
+            StackOptions {
+                gpu: crate::GpuOptions {
+                    concurrency: 0,
+                    ..crate::GpuOptions::default()
+                },
+                ..StackOptions::default()
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     fn offset_image(reference: &LinearImage, offset: f32) -> LinearImage {
@@ -4089,6 +4919,124 @@ mod tests {
         let mut heard = Vec::new();
         assert!(open(&[&color, &light], &mut heard).is_err());
         assert!(heard.is_empty());
+    }
+
+    /// The GPU's accumulator classifies and integrates as the CPU's does,
+    /// weighted or not, for whole frames and frames over part of the grid,
+    /// with outliers for delta-sigma rejection to refuse.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn the_gpu_accumulator_matches_the_cpu() {
+        let (width, height) = (1200_usize, 1000_usize);
+        let rejection = RejectionMode::DeltaSigma(DeltaSigmaOptions::default());
+        for weighted in [false, true] {
+            let mut cpu = Accumulator::new(width * height, weighted);
+            let mut gpu = Accumulator::new(width * height, weighted);
+            gpu.offer_gpu(&crate::GpuOptions::default());
+            if gpu.gpu.is_none() {
+                eprintln!("no GPU: the GPU accumulator not compared");
+                return;
+            }
+            let mut state = 0x2545_f491_4f6c_dd1d_u64;
+            let mut uniform = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 11) as f32 / (1_u64 << 53) as f32
+            };
+            for frame in 0..12 {
+                // Every third frame covers only part of the grid.
+                let region = if frame % 3 == 2 {
+                    ReferenceRegion {
+                        x: 101,
+                        y: 57,
+                        width: 700,
+                        height: 600,
+                    }
+                } else {
+                    ReferenceRegion {
+                        x: 0,
+                        y: 0,
+                        width,
+                        height,
+                    }
+                };
+                let data: Vec<f32> = (0..region.width * region.height)
+                    .map(|index| {
+                        let roll = uniform();
+                        if roll < 0.01 {
+                            f32::NAN
+                        } else if roll > 0.995 {
+                            5_000.0
+                        } else {
+                            100.0 + (index % 97) as f32 + (uniform() - 0.5) * 20.0
+                        }
+                    })
+                    .collect();
+                let image = LinearImage::new(region.width, region.height, 1, data).unwrap();
+                let placed = Placed {
+                    image: &image,
+                    region,
+                    width,
+                    height,
+                    sampled: None,
+                };
+                let weights = [0.6 + 0.1 * frame as f32];
+                let weights = weighted.then_some(&weights[..]);
+                // Single precision on both, but a GPU may fuse a multiply
+                // and add the CPU rounds apart, so a sample on a threshold
+                // can fall the other way: at most one in 100 000.
+                let close = |(a, b): (usize, usize), (c, d): (usize, usize)| {
+                    let total = (c + d).max(1);
+                    a.abs_diff(c) * 100_000 <= total && b.abs_diff(d) * 100_000 <= total
+                };
+                let (classified, expected) = cpu.admit_frame(placed, rejection, weights, 0);
+                let (would_accept, actual) = gpu.admit_frame(placed, rejection, weights, 0);
+                let (expected, actual) = (expected.unwrap(), actual.unwrap());
+                assert!(
+                    close((would_accept, 0), (classified, 0)),
+                    "frame {frame} weighted {weighted}: classified {would_accept} against \
+                     {classified}"
+                );
+                assert!(
+                    close(actual, expected),
+                    "frame {frame} weighted {weighted}: integrated {actual:?} against {expected:?}"
+                );
+                // A frame short of its admission count is classified, and
+                // left out of the moments on both.
+                let refused_at = classified + classified / 2 + 1;
+                assert_eq!(
+                    cpu.admit_frame(placed, rejection, weights, refused_at).1,
+                    None
+                );
+                assert_eq!(
+                    gpu.admit_frame(placed, rejection, weights, refused_at).1,
+                    None
+                );
+            }
+            let (cpu, gpu) = (cpu.moments(), gpu.moments());
+            let differing = gpu
+                .count
+                .iter()
+                .zip(cpu.count)
+                .zip(gpu.rejected.iter().zip(cpu.rejected))
+                .filter(|((a, b), (c, d))| a != b || c != d)
+                .count();
+            assert!(
+                differing * 100_000 <= cpu.count.len(),
+                "weighted {weighted}: {differing} samples counted apart"
+            );
+            let apart = gpu
+                .mean
+                .iter()
+                .zip(cpu.mean)
+                .filter(|(gpu, cpu)| (**gpu - **cpu).abs() > 1.0e-4 * cpu.abs().max(1.0))
+                .count();
+            assert!(
+                apart * 100_000 <= cpu.mean.len(),
+                "weighted {weighted}: {apart} means apart"
+            );
+        }
     }
 
     #[test]
@@ -4555,6 +5503,7 @@ mod tests {
                 Some(crate::lens::LensDistortion::none(160, 128)),
                 &stacker.options.registration,
                 crate::binning::Scale::NATIVE,
+                &crate::GpuOptions::default(),
             )
             .unwrap(),
         );

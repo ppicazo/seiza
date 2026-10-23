@@ -11,8 +11,18 @@ readme = "README.md"
 keywords = ["astronomy", "astrophotography", "stacking", "fits"]
 categories = ["science", "multimedia::images"]
 
+[features]
+default = ["gpu"]
+# Run stacking's heavy passes on the GPU when one is present, through wgpu,
+# where each request's GpuOptions allow it. Without it, every pass runs on
+# the CPU.
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+
 [dependencies]
 multiversion = "0.9"
+wgpu = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
+bytemuck = { workspace = true, optional = true }
 rayon.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -30,3 +40,6 @@ seiza-stretch.workspace = true
 tempfile = "3"
 thiserror.workspace = true
 zstd.workspace = true
+
+[dev-dependencies]
+naga.workspace = true

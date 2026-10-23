@@ -202,6 +202,33 @@ stacks, and format 4 only as a weighted one. Equal-weight stacks keep writing
 format 3, byte for byte as before, and their options and configuration
 fingerprint do not change.
 
+## GPU resampling and integration
+
+With the default `gpu` feature, defect learning's first screen, VNG
+debayering, star detection, registration resampling (clamped Lanczos-3 and
+bilinear), the live stack's accumulator and the final integration's three
+rejection passes run on the GPU when one is present, through wgpu: Metal, Vulkan or
+Direct3D 12. Frames under a million samples stay on the CPU, which is as
+quick for them. The GPU works in single precision and stays within a few
+thousandths of the frame's noise of the CPU, and the defect map comes out
+bit for bit as the CPU's (see `docs/design/gpu-stacking.md`); on a 45-frame,
+26 MP stack with reintegration it halves the wall time and quarters the CPU
+time.
+
+Each request says which passes may run there, in its `GpuOptions`:
+`StackOptions::gpu` for a live stack and its reintegration,
+`BatchStackOptions::gpu` for `integrate_registered_frames_banded`, and
+`DefectDetectionOptions::gpu` for defect learning. `GpuOptions::cpu()` keeps
+every pass on the CPU, and `defects`, `debayer`, `detection`, `resampling`,
+`accumulator` and `integration` keep one each; `concurrency` (3) is how many
+frame calls the GPU takes at once, and `trace` prints each call's timings to
+stderr. A stack's context keeps its GPU options, and its configuration
+fingerprint leaves them out. Calls that take no options, such as
+`resample_to_reference` and `FitsFrame::into_prepared`, use the defaults.
+Build with `default-features = false` for a crate without wgpu. No adapter,
+or any GPU error, falls back to the CPU; an error is logged once and turns
+the GPU off for the rest of the process.
+
 ## Pipelined preparation with a shared pool
 
 `LiveStacker::push_fits_pipelined_with_pool` takes a host-owned Rayon pool and

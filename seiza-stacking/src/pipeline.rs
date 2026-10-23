@@ -283,6 +283,14 @@ impl ComputePool<'_> {
     }
 }
 
+/// A frame for `pool`: its file read through on this thread, so storage is
+/// read off the pool's threads, then decoded in the pool, so the decode's
+/// Rayon work stays in it.
+fn read_for(pool: &rayon::ThreadPool, path: &Path) -> Result<FitsFrame> {
+    crate::tasks::read_through(&[path]);
+    pool.install(|| FitsFrame::open(path))
+}
+
 fn timed<T>(work: impl FnOnce() -> T) -> (T, Duration) {
     let started = Instant::now();
     let result = work();
@@ -384,11 +392,12 @@ impl LiveStacker {
     /// Overlap reads while keeping all image preparation and integration in
     /// the supplied Rayon pool. Call from a non-Rayon coordinator thread.
     ///
-    /// Bounded scoped OS workers read and decode FITS/XISF containers outside
-    /// the pool, then submit calibration, cosmetic correction, CFA conversion,
-    /// registration and normalization to it. The coordinator submits ordered
-    /// integration to the same pool and invokes `on_frame` on its own thread.
-    /// This preserves the sequential result without borrowing the global pool.
+    /// Bounded scoped OS workers read FITS/XISF files through outside the
+    /// pool, then submit decoding, calibration, cosmetic correction, CFA
+    /// conversion, registration and normalization to it. The coordinator
+    /// submits ordered integration to the same pool and invokes `on_frame` on
+    /// its own thread. This preserves the sequential result without borrowing
+    /// the global pool.
     ///
     /// A caller already on any Rayon worker gets a sequential fallback, even
     /// with a one-thread supplied pool. It still uses the supplied pool for
@@ -420,7 +429,7 @@ impl LiveStacker {
             paths,
             options,
             ComputePool(Some(pool)),
-            &|path| FitsFrame::open(path),
+            &|path| read_for(pool, path),
             &prepare_decoded,
             on_frame,
         )
@@ -430,8 +439,9 @@ impl LiveStacker {
     ///
     /// This is a memory-saving alternative to [`Self::push_fits_pipelined_with_pool`].
     /// It creates no reader threads or preparation queue: each read, preparation,
-    /// integration and callback finishes before the next path is read. Reads and
-    /// callbacks stay on the caller; preparation and integration enter `pool`.
+    /// integration and callback finishes before the next path is read. Files
+    /// are read through and callbacks run on the caller; decoding, preparation
+    /// and integration enter `pool`.
     /// Calling from the same or another Rayon pool is supported, including a
     /// one-thread pool. The callback need not be `Send`.
     ///
@@ -471,7 +481,7 @@ impl LiveStacker {
             &plan,
             normalized_full_scale,
             ComputePool(Some(pool)),
-            &|path| FitsFrame::open(path),
+            &|path| read_for(pool, path),
             &prepare_decoded,
             &mut on_frame,
         );
@@ -493,6 +503,8 @@ impl LiveStacker {
         mut on_frame: impl FnMut(&Path, Result<FrameDisposition>) -> Continue,
     ) -> Result<PoolPipelineReport> {
         let started = Instant::now();
+        // The frames' buffers go back to the allocator when the run ends.
+        let _recycled = crate::recycle::Scope;
         self.require_fits_input_mode()?;
         if paths.is_empty() {
             return Ok(PoolPipelineReport::default());
@@ -568,6 +580,8 @@ impl LiveStacker {
             ..PoolPipelineReport::default()
         };
 
+        let (_, elapsed) = timed(|| integration.prepare_accumulator());
+        report.timings.integration += elapsed;
         std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(workers);
             for (worker, sender) in senders.into_iter().enumerate() {
@@ -694,6 +708,8 @@ impl LiveStacker {
             .in_flight_bytes(workers),
             ..PoolPipelineReport::default()
         };
+        let (_, elapsed) = timed(|| integration.prepare_accumulator());
+        report.timings.integration += elapsed;
         crate::tasks::ahead(|ahead| {
             std::thread::scope(|scope| {
                 let mut in_flight = std::collections::VecDeque::new();
@@ -775,6 +791,8 @@ impl LiveStacker {
             ..PoolPipelineReport::default()
         };
         let (preparation, mut integration) = self.split_for_pipeline();
+        let (_, elapsed) = timed(|| integration.prepare_accumulator());
+        report.timings.integration += elapsed;
         for (index, path) in paths.iter().enumerate() {
             let outcome = match &plan[index] {
                 Planned::Duplicate => Err(duplicate_error(path)),
@@ -867,6 +885,13 @@ fn prepare_worker(
             Planned::Duplicate => Err(duplicate_error(&paths[index])),
             Planned::Prepare(_) => {
                 let (frame, elapsed) = timed(|| read(&paths[index]));
+                #[cfg(feature = "gpu")]
+                if preparation.options.gpu.trace {
+                    eprintln!(
+                        "seiza-stacking gpu: read frame {index}: {:.1} ms",
+                        elapsed.as_secs_f64() * 1000.0
+                    );
+                }
                 timings.read_decode += elapsed;
                 frame.and_then(|frame| {
                     let (prepared, elapsed) = compute
@@ -892,12 +917,16 @@ fn prepare_decoded(
     half: &crate::stack::PreparationHalf<'_>,
     normalized_full_scale: Option<f32>,
 ) -> Result<PreparedFrame> {
+    #[cfg(feature = "gpu")]
+    let mut trace = crate::gpu::Trace::new(half.options.gpu.trace);
     if let Some(full_scale) = normalized_full_scale {
         frame.rescale_declared_unit_bounds(full_scale);
     }
     // Recorded after the rescale, which a replay repeats.
     let source = crate::replay::FrameSource::of(&frame);
     let clipped = crate::saturation::raw_clip_mask(&frame);
+    #[cfg(feature = "gpu")]
+    trace.mark("raw clipping");
     let (frame, cfa) = match crate::stack::prepare_light(
         frame,
         half.calibration,
@@ -907,7 +936,9 @@ fn prepare_decoded(
         Ok(prepared) => prepared,
         Err(failure) => return Ok(PreparedFrame::Rejected(failure.rejection())),
     };
-    Ok(prepare_frame(
+    #[cfg(feature = "gpu")]
+    trace.mark("calibration");
+    let prepared = prepare_frame(
         half.reference,
         crate::stack::FrameRegistration {
             registrar: half.registrar,
@@ -917,6 +948,8 @@ fn prepare_decoded(
                 frame.source.as_ref(),
             )?,
             ceilings: half.reference_ceilings,
+            #[cfg(feature = "gpu")]
+            fit_tiles: half.fit_tiles,
         },
         half.options,
         half.reference_noise,
@@ -925,7 +958,13 @@ fn prepare_decoded(
         half.frame_cache.filter(|_| source.is_some()),
         crate::stack::developed_clip_mask(clipped, cfa, half.options),
     )?
-    .with_source(source))
+    .with_source(source);
+    #[cfg(feature = "gpu")]
+    {
+        trace.mark("register and normalize");
+        trace.print("prepare decoded");
+    }
+    Ok(prepared)
 }
 
 #[cfg(test)]

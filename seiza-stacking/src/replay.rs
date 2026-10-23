@@ -1290,6 +1290,26 @@ impl FrameCache {
         map: Option<&crate::NormalizationMap>,
         recorded: Option<&crate::NormalizationMap>,
     ) -> Result<()> {
+        self.read_band_target(
+            index,
+            shape,
+            top,
+            &mut BandTarget::Host(band),
+            map,
+            recorded,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read_band_target(
+        &self,
+        index: usize,
+        shape: (usize, usize, usize),
+        top: usize,
+        band: &mut BandTarget<'_>,
+        map: Option<&crate::NormalizationMap>,
+        recorded: Option<&crate::NormalizationMap>,
+    ) -> Result<()> {
         use std::io::{Read, Seek};
         let path = self.path(index);
         let failed = |reason: String| {
@@ -1326,18 +1346,17 @@ impl FrameCache {
             (top + rows).min(region.y + region.height),
         );
         if first >= last {
-            band.fill(f32::NAN);
+            band.fill(0..band.len(), f32::NAN);
             return Ok(());
         }
-        band[..(first - top) * row_samples].fill(f32::NAN);
-        band[(last - top) * row_samples..].fill(f32::NAN);
+        band.fill(0..(first - top) * row_samples, f32::NAN);
+        band.fill((last - top) * row_samples..band.len(), f32::NAN);
         let start = region.x * channels;
         if run < row_samples {
-            for row in band[(first - top) * row_samples..(last - top) * row_samples]
-                .chunks_exact_mut(row_samples)
-            {
-                row[..start].fill(f32::NAN);
-                row[start + run..].fill(f32::NAN);
+            for row in first..last {
+                let at = (row - top) * row_samples;
+                band.fill(at..at + start, f32::NAN);
+                band.fill(at + start + run..at + row_samples, f32::NAN);
             }
         }
         file.seek(std::io::SeekFrom::Start(
@@ -1363,19 +1382,71 @@ impl FrameCache {
             for (offset, raw) in raw.chunks_exact(run * 4).enumerate() {
                 let row = first_read + offset;
                 let at = (row - top) * row_samples + start;
-                let samples = &mut band[at..at + run];
-                for (sample, raw) in samples.iter_mut().zip(raw.as_chunks::<4>().0.iter()) {
-                    *sample = f32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
-                }
-                if let Some(normalizer) = &normalizer {
-                    normalizer.apply(&mut coefficients, samples, row);
-                }
-                if let Some(residual) = &residual {
-                    residual.apply(&mut residual_coefficients, samples, row);
-                }
+                band.update(at..at + run, |samples| {
+                    for (sample, raw) in samples.iter_mut().zip(raw.as_chunks::<4>().0.iter()) {
+                        *sample = f32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+                    }
+                    if let Some(normalizer) = &normalizer {
+                        normalizer.apply(&mut coefficients, samples, row);
+                    }
+                    if let Some(residual) = &residual {
+                        residual.apply(&mut residual_coefficients, samples, row);
+                    }
+                });
             }
         }
         Ok(())
+    }
+}
+
+/// A band in ordinary memory, or a write-only destination such as mapped
+/// GPU staging. The latter holds only one decoded row, never a full band.
+enum BandTarget<'a> {
+    Host(&'a mut [f32]),
+    #[cfg(feature = "gpu")]
+    Stream {
+        samples: usize,
+        write: &'a mut dyn FnMut(usize, &[f32]),
+        scratch: Vec<f32>,
+    },
+}
+
+impl BandTarget<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Host(samples) => samples.len(),
+            #[cfg(feature = "gpu")]
+            Self::Stream { samples, .. } => *samples,
+        }
+    }
+
+    fn fill(&mut self, range: std::ops::Range<usize>, value: f32) {
+        if range.is_empty() {
+            return;
+        }
+        match self {
+            Self::Host(samples) => samples[range].fill(value),
+            #[cfg(feature = "gpu")]
+            Self::Stream { write, scratch, .. } => {
+                scratch.resize(range.len().min(1 << 18), value);
+                scratch.fill(value);
+                for start in range.clone().step_by(scratch.len()) {
+                    write(start, &scratch[..scratch.len().min(range.end - start)]);
+                }
+            }
+        }
+    }
+
+    fn update(&mut self, range: std::ops::Range<usize>, fill: impl FnOnce(&mut [f32])) {
+        match self {
+            Self::Host(samples) => fill(&mut samples[range]),
+            #[cfg(feature = "gpu")]
+            Self::Stream { write, scratch, .. } => {
+                scratch.resize(range.len(), 0.0);
+                fill(scratch);
+                write(range.start, scratch);
+            }
+        }
     }
 }
 
@@ -1444,6 +1515,28 @@ impl crate::batch::BandSource for CacheBands<'_> {
         )
     }
 
+    #[cfg(feature = "gpu")]
+    fn read_into(
+        &self,
+        index: usize,
+        top: usize,
+        samples: usize,
+        write: &mut dyn FnMut(usize, &[f32]),
+    ) -> Result<()> {
+        self.cache.read_band_target(
+            self.frames[index],
+            self.shape,
+            top,
+            &mut BandTarget::Stream {
+                samples,
+                write,
+                scratch: Vec::new(),
+            },
+            Some(&self.maps[index]),
+            self.recorded.map(|maps| &maps[index]),
+        )
+    }
+
     fn region(&self, index: usize) -> Option<ReferenceRegion> {
         let (width, height, _) = self.shape;
         self.cache
@@ -1496,6 +1589,29 @@ impl crate::batch::BandSource for LoadedFrames {
             .shape
             .expect("a band is read only after every frame is kept");
         self.cache.read_band(index, shape, top, band, None, None)
+    }
+
+    #[cfg(feature = "gpu")]
+    fn read_into(
+        &self,
+        index: usize,
+        top: usize,
+        samples: usize,
+        write: &mut dyn FnMut(usize, &[f32]),
+    ) -> Result<()> {
+        let shape = self.shape.expect("every frame is kept before reading");
+        self.cache.read_band_target(
+            index,
+            shape,
+            top,
+            &mut BandTarget::Stream {
+                samples,
+                write,
+                scratch: Vec::new(),
+            },
+            None,
+            None,
+        )
     }
 }
 
@@ -2327,6 +2443,7 @@ impl LiveStacker {
                 &options,
                 stars,
                 crate::binning::Scale::NATIVE,
+                &self.options.gpu,
             );
             let mut initial = carried.transform();
             initial.translation_x -= region.x as f64;
@@ -2339,6 +2456,7 @@ impl LiveStacker {
                 &options,
                 stars,
                 crate::binning::Scale::NATIVE,
+                &self.options.gpu,
             )
             .map(|mut result| {
                 result.transform.translation_x += region.x as f64;
@@ -2582,10 +2700,13 @@ impl LiveStacker {
             return Err(Error::Stack(reason));
         }
         let ledger = &self.ledger;
-        let weighted_options;
-        let options = if self.options.weighting.is_equal() {
-            options
-        } else {
+        // Frames are prepared again as the stack prepared them, and their
+        // rejection passes run on the GPU only where the stack allows it too.
+        let mut options = BatchStackOptions {
+            gpu: self.options.gpu.within(options.gpu),
+            ..options.clone()
+        };
+        if !self.options.weighting.is_equal() {
             if options.frame_weights.is_some() {
                 return Err(Error::Stack(
                     "a weighted stack replays with its recorded frame weights; \
@@ -2593,18 +2714,15 @@ impl LiveStacker {
                         .into(),
                 ));
             }
-            weighted_options = BatchStackOptions {
-                frame_weights: Some(
-                    ledger
-                        .frames
-                        .iter()
-                        .map(|frame| frame.weighting.weight.clone())
-                        .collect(),
-                ),
-                ..options.clone()
-            };
-            &weighted_options
-        };
+            options.frame_weights = Some(
+                ledger
+                    .frames
+                    .iter()
+                    .map(|frame| frame.weighting.weight.clone())
+                    .collect(),
+            );
+        }
+        let options = &options;
         let count = ledger.frames.len();
         let masters = MastersCache::default();
         // The frames the live pass kept, when it was asked to; otherwise a
@@ -2975,11 +3093,13 @@ impl LiveStacker {
                 prepared,
                 region,
                 crate::registration::Sampling::NearestPhotosite(layout),
+                &self.options.gpu,
             )?,
             None if keeps_zeros(&self.options, cfa) => admitted.mapping.resample_region(
                 prepared,
                 region,
                 self.options.interpolation.into(),
+                &self.options.gpu,
             )?,
             None => interpolated.clone(),
         };
@@ -3029,11 +3149,18 @@ impl LiveStacker {
                 self.full_region(admitted),
                 interpolation,
                 sites,
+                &self.options.gpu,
             )?));
         }
         let region = admitted.mapping.footprint(prepared.width, prepared.height);
         Ok(PlacedImage {
-            image: identity.extract_region_sited(prepared, region, interpolation, sites)?,
+            image: identity.extract_region_sited(
+                prepared,
+                region,
+                interpolation,
+                sites,
+                &self.options.gpu,
+            )?,
             region,
             width: admitted.mapping.reference_width(),
             height: admitted.mapping.reference_height(),
@@ -3192,10 +3319,12 @@ impl LiveStacker {
                         .mapping
                         .extract_region_photosites(&frame.image, region, layout)
                 }
-                None => admitted.mapping.extract_region_with(
+                None => admitted.mapping.extract_region_sited(
                     &frame.image,
                     region,
                     self.options.interpolation,
+                    admitted.mapping.channel_sites(),
+                    &self.options.gpu,
                 ),
             };
         }
@@ -3235,8 +3364,13 @@ impl LiveStacker {
         let identity = admitted
             .mapping
             .with_normalization(crate::NormalizationMap::identity(&self.reference))?;
-        let mut interpolated =
-            identity.extract_region_with(&frame.image, region, self.options.interpolation)?;
+        let mut interpolated = identity.extract_region_sited(
+            &frame.image,
+            region,
+            self.options.interpolation,
+            identity.channel_sites(),
+            &self.options.gpu,
+        )?;
         let map = renormalizer.map_for(admitted, index, Placed::whole(&interpolated))?;
         match cfa.filter(|_| self.options.cfa_integration == crate::CfaIntegration::BayerDrizzle) {
             Some(layout) => admitted
@@ -3354,6 +3488,7 @@ mod tests {
                 None,
                 &stacker.options.registration,
                 stacker.options.scale(),
+                &crate::GpuOptions::default(),
             )
             .unwrap(),
         );
@@ -3454,6 +3589,7 @@ mod tests {
                 None,
                 &stacker.options.registration,
                 stacker.options.scale(),
+                &crate::GpuOptions::default(),
             )
             .unwrap(),
         );
