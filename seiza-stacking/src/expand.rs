@@ -22,6 +22,7 @@ use crate::{
     NormalizationMode, PolynomialWarp, ReferenceRegion, Registrar, RegistrationOptions,
     RegistrationResult, Result, SimilarityTransform, StackOptions, path_identity,
 };
+use rayon::prelude::*;
 use seiza::DetectedStar;
 use seiza_fits::HeaderValue;
 use serde::{Deserialize, Serialize};
@@ -1375,8 +1376,9 @@ struct Placement {
     dy: usize,
     transform: SimilarityTransform,
     region: ReferenceRegion,
-    incoming: LinearImage,
-    existing: LinearImage,
+    /// The frame resampled onto `region`, when counting its coverage needed
+    /// it; see [`crate::registration::resampled_coverage`].
+    incoming: Option<LinearImage>,
     /// Samples both define, and samples only the frame defines.
     common: usize,
     uncovered: usize,
@@ -1499,8 +1501,7 @@ impl Plan {
             dy,
             transform,
             region,
-            mut incoming,
-            existing,
+            incoming,
             common,
             uncovered,
         } = placed;
@@ -1515,7 +1516,20 @@ impl Plan {
         // meridian flip misses the stars that photometry measures; the
         // integration normalizes every frame on its own.
         let starts_panel = refined;
-        if starts_panel && uncovered > 0 {
+        let mut incoming = match incoming {
+            Some(incoming) => Some(incoming),
+            None if starts_panel => Some(crate::registration::resample_region_sited(
+                source,
+                width,
+                height,
+                region,
+                crate::registration::FrameGeometry::Similarity(transform),
+                options.interpolation.into(),
+                sites,
+            )?),
+            None => None,
+        };
+        if let Some(incoming) = incoming.as_mut().filter(|_| starts_panel && uncovered > 0) {
             let landed = stars
                 .iter()
                 .map(|star| {
@@ -1523,8 +1537,9 @@ impl Plan {
                     (x - region.x as f64, y - region.y as f64)
                 })
                 .collect::<Vec<_>>();
+            let existing = crop(&self.image, region, dx, dy)?;
             self.match_panel(
-                &mut incoming,
+                incoming,
                 &existing,
                 region,
                 (dx, dy),
@@ -1535,7 +1550,11 @@ impl Plan {
         }
 
         // Every check has passed: commit.
-        let filled = self.commit((width, height, dx, dy), region, &incoming, starts_panel)?;
+        let filled = self.commit(
+            (width, height, dx, dy),
+            region,
+            incoming.as_ref().filter(|_| starts_panel),
+        )?;
         let mut joined = RegistrationResult {
             transform,
             ..registration
@@ -1551,9 +1570,10 @@ impl Plan {
         // RMS and left copies of each star; built from its first frame, the
         // same frames fit at 0.05px.
         let mut creates_window = false;
-        if filled as f64 >= NEW_PANEL_FRACTION * source_area
+        if let Some(incoming) = incoming.as_ref().filter(|_| starts_panel)
+            && filled as f64 >= NEW_PANEL_FRACTION * source_area
             && let Ok(panel) =
-                Window::from_pixels(&incoming, region, &options.registration, options.scale())
+                Window::from_pixels(incoming, region, &options.registration, options.scale())
         {
             self.windows.push(panel);
             self.last_window = self.windows.len() - 1;
@@ -1647,21 +1667,23 @@ impl Plan {
     }
 
     /// Grow the canvas to `width` by `height`, the present one `dx`, `dy`
-    /// from its origin, and when `fill`, fill the samples of `region` only
-    /// `incoming` defines. Returns the samples filled.
+    /// from its origin, and fill the samples of `region` only the frame
+    /// resampled onto it, `fill`, defines. Returns the samples filled.
     fn commit(
         &mut self,
         (width, height, dx, dy): (usize, usize, usize, usize),
         region: ReferenceRegion,
-        incoming: &LinearImage,
-        fill: bool,
+        fill: Option<&LinearImage>,
     ) -> Result<usize> {
         if (width, height, dx, dy) != (self.image.width, self.image.height, 0, 0) {
             self.grow(width, height, dx, dy)?;
         }
         let channels = self.image.channels;
         let mut filled = 0;
-        for row in (0..region.height).filter(|_| fill) {
+        let Some(incoming) = fill else {
+            return Ok(0);
+        };
+        for row in 0..region.height {
             let start = ((region.y + row) * width + region.x) * channels;
             let target = &mut self.image.data[start..start + region.width * channels];
             let from = row * region.width * channels;
@@ -1747,26 +1769,24 @@ impl Plan {
         transform.translation_y += dy as f64;
         let region = footprint(source, transform, width, height)
             .ok_or_else(|| Error::Registration("panel footprint is empty".into()))?;
-        let incoming = crate::registration::resample_region_sited(
-            source,
-            width,
-            height,
-            region,
-            crate::registration::FrameGeometry::Similarity(transform),
-            options.interpolation.into(),
-            sites,
-        )?;
-        let existing = crop(&self.image, region, dx, dy)?;
-        let (mut common, mut uncovered) = (0, 0);
-        for (a, b) in existing.data.iter().zip(&incoming.data) {
-            if b.is_finite() {
-                if a.is_finite() {
-                    common += 1;
-                } else {
-                    uncovered += 1;
-                }
+        // Most frames join within sky the canvas holds, and their pixels are
+        // never wanted: only which samples they cover. Resample only when
+        // that cannot be told from the geometry.
+        let geometry = crate::registration::FrameGeometry::Similarity(transform);
+        let sampling = options.interpolation.into();
+        let (incoming, covered) = match crate::registration::resampled_coverage(
+            source, region, geometry, sampling, sites,
+        )? {
+            Some(covered) => (None, covered),
+            None => {
+                let incoming = crate::registration::resample_region_sited(
+                    source, width, height, region, geometry, sampling, sites,
+                )?;
+                let covered = incoming.data.iter().map(|v| v.is_finite()).collect();
+                (Some(incoming), covered)
             }
-        }
+        };
+        let (common, uncovered) = overlap(&self.image, region, (dx, dy), &covered);
         Ok(Placement {
             width,
             height,
@@ -1775,7 +1795,6 @@ impl Plan {
             transform,
             region,
             incoming,
-            existing,
             common,
             uncovered,
         })
@@ -2277,7 +2296,7 @@ impl Plan {
                 options,
             )?;
         }
-        self.commit((width, height, dx, dy), region, &incoming, true)?;
+        self.commit((width, height, dx, dy), region, Some(&incoming))?;
         if start.creates_window {
             self.windows.push(
                 Window::from_pixels(&incoming, region, &options.registration, options.scale())?
@@ -2684,6 +2703,45 @@ fn region_within(
         width: right - x,
         height: bottom - y,
     })
+}
+
+/// The samples `covered` marks on `region` of a canvas about to move `dx`
+/// and `dy` from its origin, as [`crop`] would hold them: those the canvas
+/// also defines, and those it does not.
+fn overlap(
+    canvas: &LinearImage,
+    region: ReferenceRegion,
+    (dx, dy): (usize, usize),
+    covered: &[bool],
+) -> (usize, usize) {
+    let channels = canvas.channels;
+    let row_samples = region.width * channels;
+    covered
+        .par_chunks(row_samples)
+        .enumerate()
+        .map(|(row, covered)| {
+            let defined = |x: usize| {
+                let column = region.x + x / channels;
+                (region.y + row)
+                    .checked_sub(dy)
+                    .filter(|&y| y < canvas.height)
+                    .zip(column.checked_sub(dx).filter(|&x| x < canvas.width))
+                    .is_some_and(|(y, column)| {
+                        canvas.data[(y * canvas.width + column) * channels + x % channels]
+                            .is_finite()
+                    })
+            };
+            let common = covered
+                .iter()
+                .enumerate()
+                .filter(|&(x, &covered)| covered && defined(x))
+                .count();
+            (
+                common,
+                covered.iter().filter(|&&covered| covered).count() - common,
+            )
+        })
+        .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
 }
 
 /// `region` of a canvas about to move `dx` and `dy` from its origin: the
@@ -3326,5 +3384,46 @@ mod tests {
         assert!(moved.data[..4].iter().all(|v| v.is_nan()));
         assert_eq!(&moved.data[4..], &[1.0, 2.0]);
         assert_eq!(crop(&canvas, region, 0, 0).unwrap().data, canvas.data);
+    }
+
+    /// The overlap counted on the canvas is the one its crop gives, for a
+    /// canvas with gaps, about to move, under a region reaching past it.
+    #[test]
+    fn overlap_counts_what_the_crop_holds() {
+        let (width, height, channels) = (9, 7, 3);
+        let data = (0..width * height * channels)
+            .map(|index| {
+                if index % 7 == 3 {
+                    f32::NAN
+                } else {
+                    index as f32
+                }
+            })
+            .collect();
+        let canvas = LinearImage::new(width, height, channels, data).unwrap();
+        let region = ReferenceRegion {
+            x: 1,
+            y: 2,
+            width: 10,
+            height: 8,
+        };
+        let covered = (0..region.width * region.height * channels)
+            .map(|index| index % 5 != 1)
+            .collect::<Vec<_>>();
+        for shift in [(0, 0), (2, 1), (4, 6)] {
+            let crop = crop(&canvas, region, shift.0, shift.1).unwrap();
+            let common = crop
+                .data
+                .iter()
+                .zip(&covered)
+                .filter(|(value, covered)| **covered && value.is_finite())
+                .count();
+            let all = covered.iter().filter(|covered| **covered).count();
+            assert!(common > 0 && common < all);
+            assert_eq!(
+                overlap(&canvas, region, shift, &covered),
+                (common, all - common)
+            );
+        }
     }
 }

@@ -1866,6 +1866,63 @@ pub(crate) fn resample_region_sited(
     LinearImage::new(region.width, region.height, 3, data)
 }
 
+/// Which samples [`resample_region_sited`] would leave finite, sample by
+/// sample, without interpolating: for counting what a frame covers when its
+/// pixels are not wanted. A sample is finite exactly where its channel's
+/// source position lies within the source, when every source sample is
+/// finite and small enough that no interpolation overflows. `None` for a
+/// source that is not, or for photosite sampling, which fills one channel
+/// of each pixel.
+pub(crate) fn resampled_coverage(
+    source: &LinearImage,
+    region: ReferenceRegion,
+    geometry: FrameGeometry<'_>,
+    sampling: Sampling,
+    sites: Option<ChannelSites>,
+) -> Result<Option<Vec<bool>>> {
+    // Interpolation weights sum to one and Lanczos's clamped lobes stay
+    // within a few times the taps, so a quarter of f32's range is safe.
+    const LARGEST: f32 = f32::MAX / 16.0;
+    if matches!(sampling, Sampling::NearestPhotosite(_))
+        || !source
+            .data
+            .iter()
+            .all(|value| value.is_finite() && value.abs() <= LARGEST)
+    {
+        return Ok(None);
+    }
+    let channels = source.channels;
+    let sites = match sites.filter(|_| channels == 3) {
+        Some(ChannelSites(sites)) => sites.to_vec(),
+        None => vec![(0.0, 0.0); channels],
+    };
+    let inverse: Box<dyn Fn(f64, f64) -> (f64, f64) + Sync> = match geometry {
+        FrameGeometry::Similarity(transform) => {
+            transform.validate()?;
+            Box::new(transform.inverse_map())
+        }
+        FrameGeometry::Warp(warp) => {
+            warp.validate()?;
+            Box::new(|x, y| warp.apply(x, y))
+        }
+    };
+    let maximum_x = (source.width - 1) as f64;
+    let maximum_y = (source.height - 1) as f64;
+    let mut covered = vec![false; region.width * region.height * channels];
+    covered
+        .par_chunks_mut(region.width * channels)
+        .enumerate()
+        .for_each(|(y, row)| {
+            for (x, pixel) in row.chunks_exact_mut(channels).enumerate() {
+                let (source_x, source_y) = inverse((region.x + x) as f64, (region.y + y) as f64);
+                for (covered, &(dx, dy)) in pixel.iter_mut().zip(&sites) {
+                    *covered = within_source(source_x - dx, source_y - dy, maximum_x, maximum_y);
+                }
+            }
+        });
+    Ok(Some(covered))
+}
+
 /// How a resampled sample is formed from the source.
 #[derive(Clone, Copy)]
 pub(crate) enum Sampling {
@@ -4174,5 +4231,91 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The coverage told from geometry is the resampled image's finite
+    /// samples exactly: by similarity and by warp, bilinear and Lanczos,
+    /// with and without channel sites, mono and colour, at the frame's
+    /// edges as well as within it; and there is none to tell for a source
+    /// with a missing sample or for photosite sampling.
+    #[test]
+    fn resampled_coverage_is_the_resampled_finite_samples() {
+        let (width, height) = (61, 47);
+        let image = |channels: usize| {
+            let data = (0..width * height * channels)
+                .map(|index| 100.0 + ((index * 37) % 101) as f32)
+                .collect::<Vec<_>>();
+            LinearImage::new(width, height, channels, data).unwrap()
+        };
+        let transform = SimilarityTransform {
+            translation_x: 23.375,
+            translation_y: 11.125,
+            rotation_radians: 0.41,
+            scale: 1.03,
+        };
+        let warp = PolynomialWarp::from_similarity(SimilarityTransform {
+            translation_x: -18.25,
+            translation_y: -6.5,
+            rotation_radians: -0.37,
+            scale: 0.97,
+        });
+        let region = ReferenceRegion {
+            x: 3,
+            y: 2,
+            width: 90,
+            height: 80,
+        };
+        let sites = ChannelSites([(0.5, -0.5), (0.0, 0.0), (-0.5, 0.5)]);
+        for channels in [1, 3] {
+            let source = image(channels);
+            for geometry in [
+                FrameGeometry::Similarity(transform),
+                FrameGeometry::Warp(&warp),
+            ] {
+                for sampling in [Sampling::Bilinear, Sampling::Lanczos3] {
+                    for sited in [None, Some(sites)] {
+                        let resampled = resample_region_sited(
+                            &source, 100, 90, region, geometry, sampling, sited,
+                        )
+                        .unwrap();
+                        let covered =
+                            resampled_coverage(&source, region, geometry, sampling, sited)
+                                .unwrap()
+                                .unwrap();
+                        let finite = resampled
+                            .data
+                            .iter()
+                            .map(|value| value.is_finite())
+                            .collect::<Vec<_>>();
+                        assert!(finite.contains(&true) && finite.contains(&false));
+                        assert_eq!(covered, finite);
+                    }
+                }
+            }
+        }
+        let mut gap = image(3);
+        gap.data[100] = f32::NAN;
+        let geometry = FrameGeometry::Similarity(transform);
+        assert!(
+            resampled_coverage(&gap, region, geometry, Sampling::Bilinear, None)
+                .unwrap()
+                .is_none()
+        );
+        let layout = crate::BayerLayout {
+            pattern: seiza_fits::BayerPattern::Rggb,
+            x_offset: 0,
+            y_offset: 0,
+        };
+        assert!(
+            resampled_coverage(
+                &image(3),
+                region,
+                geometry,
+                Sampling::NearestPhotosite(layout),
+                None
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 }
