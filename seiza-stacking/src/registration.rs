@@ -2414,33 +2414,46 @@ fn translation_candidates(
     maximum_drift_pixels: f64,
 ) -> Vec<SimilarityTransform> {
     let bin_size = options.match_tolerance_pixels * 2.0;
-    // The votes are ordered by an explicit sort below, so the hash only
-    // needs to be quick, and sized for every pair it never rehashes: 160,000
-    // pairs for 200 stars against 800, nearly each in a bin of its own.
-    let mut votes = rustc_hash::FxHashMap::<(i32, i32), TranslationVote>::with_capacity_and_hasher(
-        source.len() * reference.len(),
-        Default::default(),
-    );
-    for source in source {
-        for reference in reference {
-            let translation_x = reference.x - source.x;
-            let translation_y = reference.y - source.y;
+    let translation = |pair: usize| {
+        let (source, reference) = (
+            &source[pair / reference.len()],
+            &reference[pair % reference.len()],
+        );
+        (reference.x - source.x, reference.y - source.y)
+    };
+    // Each pair within the drift, by its bin, in the order the pairs are
+    // scanned. Sorting these and summing each run of one bin gives every
+    // bin the votes, and the sums in the order, a map filled in that scan
+    // would: 800 stars against 800 fall in some 450,000 bins, and a map that
+    // size missed the cache on nearly every vote.
+    let mut binned = (0..source.len() * reference.len())
+        .into_par_iter()
+        .filter_map(|pair| {
+            let (translation_x, translation_y) = translation(pair);
             if translation_x.hypot(translation_y) > maximum_drift_pixels {
-                continue;
+                return None;
             }
             let key = (
                 (translation_x / bin_size).round() as i32,
                 (translation_y / bin_size).round() as i32,
             );
-            let vote = votes.entry(key).or_default();
-            vote.count += 1;
-            vote.sum_x += translation_x;
-            vote.sum_y += translation_y;
-        }
-    }
-    let mut votes = votes
-        .into_iter()
-        .filter(|(_, vote)| vote.count >= options.minimum_matches)
+            Some((key, pair))
+        })
+        .collect::<Vec<_>>();
+    binned.par_sort_unstable();
+    let mut votes = binned
+        .chunk_by(|left, right| left.0 == right.0)
+        .filter(|run| run.len() >= options.minimum_matches)
+        .map(|run| {
+            let mut vote = TranslationVote::default();
+            for &(_, pair) in run {
+                let (translation_x, translation_y) = translation(pair);
+                vote.count += 1;
+                vote.sum_x += translation_x;
+                vote.sum_y += translation_y;
+            }
+            (run[0].0, vote)
+        })
         .collect::<Vec<_>>();
     votes.sort_unstable_by(|(left_key, left), (right_key, right)| {
         right
@@ -4481,6 +4494,80 @@ mod tests {
                 registrar.triangle_candidates(&source_triangles, source_stars),
                 expected,
                 "{maximum_candidates} candidates"
+            );
+        }
+    }
+
+    /// Votes summed by sorted runs pick the same translations, with the same
+    /// means to the bit, as a map filled in the order the pairs are scanned:
+    /// for a shifted copy of a field with stars added and lost, and with a
+    /// drift limit that turns some pairs away.
+    #[test]
+    fn translation_candidates_match_votes_kept_in_a_map() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1_u64 << 53) as f64
+        };
+        let reference = (0..300)
+            .map(|_| star(2000.0 * next(), 1500.0 * next()))
+            .collect::<Vec<_>>();
+        let mut source = Vec::new();
+        for kept in reference.iter().take(260) {
+            let (x, y) = (kept.x - 37.3 + 0.4 * next(), kept.y + 12.6 + 0.4 * next());
+            source.push(star(x, y));
+        }
+        for _ in 0..40 {
+            let (x, y) = (2000.0 * next(), 1500.0 * next());
+            source.push(star(x, y));
+        }
+        let options = RegistrationOptions::default();
+        for drift in [5000.0, 600.0] {
+            let bin_size = options.match_tolerance_pixels * 2.0;
+            let mut map = HashMap::<(i32, i32), TranslationVote>::new();
+            for source in &source {
+                for reference in &reference {
+                    let translation_x = reference.x - source.x;
+                    let translation_y = reference.y - source.y;
+                    if translation_x.hypot(translation_y) > drift {
+                        continue;
+                    }
+                    let vote = map
+                        .entry((
+                            (translation_x / bin_size).round() as i32,
+                            (translation_y / bin_size).round() as i32,
+                        ))
+                        .or_default();
+                    vote.count += 1;
+                    vote.sum_x += translation_x;
+                    vote.sum_y += translation_y;
+                }
+            }
+            let mut votes = map
+                .into_iter()
+                .filter(|(_, vote)| vote.count >= options.minimum_matches)
+                .collect::<Vec<_>>();
+            votes.sort_unstable_by(|(left_key, left), (right_key, right)| {
+                right
+                    .count
+                    .cmp(&left.count)
+                    .then_with(|| left_key.cmp(right_key))
+            });
+            votes.truncate(options.maximum_candidates.min(64));
+            let expected = votes
+                .into_iter()
+                .map(|(_, vote)| SimilarityTransform {
+                    translation_x: vote.sum_x / vote.count as f64,
+                    translation_y: vote.sum_y / vote.count as f64,
+                    ..SimilarityTransform::IDENTITY
+                })
+                .collect::<Vec<_>>();
+            assert!(expected.len() > 1);
+            assert_eq!(
+                translation_candidates(&source, &reference, &options, drift),
+                expected
             );
         }
     }
