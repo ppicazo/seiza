@@ -3001,8 +3001,10 @@ impl IntegrationHalf<'_> {
             self.accumulator
                 .classify_placed(placed, self.options.rejection, weights);
         // A photosite frame offers one sample per pixel, not one per channel.
+        // This runs on the one serial stage a pipeline waits on, so the
+        // count of a canvas frame's ~50 million samples runs in parallel.
         let offered = if self.expanded_canvas {
-            registered.data.iter().filter(|v| v.is_finite()).count()
+            registered.data.par_iter().filter(|v| v.is_finite()).count()
         } else if photosites {
             registered.pixel_count()
         } else {
@@ -3114,7 +3116,7 @@ impl Accumulator {
     ) {
         if mask.channels != 1
             || (mask.width, mask.height) != (region.width, region.height)
-            || !mask.data.iter().any(|&value| value > 0.0)
+            || !mask.data.par_iter().any(|&value| value > 0.0)
         {
             return;
         }
