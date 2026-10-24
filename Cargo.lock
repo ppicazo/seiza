@@ -3300,6 +3300,7 @@ dependencies = [
  "bytemuck",
  "multiversion",
  "naga",
+ "objc2-metal",
  "pollster",
  "postcard",
  "rayon",
@@ -3318,6 +3319,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "wgpu",
+ "windows",
  "zstd",
 ]
 
