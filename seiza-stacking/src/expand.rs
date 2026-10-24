@@ -129,6 +129,11 @@ const MAXIMUM_GEOMETRY_ERROR_PIXELS: f64 = 0.02;
 /// the poses' polynomials missed the start's bound by up to 0.05 px on 70.
 const SEED_GEOMETRY_ERROR_PIXELS: f64 = 0.2;
 
+/// Frames planning reads, prepares and finds the stars of ahead of the one
+/// registering: enough to keep the planning thread fed, few enough that the
+/// prepared frames waiting stay a few hundred megabytes.
+const PLAN_READ_AHEAD: usize = 3;
+
 /// Columns and rows of the grid of a panel start's pixels its polynomial is
 /// fitted through.
 const GEOMETRY_GRID: (usize, usize) = (24, 16);
@@ -1167,6 +1172,17 @@ pub(crate) fn plan(
         Ok((frame.image, optics, sites))
     };
     let prepare = |path: &Path, channels: usize| prepare_at(path, channels, options.bin_factor);
+    // A frame read for the first time, prepared, with the stars the anchor's
+    // panel detects in it: the detector depends only on the options, so it
+    // runs off the planning thread.
+    let detector = plan.windows[0].registrar.clone();
+    let channels = plan.image.channels;
+    let measure =
+        |path: &Path| -> Result<(LinearImage, OpticalMetadata, Sites, Vec<DetectedStar>)> {
+            let (prepared, optics, sites) = prepare(path, channels)?;
+            let stars = detector.detect_source_stars(&prepared);
+            Ok((prepared, optics, sites, stars))
+        };
     let mut pending = paths[1..]
         .iter()
         .map(|path| Pending {
@@ -1188,103 +1204,135 @@ pub(crate) fn plan(
         let mut deferred = Vec::new();
         let mut first_error = None;
         let mut waiting_for_pier_side = false;
-        for mut item in pending {
-            let path = item.path;
-            if progress(
-                path,
-                plan.registrations.len(),
-                plan.image.width,
-                plan.image.height,
-            ) == Continue::No
-            {
-                return Err(Error::Cancelled);
-            }
-            check_source(path)?;
-            // A frame that matched no panel keeps its stars, and is read
-            // again only once a panel added since then matches it.
-            let mut image = None;
-            if item.size.is_none() {
-                let (prepared, optics, sites) = prepare(path, plan.image.channels)?;
-                item.optics = Some(optics);
-                item.stars = plan.windows[0].registrar.detect_source_stars(&prepared);
-                item.size = Some((prepared.width, prepared.height));
-                image = Some((prepared, sites));
-            }
-            let (width, height) = item.size.expect("the frame was measured");
-            let panels = plan.windows.len();
-            let joined = match plan.register(&item.stars, width, height, item.tried, options) {
-                Err(error) => {
-                    item.tried = panels;
-                    Err(error)
-                }
-                Ok((registration, window, coverage)) => {
-                    let (image, sites) = match image {
-                        Some(image) => image,
-                        None => {
-                            let (image, _, sites) = prepare(path, plan.image.channels)?;
-                            (image, sites)
-                        }
-                    };
-                    let offer = plan.join(
-                        path,
-                        (&image, sites),
-                        &item.stars,
-                        (registration, window, coverage),
-                        flipped_start,
-                        options,
-                        maximum_samples,
-                    );
-                    // The canvas may yet grow enough for any panel to admit it.
-                    item.tried = 0;
-                    offer.map(|offer| (offer, window))
-                }
-            };
-            match joined {
-                Ok((Offer::Joined(registration, starts_panel), window)) => {
-                    plan.registrations.insert(
-                        path_identity(path),
-                        PlannedRegistration {
-                            result: Ok(registration),
-                            stamp: stamps[path],
-                            starts_panel,
-                        },
-                    );
-                    plan.record.optics.push((
-                        path.clone(),
-                        item.optics.take().expect("the frame was measured"),
-                    ));
-                    plan.record.joined.push(Joined {
-                        path: path.clone(),
-                        stars: std::mem::take(&mut item.stars),
-                        size: (width, height),
-                        window,
-                        starts_panel,
-                    });
-                }
-                Ok((Offer::Flipped, _)) => {
-                    waiting_for_pier_side = true;
-                    deferred.push(item);
-                }
-                Ok((Offer::Short(overlap), _)) => {
-                    item.overlap = Some(item.overlap.map_or(overlap, |best| best.max(overlap)));
-                    let error = Error::Registration(format!(
-                        "panel overlap {overlap:.3} is below {}",
-                        options.acceptance.minimum_overlap_fraction
-                    ));
-                    first_error.get_or_insert_with(|| format!("{}: {error}", path.display()));
-                    item.error = Some(error.to_string());
-                    deferred.push(item);
-                }
-                Err(error) => {
-                    if !retryable(&error) {
-                        return Err(error);
+        // Every frame not yet read, in this pass's order, is read, prepared
+        // and has its stars found a few frames ahead, while earlier frames
+        // register and join; each joins as before, in order, with the same
+        // stars, and a frame's error surfaces when the pass reaches it.
+        let unread = pending
+            .iter()
+            .filter(|item| item.size.is_none())
+            .map(|item| item.path)
+            .collect::<Vec<_>>();
+        crate::tasks::ahead(|ahead| {
+            std::thread::scope(|scope| -> Result<()> {
+                let mut unread = unread.into_iter();
+                let mut reading = std::collections::VecDeque::new();
+                for mut item in pending {
+                    while reading.len() < PLAN_READ_AHEAD
+                        && let Some(path) = unread.next()
+                    {
+                        reading.push_back(ahead.spawn(
+                            scope,
+                            || vec![path.to_path_buf()],
+                            move || measure(path),
+                        ));
                     }
-                    first_error.get_or_insert_with(|| format!("{}: {error}", path.display()));
-                    item.error = Some(error.to_string());
-                    deferred.push(item);
+                    let path = item.path;
+                    if progress(
+                        path,
+                        plan.registrations.len(),
+                        plan.image.width,
+                        plan.image.height,
+                    ) == Continue::No
+                    {
+                        return Err(Error::Cancelled);
+                    }
+                    check_source(path)?;
+                    // A frame that matched no panel keeps its stars, and is read
+                    // again only once a panel added since then matches it.
+                    let mut image = None;
+                    if item.size.is_none() {
+                        let measured = reading
+                            .pop_front()
+                            .expect("every unread frame is read ahead");
+                        let (prepared, optics, sites, stars) = ahead.join(measured)?;
+                        item.optics = Some(optics);
+                        item.stars = stars;
+                        item.size = Some((prepared.width, prepared.height));
+                        image = Some((prepared, sites));
+                    }
+                    let (width, height) = item.size.expect("the frame was measured");
+                    let panels = plan.windows.len();
+                    let joined =
+                        match plan.register(&item.stars, width, height, item.tried, options) {
+                            Err(error) => {
+                                item.tried = panels;
+                                Err(error)
+                            }
+                            Ok((registration, window, coverage)) => {
+                                let (image, sites) = match image {
+                                    Some(image) => image,
+                                    None => {
+                                        let (image, _, sites) = prepare(path, plan.image.channels)?;
+                                        (image, sites)
+                                    }
+                                };
+                                let offer = plan.join(
+                                    path,
+                                    (&image, sites),
+                                    &item.stars,
+                                    (registration, window, coverage),
+                                    flipped_start,
+                                    options,
+                                    maximum_samples,
+                                );
+                                // The canvas may yet grow enough for any panel to admit it.
+                                item.tried = 0;
+                                offer.map(|offer| (offer, window))
+                            }
+                        };
+                    match joined {
+                        Ok((Offer::Joined(registration, starts_panel), window)) => {
+                            plan.registrations.insert(
+                                path_identity(path),
+                                PlannedRegistration {
+                                    result: Ok(registration),
+                                    stamp: stamps[path],
+                                    starts_panel,
+                                },
+                            );
+                            plan.record.optics.push((
+                                path.clone(),
+                                item.optics.take().expect("the frame was measured"),
+                            ));
+                            plan.record.joined.push(Joined {
+                                path: path.clone(),
+                                stars: std::mem::take(&mut item.stars),
+                                size: (width, height),
+                                window,
+                                starts_panel,
+                            });
+                        }
+                        Ok((Offer::Flipped, _)) => {
+                            waiting_for_pier_side = true;
+                            deferred.push(item);
+                        }
+                        Ok((Offer::Short(overlap), _)) => {
+                            item.overlap =
+                                Some(item.overlap.map_or(overlap, |best| best.max(overlap)));
+                            let error = Error::Registration(format!(
+                                "panel overlap {overlap:.3} is below {}",
+                                options.acceptance.minimum_overlap_fraction
+                            ));
+                            first_error
+                                .get_or_insert_with(|| format!("{}: {error}", path.display()));
+                            item.error = Some(error.to_string());
+                            deferred.push(item);
+                        }
+                        Err(error) => {
+                            if !retryable(&error) {
+                                return Err(error);
+                            }
+                            first_error
+                                .get_or_insert_with(|| format!("{}: {error}", path.display()));
+                            item.error = Some(error.to_string());
+                            deferred.push(item);
+                        }
+                    }
                 }
-            }
-        }
+                Ok(())
+            })
+        })?;
         if deferred.len() == before {
             if waiting_for_pier_side && !flipped_start {
                 flipped_start = true;
