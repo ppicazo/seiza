@@ -225,7 +225,7 @@ impl AffineTransform {
         self.matrix[0][0].mul_add(self.matrix[1][1], -self.matrix[0][1] * self.matrix[1][0])
     }
 
-    fn inverse_map(self) -> impl Fn(f64, f64) -> (f64, f64) {
+    pub(crate) fn inverse_map(self) -> impl Fn(f64, f64) -> (f64, f64) {
         let determinant = self.determinant();
         let inverse = [
             [
@@ -879,13 +879,24 @@ pub struct Registrar {
 
 impl Registrar {
     /// Detect stars in the reference frame and prepare the matching index.
+    /// Stars, the reference's and those of each frame [`Self::register`]
+    /// registers, are detected on the GPU where the default
+    /// [`crate::GpuOptions`] allow it; see [`Self::new_with_gpu`].
     pub fn new(reference: &LinearImage, options: RegistrationOptions) -> Result<Self> {
-        Self::at_scale(
-            reference,
-            &options,
-            Scale::NATIVE,
-            &crate::GpuOptions::default(),
-        )
+        Self::new_with_gpu(reference, options, &crate::GpuOptions::default())
+    }
+
+    /// [`Self::new`], detecting stars on the GPU only where `gpu` allows
+    /// it: the reference's here, and each source frame's in
+    /// [`Self::register`]. [`crate::GpuOptions::cpu`] keeps detection on the
+    /// CPU.
+    pub fn new_with_gpu(
+        reference: &LinearImage,
+        options: RegistrationOptions,
+        gpu: &crate::GpuOptions,
+    ) -> Result<Self> {
+        gpu.validate()?;
+        Self::at_scale(reference, &options, Scale::NATIVE, gpu)
     }
 
     /// [`Self::new`] for a reference binned at `scale`, with `options` in
@@ -1451,14 +1462,35 @@ pub(crate) fn refine_similarity(
 
 /// Resample a source image through a fitted source-to-reference transform.
 /// Samples outside the source grid, or whose interpolation neighborhood is
-/// not finite, are written as `NaN`.
+/// not finite, are written as `NaN`. The image is resampled on the GPU where
+/// the default [`crate::GpuOptions`] allow it; see
+/// [`resample_to_reference_with_gpu`].
 pub fn resample_to_reference(
     source: &LinearImage,
     width: usize,
     height: usize,
     transform: SimilarityTransform,
 ) -> Result<LinearImage> {
-    resample_region_to_reference(
+    resample_to_reference_with_gpu(
+        source,
+        width,
+        height,
+        transform,
+        &crate::GpuOptions::default(),
+    )
+}
+
+/// [`resample_to_reference`], resampling bilinearly on the GPU only where
+/// `gpu` allows it. [`crate::GpuOptions::cpu`] keeps the resampling on the
+/// CPU.
+pub fn resample_to_reference_with_gpu(
+    source: &LinearImage,
+    width: usize,
+    height: usize,
+    transform: SimilarityTransform,
+    gpu: &crate::GpuOptions,
+) -> Result<LinearImage> {
+    resample_region_to_reference_with_gpu(
         source,
         width,
         height,
@@ -1469,6 +1501,8 @@ pub fn resample_to_reference(
             height,
         },
         transform,
+        Interpolation::Bilinear,
+        gpu,
     )
 }
 
@@ -1476,7 +1510,8 @@ pub fn resample_to_reference(
 /// full registered image. Output pixel `(0, 0)` corresponds to
 /// `(region.x, region.y)` in reference coordinates. Samples outside the source
 /// grid, or whose interpolation neighborhood is not finite, are written as
-/// `NaN`.
+/// `NaN`. Bilinear [`resample_region_to_reference_with_gpu`] takes GPU
+/// options.
 pub fn resample_region_to_reference(
     source: &LinearImage,
     reference_width: usize,
@@ -1494,7 +1529,9 @@ pub fn resample_region_to_reference(
     )
 }
 
-/// [`resample_region_to_reference`] with a choice of interpolation.
+/// [`resample_region_to_reference`] with a choice of interpolation. The
+/// image is resampled on the GPU where the default [`crate::GpuOptions`]
+/// allow it; see [`resample_region_to_reference_with_gpu`].
 pub fn resample_region_to_reference_with(
     source: &LinearImage,
     reference_width: usize,
@@ -1503,6 +1540,31 @@ pub fn resample_region_to_reference_with(
     transform: SimilarityTransform,
     interpolation: Interpolation,
 ) -> Result<LinearImage> {
+    resample_region_to_reference_with_gpu(
+        source,
+        reference_width,
+        reference_height,
+        region,
+        transform,
+        interpolation,
+        &crate::GpuOptions::default(),
+    )
+}
+
+/// [`resample_region_to_reference_with`], resampling on the GPU only where
+/// `gpu` allows it. [`crate::GpuOptions::cpu`] keeps the resampling on the
+/// CPU. A whole frame is the region at `(0, 0)` the size of the reference
+/// grid.
+pub fn resample_region_to_reference_with_gpu(
+    source: &LinearImage,
+    reference_width: usize,
+    reference_height: usize,
+    region: ReferenceRegion,
+    transform: SimilarityTransform,
+    interpolation: Interpolation,
+    gpu: &crate::GpuOptions,
+) -> Result<LinearImage> {
+    gpu.validate()?;
     transform.validate()?;
     resample_region_with_inverse(
         source,
@@ -1510,11 +1572,8 @@ pub fn resample_region_to_reference_with(
         reference_height,
         region,
         transform.inverse_map(),
-        match interpolation {
-            Interpolation::Bilinear => Sampling::Bilinear,
-            Interpolation::Lanczos3 => Sampling::Lanczos3,
-        },
-        &crate::GpuOptions::default(),
+        Sampling::from(interpolation),
+        gpu,
     )
 }
 
@@ -1552,6 +1611,9 @@ impl Interpolation {
 /// these are the raw sensor values. Integrating many frames that land on
 /// different photosites fills every channel without interpolation; this is
 /// Bayer drizzle with a one-pixel drop at the reference scale.
+///
+/// This uses the default [`crate::GpuOptions`]; see
+/// [`resample_region_photosites_with_gpu`].
 pub fn resample_region_photosites(
     source: &LinearImage,
     reference_width: usize,
@@ -1560,6 +1622,30 @@ pub fn resample_region_photosites(
     transform: SimilarityTransform,
     layout: crate::BayerLayout,
 ) -> Result<LinearImage> {
+    resample_region_photosites_with_gpu(
+        source,
+        reference_width,
+        reference_height,
+        region,
+        transform,
+        layout,
+        &crate::GpuOptions::default(),
+    )
+}
+
+/// [`resample_region_photosites`] under `gpu`. Nearest-photosite sampling
+/// has no GPU path yet and runs on the CPU whatever `gpu` allows; a later
+/// GPU path will follow `gpu`.
+pub fn resample_region_photosites_with_gpu(
+    source: &LinearImage,
+    reference_width: usize,
+    reference_height: usize,
+    region: ReferenceRegion,
+    transform: SimilarityTransform,
+    layout: crate::BayerLayout,
+    gpu: &crate::GpuOptions,
+) -> Result<LinearImage> {
+    gpu.validate()?;
     transform.validate()?;
     if source.channels != 3 {
         return Err(Error::Registration(
@@ -1573,7 +1659,7 @@ pub fn resample_region_photosites(
         region,
         transform.inverse_map(),
         Sampling::NearestPhotosite(layout),
-        &crate::GpuOptions::default(),
+        gpu,
     )
 }
 
@@ -1887,7 +1973,9 @@ fn within_source(source_x: f64, source_y: f64, maximum_x: f64, maximum_y: f64) -
 }
 
 /// Resample one reference-grid region through a polynomial warp from
-/// [`RegistrationResult::warp`].
+/// [`RegistrationResult::warp`]. The image is resampled on the GPU where the
+/// default [`crate::GpuOptions`] allow it; see
+/// [`resample_region_warped_with_gpu`].
 pub fn resample_region_warped(
     source: &LinearImage,
     reference_width: usize,
@@ -1896,6 +1984,29 @@ pub fn resample_region_warped(
     warp: &PolynomialWarp,
     interpolation: Interpolation,
 ) -> Result<LinearImage> {
+    resample_region_warped_with_gpu(
+        source,
+        reference_width,
+        reference_height,
+        region,
+        warp,
+        interpolation,
+        &crate::GpuOptions::default(),
+    )
+}
+
+/// [`resample_region_warped`], resampling on the GPU only where `gpu`
+/// allows it.
+pub fn resample_region_warped_with_gpu(
+    source: &LinearImage,
+    reference_width: usize,
+    reference_height: usize,
+    region: ReferenceRegion,
+    warp: &PolynomialWarp,
+    interpolation: Interpolation,
+    gpu: &crate::GpuOptions,
+) -> Result<LinearImage> {
+    gpu.validate()?;
     resample_region_geometry(
         source,
         reference_width,
@@ -1903,7 +2014,7 @@ pub fn resample_region_warped(
         region,
         FrameGeometry::Warp(warp),
         Sampling::from(interpolation),
-        &crate::GpuOptions::default(),
+        gpu,
     )
 }
 
@@ -2215,14 +2326,34 @@ pub(crate) enum Sampling {
 }
 
 /// Resample a source image through a general source-to-reference affine
-/// transform. This supports parity flips as well as rotation and scale.
+/// transform. This supports parity flips as well as rotation and scale. The
+/// image is resampled on the GPU where the default [`crate::GpuOptions`]
+/// allow it; see [`resample_to_reference_affine_with_gpu`].
 pub fn resample_to_reference_affine(
     source: &LinearImage,
     width: usize,
     height: usize,
     transform: AffineTransform,
 ) -> Result<LinearImage> {
-    resample_region_to_reference_affine(
+    resample_to_reference_affine_with_gpu(
+        source,
+        width,
+        height,
+        transform,
+        &crate::GpuOptions::default(),
+    )
+}
+
+/// [`resample_to_reference_affine`], resampling on the GPU only where `gpu`
+/// allows it. [`crate::GpuOptions::cpu`] keeps the resampling on the CPU.
+pub fn resample_to_reference_affine_with_gpu(
+    source: &LinearImage,
+    width: usize,
+    height: usize,
+    transform: AffineTransform,
+    gpu: &crate::GpuOptions,
+) -> Result<LinearImage> {
+    resample_region_to_reference_affine_with_gpu(
         source,
         width,
         height,
@@ -2233,11 +2364,14 @@ pub fn resample_to_reference_affine(
             height,
         },
         transform,
+        gpu,
     )
 }
 
 /// Resample one bounded reference-grid region through a general affine
-/// transform without allocating the full registered image.
+/// transform without allocating the full registered image. The image is
+/// resampled on the GPU where the default [`crate::GpuOptions`] allow it;
+/// see [`resample_region_to_reference_affine_with_gpu`].
 pub fn resample_region_to_reference_affine(
     source: &LinearImage,
     reference_width: usize,
@@ -2245,6 +2379,27 @@ pub fn resample_region_to_reference_affine(
     region: ReferenceRegion,
     transform: AffineTransform,
 ) -> Result<LinearImage> {
+    resample_region_to_reference_affine_with_gpu(
+        source,
+        reference_width,
+        reference_height,
+        region,
+        transform,
+        &crate::GpuOptions::default(),
+    )
+}
+
+/// [`resample_region_to_reference_affine`], resampling on the GPU only where
+/// `gpu` allows it.
+pub fn resample_region_to_reference_affine_with_gpu(
+    source: &LinearImage,
+    reference_width: usize,
+    reference_height: usize,
+    region: ReferenceRegion,
+    transform: AffineTransform,
+    gpu: &crate::GpuOptions,
+) -> Result<LinearImage> {
+    gpu.validate()?;
     transform.validate()?;
     resample_region_with_inverse(
         source,
@@ -2253,7 +2408,7 @@ pub fn resample_region_to_reference_affine(
         region,
         transform.inverse_map(),
         Sampling::Bilinear,
-        &crate::GpuOptions::default(),
+        gpu,
     )
 }
 
@@ -3175,6 +3330,52 @@ mod tests {
             data[(y * width + 200) * channels..(y * width + 230) * channels].fill(f32::NAN);
         }
         LinearImage::new(width, height, channels, data).unwrap()
+    }
+
+    /// A registrar built under [`crate::GpuOptions::cpu`] detects the
+    /// reference's stars, and each source frame's, on the CPU, on a frame
+    /// large enough for the GPU.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn a_registrar_built_for_the_cpu_detects_stars_there() {
+        let cpu = crate::GpuOptions::cpu();
+        let reference = detection_field(1101, 1003, 3);
+        let registrar =
+            Registrar::new_with_gpu(&reference, RegistrationOptions::default(), &cpu).unwrap();
+        assert_eq!(registrar.gpu, cpu);
+        let on_the_cpu = |image: &LinearImage| {
+            detect(
+                image,
+                &registrar.options,
+                registrar.options.dense_star_count(),
+                Scale::NATIVE,
+                &cpu,
+            )
+        };
+        let bits = |stars: &[DetectedStar]| {
+            stars
+                .iter()
+                .map(|star| (star.x.to_bits(), star.y.to_bits(), star.flux.to_bits()))
+                .collect::<Vec<_>>()
+        };
+        assert!(registrar.detected_stars().len() > 100);
+        assert_eq!(
+            bits(registrar.detected_stars()),
+            bits(&on_the_cpu(&reference))
+        );
+        let source = detection_field(1101, 1003, 1);
+        assert_eq!(
+            bits(&registrar.detect_source_stars(&source)),
+            bits(&on_the_cpu(&source))
+        );
+        assert!(registrar.register(&reference).is_ok());
+        let invalid = crate::GpuOptions {
+            concurrency: 0,
+            ..crate::GpuOptions::default()
+        };
+        assert!(
+            Registrar::new_with_gpu(&reference, RegistrationOptions::default(), &invalid).is_err()
+        );
     }
 
     /// The CPU's detection, as `detect` makes it without a GPU.

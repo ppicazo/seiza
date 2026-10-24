@@ -153,6 +153,8 @@ struct RenderPipelineOptions<'a> {
     sample_domain: &'a SampleDomain,
     max_dimension: u32,
     interactive_preview: bool,
+    /// Where a raw Bayer frame rendered in physical units is debayered.
+    gpu: seiza_stacking::GpuOptions,
 }
 
 type InteractivePreviewCache =
@@ -172,6 +174,18 @@ struct ProcessedRenderRequest {
     deconvolution: Option<DeconvolutionRenderRequest>,
     #[serde(default)]
     interactive_preview: bool,
+    #[serde(default)]
+    gpu: Option<seiza_stacking::GpuOptions>,
+}
+
+/// The parts of an [`ImageRenderConfigRequest`].
+struct RenderRequestParts {
+    stretch: StretchStack,
+    background: Option<BackgroundRenderRequest>,
+    deconvolution: Option<DeconvolutionRenderRequest>,
+    interactive_preview: bool,
+    sample_domain: Option<SampleDomain>,
+    gpu: seiza_stacking::GpuOptions,
 }
 
 #[derive(Debug, Deserialize)]
@@ -182,16 +196,10 @@ enum ImageRenderConfigRequest {
 }
 
 impl ImageRenderConfigRequest {
-    fn into_parts(
-        self,
-    ) -> (
-        StretchStack,
-        Option<BackgroundRenderRequest>,
-        Option<DeconvolutionRenderRequest>,
-        bool,
-        Option<SampleDomain>,
-    ) {
-        match self {
+    /// The request's parts, refusing GPU options that cannot be used, so
+    /// the same request fails whether or not it reaches the debayering.
+    fn into_parts(self) -> Result<RenderRequestParts, String> {
+        let parts = match self {
             Self::Processed(request) => {
                 let ProcessedRenderRequest {
                     stretch,
@@ -199,17 +207,28 @@ impl ImageRenderConfigRequest {
                     background,
                     deconvolution,
                     interactive_preview,
+                    gpu,
                 } = *request;
-                (
-                    stretch.into_stack(),
+                RenderRequestParts {
+                    stretch: stretch.into_stack(),
                     background,
                     deconvolution,
                     interactive_preview,
                     sample_domain,
-                )
+                    gpu: gpu.unwrap_or_default(),
+                }
             }
-            Self::Stretch(request) => (request.into_stack(), None, None, false, None),
-        }
+            Self::Stretch(request) => RenderRequestParts {
+                stretch: request.into_stack(),
+                background: None,
+                deconvolution: None,
+                interactive_preview: false,
+                sample_domain: None,
+                gpu: seiza_stacking::GpuOptions::default(),
+            },
+        };
+        parts.gpu.validate().map_err(stacking_message)?;
+        Ok(parts)
     }
 }
 
@@ -3869,6 +3888,40 @@ pub unsafe extern "C" fn seiza_live_stacker_open_context(
 }
 
 #[unsafe(no_mangle)]
+/// Reopens a live-stack context as [`seiza_live_stacker_open_context`] does,
+/// but runs the stack under the GPU options in `gpu_json` in place of the
+/// options it was saved with. `gpu_json` is a JSON object with the fields of
+/// the `"gpu"` member of [`seiza_live_stacker_open_fits`]'s options, such as
+/// `{"enabled": false}` to keep every pass on the CPU, or `{}` for the
+/// defaults, which let every pass run on the GPU. When `gpu_json` is null or
+/// empty, the stack keeps the options it was saved with, as
+/// [`seiza_live_stacker_open_context`] does. The configuration
+/// fingerprint leaves GPU options out, so it matches the saved stack's, and
+/// a context saved from the reopened handle records the new options.
+///
+/// # Safety
+/// `context_path` must be a valid NUL-terminated path. `gpu_json` may be
+/// null; when non-null it must be NUL-terminated. When non-null,
+/// `error_out` must point to writable storage for one pointer.
+pub unsafe extern "C" fn seiza_live_stacker_open_context_with_gpu(
+    context_path: *const c_char,
+    gpu_json: *const c_char,
+    error_out: *mut *mut c_char,
+) -> *mut SeizaLiveStacker {
+    clear_error(error_out);
+    ffi_result(error_out, || {
+        let context_path = required_path(context_path, "stack context path")?;
+        let stacker = match gpu_options(gpu_json)? {
+            Some(gpu) => LiveStacker::open_context_with_gpu(&context_path, gpu),
+            None => LiveStacker::open_context(&context_path),
+        }
+        .map_err(|error| error.to_string())?;
+        Ok(SeizaLiveStacker { stacker })
+    })
+    .map_or(ptr::null_mut(), |stacker| Box::into_raw(Box::new(stacker)))
+}
+
+#[unsafe(no_mangle)]
 /// Atomically checkpoints every piece of state required to reopen this live
 /// stack and continue integrating with identical online rejection behavior.
 /// The live handle remains usable after the checkpoint completes.
@@ -4331,7 +4384,15 @@ pub unsafe extern "C" fn seiza_live_stacker_render_preview(
         let config_json = required_str(config_json, "stretch config JSON")?;
         let request: ImageRenderConfigRequest = serde_json::from_str(&config_json)
             .map_err(|error| format!("invalid stretch config JSON: {error}"))?;
-        let (stretch, background, deconvolution, _, sample_domain) = request.into_parts();
+        // A live stack renders its accumulator, which is never debayered
+        // here, so the request's GPU options do not apply.
+        let RenderRequestParts {
+            stretch,
+            background,
+            deconvolution,
+            sample_domain,
+            ..
+        } = request.into_parts()?;
         let stacker = unsafe { required_live_stacker(stacker)? };
         let sample_domain = sample_domain
             .unwrap_or_else(|| default_live_preview_sample_domain(stacker.stacker.input_mode()));
@@ -5647,7 +5708,11 @@ pub unsafe extern "C" fn seiza_rendered_image_open_with_rgb_stretch(
 /// `config_json`. The value may be one serialized `seiza-stretch`
 /// `StretchConfig` (the original schema), a non-empty array of configs, or an
 /// object with `stretch`, optional `background`, optional `deconvolution`,
-/// optional `sample_domain`, and optional `interactive_preview` fields. Array
+/// optional `sample_domain`, optional `interactive_preview` and optional
+/// `gpu` fields. `gpu` takes the fields of the `"gpu"` member of
+/// [`seiza_live_stacker_open_fits`]'s options, such as `{"enabled": false}`,
+/// and says whether a raw Bayer frame rendered in physical units is
+/// debayered on the GPU; by default it may be. Array
 /// stages are applied in order using `f32` intermediates and converted to RGBA
 /// only after the final stage. Background correction and deconvolution, when
 /// requested, are applied to linear samples in that order. Sample-domain
@@ -5674,8 +5739,14 @@ pub unsafe extern "C" fn seiza_rendered_image_open_with_stretch_config(
         let config_json = required_str(config_json, "stretch config JSON")?;
         let request: ImageRenderConfigRequest = serde_json::from_str(&config_json)
             .map_err(|error| format!("invalid image processing config JSON: {error}"))?;
-        let (stack, background, deconvolution, interactive_preview, sample_domain) =
-            request.into_parts();
+        let RenderRequestParts {
+            stretch: stack,
+            background,
+            deconvolution,
+            interactive_preview,
+            sample_domain,
+            gpu,
+        } = request.into_parts()?;
         let sample_domain = sample_domain.unwrap_or_default();
         if interactive_preview {
             render_cached_interactive_preview(
@@ -5685,6 +5756,7 @@ pub unsafe extern "C" fn seiza_rendered_image_open_with_stretch_config(
                 deconvolution.as_ref(),
                 &sample_domain,
                 max_dimension,
+                &gpu,
             )
         } else {
             let (image, format) = open_astronomy_image(&path)?;
@@ -5698,6 +5770,7 @@ pub unsafe extern "C" fn seiza_rendered_image_open_with_stretch_config(
                     sample_domain: &sample_domain,
                     max_dimension,
                     interactive_preview: false,
+                    gpu,
                 },
             )
         }
@@ -5775,8 +5848,14 @@ pub unsafe extern "C" fn seiza_rendered_image16_open_with_stretch_config(
         let config_json = required_str(config_json, "stretch config JSON")?;
         let request: ImageRenderConfigRequest = serde_json::from_str(&config_json)
             .map_err(|error| format!("invalid image processing config JSON: {error}"))?;
-        let (stack, background, deconvolution, interactive_preview, sample_domain) =
-            request.into_parts();
+        let RenderRequestParts {
+            stretch: stack,
+            background,
+            deconvolution,
+            interactive_preview,
+            sample_domain,
+            gpu,
+        } = request.into_parts()?;
         let sample_domain = sample_domain.unwrap_or_default();
         if interactive_preview {
             render_cached_interactive_preview16(
@@ -5786,6 +5865,7 @@ pub unsafe extern "C" fn seiza_rendered_image16_open_with_stretch_config(
                 deconvolution.as_ref(),
                 &sample_domain,
                 max_dimension,
+                &gpu,
             )
         } else {
             let (image, format) = open_astronomy_image(&path)?;
@@ -5799,6 +5879,7 @@ pub unsafe extern "C" fn seiza_rendered_image16_open_with_stretch_config(
                     sample_domain: &sample_domain,
                     max_dimension,
                     interactive_preview: false,
+                    gpu,
                 },
             )
         }
@@ -6654,6 +6735,7 @@ fn render_fits_with_stack(
             sample_domain: &SampleDomain::UnitLinear,
             max_dimension,
             interactive_preview: false,
+            gpu: seiza_stacking::GpuOptions::default(),
         },
     )
 }
@@ -6671,6 +6753,7 @@ fn render_astronomy_with_pipeline(
         options.sample_domain,
         options.max_dimension,
         options.interactive_preview,
+        &options.gpu,
     )?;
     render_prepared_fits(
         &prepared,
@@ -6695,6 +6778,7 @@ fn render_astronomy_with_pipeline16(
         options.sample_domain,
         options.max_dimension,
         options.interactive_preview,
+        &options.gpu,
     )?;
     render_prepared_fits16(
         &prepared,
@@ -6713,6 +6797,7 @@ fn prepare_fits_render(
     sample_domain: &SampleDomain,
     max_dimension: u32,
     interactive_preview: bool,
+    gpu: &seiza_stacking::GpuOptions,
 ) -> Result<PreparedFitsRender, String> {
     let source_width = fits.width;
     let source_height = fits.height;
@@ -6745,7 +6830,7 @@ fn prepare_fits_render(
         }
         SampleDomain::PhysicalLinear { .. } => {
             let frame = FitsFrame::from_fits(fits, None)
-                .and_then(FitsFrame::into_prepared)
+                .and_then(|frame| frame.into_prepared_with_gpu(gpu))
                 .map_err(|error| format!("failed to prepare physical render samples: {error}"))?;
             let channels = frame.image.channels;
             let data = frame.image.data;
@@ -7231,6 +7316,7 @@ fn render_cached_interactive_preview(
     deconvolution: Option<&DeconvolutionRenderRequest>,
     sample_domain: &SampleDomain,
     max_dimension: u32,
+    gpu: &seiza_stacking::GpuOptions,
 ) -> Result<SeizaRenderedImage, String> {
     let key = interactive_preview_cache_key(path, background, sample_domain, max_dimension)?;
     let cache = INTERACTIVE_PREVIEW_CACHE
@@ -7255,6 +7341,7 @@ fn render_cached_interactive_preview(
         sample_domain,
         max_dimension,
         true,
+        gpu,
     )?);
     let prepared = store_interactive_preview(cache, key, prepared)?;
     render_prepared_fits(
@@ -7274,6 +7361,7 @@ fn render_cached_interactive_preview16(
     deconvolution: Option<&DeconvolutionRenderRequest>,
     sample_domain: &SampleDomain,
     max_dimension: u32,
+    gpu: &seiza_stacking::GpuOptions,
 ) -> Result<SeizaRenderedImage16, String> {
     let key = interactive_preview_cache_key(path, background, sample_domain, max_dimension)?;
     let cache = INTERACTIVE_PREVIEW_CACHE
@@ -7298,6 +7386,7 @@ fn render_cached_interactive_preview16(
         sample_domain,
         max_dimension,
         true,
+        gpu,
     )?);
     let prepared = store_interactive_preview(cache, key, prepared)?;
     render_prepared_fits16(
@@ -7972,6 +8061,20 @@ fn expanding_stack_options(options_json: *const c_char) -> Result<StackOptions, 
             FrameAcceptanceCriteria::EXPANDED_MINIMUM_OVERLAP_FRACTION;
     }
     Ok(options)
+}
+
+/// The GPU options `gpu_json` gives, or `None` when it is null or empty.
+fn gpu_options(gpu_json: *const c_char) -> Result<Option<seiza_stacking::GpuOptions>, String> {
+    if gpu_json.is_null() {
+        return Ok(None);
+    }
+    let gpu_json = required_str(gpu_json, "GPU options JSON")?;
+    if gpu_json.trim().is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_str(&gpu_json)
+        .map(Some)
+        .map_err(|error| format!("invalid GPU options JSON: {error}"))
 }
 
 fn stack_options(options_json: *const c_char) -> Result<StackOptions, String> {
@@ -10591,6 +10694,96 @@ mod tests {
     }
 
     #[test]
+    fn stacking_cabi_reopens_a_context_under_other_gpu_options() {
+        let (width, height) = (160, 128);
+        let image = stacking_star_field(width, height);
+        let config = no_adjustment_stack_options();
+        let directory = tempfile::tempdir().unwrap();
+        let context_c =
+            CString::new(directory.path().join("live.seiza-stack").to_str().unwrap()).unwrap();
+        let mut error = ptr::null_mut();
+        let stacker = unsafe {
+            seiza_live_stacker_create(
+                image.as_ptr(),
+                image.len(),
+                width,
+                height,
+                1,
+                config.as_ptr(),
+                &mut error,
+            )
+        };
+        assert!(!stacker.is_null());
+        assert!(unsafe {
+            seiza_live_stacker_save_context(stacker, context_c.as_ptr(), &mut error)
+        });
+        let fingerprint = |stacker| {
+            let raw = unsafe { seiza_live_stacker_state_json(stacker, ptr::null_mut()) };
+            assert!(!raw.is_null());
+            let state: Value =
+                serde_json::from_str(unsafe { CStr::from_ptr(raw) }.to_str().unwrap()).unwrap();
+            unsafe { seiza_string_free(raw) };
+            state["configurationFingerprint"].clone()
+        };
+        let saved = fingerprint(stacker);
+        unsafe { seiza_live_stacker_free(stacker) };
+
+        // Null and empty keep the saved options; `{}` asks for the defaults.
+        for gpu in [Some(r#"{"enabled": false}"#), Some("{}"), Some(""), None] {
+            let gpu = gpu.map(|gpu| CString::new(gpu).unwrap());
+            let resumed = unsafe {
+                seiza_live_stacker_open_context_with_gpu(
+                    context_c.as_ptr(),
+                    gpu.as_ref().map_or(ptr::null(), |gpu| gpu.as_ptr()),
+                    &mut error,
+                )
+            };
+            assert!(!resumed.is_null());
+            assert!(error.is_null());
+            assert_eq!(unsafe { seiza_live_stacker_accepted_frames(resumed) }, 1);
+            assert_eq!(fingerprint(resumed), saved);
+            let disposition = unsafe {
+                seiza_live_stacker_push_linear_json(
+                    resumed,
+                    image.as_ptr(),
+                    image.len(),
+                    width,
+                    height,
+                    1,
+                    &mut error,
+                )
+            };
+            assert!(!disposition.is_null());
+            unsafe { seiza_string_free(disposition) };
+            assert_eq!(unsafe { seiza_live_stacker_accepted_frames(resumed) }, 2);
+            unsafe { seiza_live_stacker_free(resumed) };
+        }
+
+        for (gpu, message) in [
+            (r#"{"concurrency": 0}"#, "concurrency"),
+            (r#"{"cuda": true}"#, "invalid GPU options JSON"),
+        ] {
+            let gpu = CString::new(gpu).unwrap();
+            let resumed = unsafe {
+                seiza_live_stacker_open_context_with_gpu(
+                    context_c.as_ptr(),
+                    gpu.as_ptr(),
+                    &mut error,
+                )
+            };
+            assert!(resumed.is_null());
+            assert!(!error.is_null());
+            let text = unsafe { CStr::from_ptr(error) }
+                .to_str()
+                .unwrap()
+                .to_owned();
+            assert!(text.contains(message), "{text}");
+            unsafe { seiza_string_free(error) };
+            error = ptr::null_mut();
+        }
+    }
+
+    #[test]
     fn stacking_cabi_opens_fits_and_rejects_duplicate_paths() {
         let (width, height) = (160, 128);
         let data = stacking_star_field(width, height);
@@ -11698,6 +11891,7 @@ mod tests {
                 sample_domain: &sample_domain,
                 max_dimension: 0,
                 interactive_preview: false,
+                gpu: seiza_stacking::GpuOptions::default(),
             },
         )
         .unwrap();
@@ -14400,6 +14594,7 @@ mod tests {
             sample_domain: &SampleDomain::UnitLinear,
             max_dimension: 0,
             interactive_preview: false,
+            gpu: seiza_stacking::GpuOptions::default(),
         };
         let image8 = render_astronomy_with_pipeline(
             fits.clone(),
@@ -14444,6 +14639,7 @@ mod tests {
                 sample_domain: &SampleDomain::UnitLinear,
                 max_dimension: 0,
                 interactive_preview: false,
+                gpu: seiza_stacking::GpuOptions::default(),
             },
         )
         .unwrap();
@@ -14457,6 +14653,7 @@ mod tests {
                 sample_domain: &SampleDomain::UnitLinear,
                 max_dimension: 0,
                 interactive_preview: false,
+                gpu: seiza_stacking::GpuOptions::default(),
             },
         )
         .unwrap();
@@ -14586,8 +14783,14 @@ mod tests {
         }))
         .unwrap();
 
-        let (stack, background, deconvolution, interactive_preview, sample_domain) =
-            request.into_parts();
+        let RenderRequestParts {
+            stretch: stack,
+            background,
+            deconvolution,
+            interactive_preview,
+            sample_domain,
+            ..
+        } = request.into_parts().unwrap();
         assert_eq!(stack.len(), 1);
         assert!(background.is_none());
         assert!(deconvolution.is_none());
@@ -14602,6 +14805,131 @@ mod tests {
                 },
             })
         );
+    }
+
+    /// A processed render takes the GPU options a raw Bayer frame rendered
+    /// in physical units is debayered under; without them it uses the
+    /// defaults, and options that cannot be used are refused.
+    #[test]
+    fn render_config_carries_gpu_options_to_the_debayering() {
+        let request = |gpu: Option<Value>| -> ImageRenderConfigRequest {
+            let mut request = json!({
+                "stretch": [{
+                    "model": { "type": "identity" },
+                    "color_strategy": "linked",
+                    "max_analysis_samples": 4096
+                }],
+                "sample_domain": {
+                    "type": "physical-linear",
+                    "normalization": { "type": "explicit-range", "black": 0.0, "white": 65535.0 }
+                }
+            });
+            if let Some(gpu) = gpu {
+                request["gpu"] = gpu;
+            }
+            serde_json::from_value(request).unwrap()
+        };
+        assert_eq!(
+            request(None).into_parts().unwrap().gpu,
+            seiza_stacking::GpuOptions::default()
+        );
+        let parts = request(Some(json!({ "enabled": false })))
+            .into_parts()
+            .unwrap();
+        assert_eq!(parts.gpu, seiza_stacking::GpuOptions::cpu());
+        // Unusable options are refused when the request is read, whatever
+        // the sample domain, so a unit-linear render that never debayers
+        // refuses them too.
+        let error = request(Some(json!({ "concurrency": 0 })))
+            .into_parts()
+            .err()
+            .unwrap();
+        assert!(error.contains("concurrency"), "{error}");
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mono.fits");
+        seiza_fits::write_f32_image(&path, 4, 4, seiza_fits::F32ImageData::Mono(&[0.5; 16]), &[])
+            .unwrap();
+        let path = CString::new(path.to_str().unwrap()).unwrap();
+        let config = CString::new(
+            json!({
+                "stretch": [{
+                    "model": { "type": "identity" },
+                    "color_strategy": "linked",
+                    "max_analysis_samples": 4096
+                }],
+                "gpu": { "concurrency": 0 }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut error = ptr::null_mut();
+        let image = unsafe {
+            seiza_rendered_image_open_with_stretch_config(
+                path.as_ptr(),
+                config.as_ptr(),
+                0,
+                &mut error,
+            )
+        };
+        assert!(image.is_null());
+        let message = unsafe { CStr::from_ptr(error) }
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(message.contains("concurrency"), "{message}");
+        unsafe { seiza_string_free(error) };
+
+        let bayer = || {
+            let headers = vec![(
+                "BAYERPAT".to_owned(),
+                seiza_fits::HeaderValue::String("RGGB".into()),
+            )];
+            // Large enough for the GPU's VNG, so the default render runs
+            // there where a GPU is present.
+            FitsImage {
+                width: 1024,
+                height: 1024,
+                planes: 1,
+                pixels: seiza_fits::Pixels::U16(
+                    (0..1024 * 1024_u32)
+                        .map(|index| ((index * 37 + index / 1024 * 19) % 40_000) as u16)
+                        .collect(),
+                ),
+                headers,
+            }
+        };
+        let render = |gpu| {
+            render_astronomy_with_pipeline(
+                bayer(),
+                AstronomyImageFormat::Fits,
+                &parts.stretch,
+                RenderPipelineOptions {
+                    background: None,
+                    deconvolution: None,
+                    sample_domain: parts.sample_domain.as_ref().unwrap(),
+                    max_dimension: 0,
+                    interactive_preview: false,
+                    gpu,
+                },
+            )
+        };
+        // The GPU's VNG differs from the CPU's by single-precision rounding,
+        // which can move an 8-bit level by one.
+        let on_cpu = render(seiza_stacking::GpuOptions::cpu()).unwrap();
+        let by_default = render(seiza_stacking::GpuOptions::default()).unwrap();
+        assert_eq!(on_cpu.rgba.len(), by_default.rgba.len());
+        assert!(
+            on_cpu
+                .rgba
+                .iter()
+                .zip(&by_default.rgba)
+                .all(|(a, b)| a.abs_diff(*b) <= 1)
+        );
+        let refused = render(seiza_stacking::GpuOptions {
+            concurrency: 0,
+            ..seiza_stacking::GpuOptions::default()
+        });
+        assert!(refused.is_err());
     }
 
     #[test]
@@ -14627,8 +14955,14 @@ mod tests {
             }
         }))
         .unwrap();
-        let (stack, background, deconvolution, interactive_preview, sample_domain) =
-            request.into_parts();
+        let RenderRequestParts {
+            stretch: stack,
+            background,
+            deconvolution,
+            interactive_preview,
+            sample_domain,
+            ..
+        } = request.into_parts().unwrap();
         assert_eq!(stack.len(), 1);
         assert!(!interactive_preview);
         assert!(deconvolution.is_none());
@@ -14678,6 +15012,7 @@ mod tests {
                 sample_domain: &SampleDomain::UnitLinear,
                 max_dimension: 0,
                 interactive_preview: false,
+                gpu: seiza_stacking::GpuOptions::default(),
             },
         )
         .unwrap();
@@ -14750,6 +15085,7 @@ mod tests {
                 sample_domain: &SampleDomain::UnitLinear,
                 max_dimension: 0,
                 interactive_preview: false,
+                gpu: seiza_stacking::GpuOptions::default(),
             },
         )
         .unwrap();
@@ -14793,8 +15129,14 @@ mod tests {
             "interactive_preview": true
         }))
         .unwrap();
-        let (stack, background, deconvolution, interactive_preview, sample_domain) =
-            request.into_parts();
+        let RenderRequestParts {
+            stretch: stack,
+            background,
+            deconvolution,
+            interactive_preview,
+            sample_domain,
+            ..
+        } = request.into_parts().unwrap();
         assert!(background.is_none());
         assert!(sample_domain.is_none());
         let deconvolution = deconvolution.unwrap();
@@ -14819,6 +15161,7 @@ mod tests {
                 sample_domain: &SampleDomain::UnitLinear,
                 max_dimension: 100,
                 interactive_preview,
+                gpu: seiza_stacking::GpuOptions::default(),
             },
         )
         .unwrap();
@@ -14857,9 +15200,16 @@ mod tests {
         let automatic_domain = SampleDomain::PhysicalLinear {
             normalization: Default::default(),
         };
-        let first =
-            render_cached_interactive_preview(&path, &stack, None, None, &automatic_domain, 100)
-                .unwrap();
+        let first = render_cached_interactive_preview(
+            &path,
+            &stack,
+            None,
+            None,
+            &automatic_domain,
+            100,
+            &seiza_stacking::GpuOptions::default(),
+        )
+        .unwrap();
         let second = render_cached_interactive_preview(
             &path,
             &stack,
@@ -14867,6 +15217,7 @@ mod tests {
             Some(&deconvolution),
             &automatic_domain,
             100,
+            &seiza_stacking::GpuOptions::default(),
         )
         .unwrap();
         let explicit_domain = SampleDomain::PhysicalLinear {
@@ -14875,9 +15226,16 @@ mod tests {
                 white: 0.5,
             },
         };
-        let remapped =
-            render_cached_interactive_preview(&path, &stack, None, None, &explicit_domain, 100)
-                .unwrap();
+        let remapped = render_cached_interactive_preview(
+            &path,
+            &stack,
+            None,
+            None,
+            &explicit_domain,
+            100,
+            &seiza_stacking::GpuOptions::default(),
+        )
+        .unwrap();
         let first_metadata: Value =
             serde_json::from_str(first.metadata_json.to_str().unwrap()).unwrap();
         let second_metadata: Value =
@@ -15065,6 +15423,7 @@ mod tests {
                 sample_domain: &SampleDomain::UnitLinear,
                 max_dimension: 0,
                 interactive_preview: false,
+                gpu: seiza_stacking::GpuOptions::default(),
             },
         )
         .unwrap();
