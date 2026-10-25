@@ -1118,35 +1118,17 @@ impl Registrar {
             )));
         }
         let mut best: Option<ScoredTransform> = None;
-        for candidate in translation_candidates(
+        let translations = translation_candidates(
             source_stars,
             &self.reference_stars,
             &self.options,
             self.maximum_drift_pixels,
-        ) {
-            retain_scored_transform(
-                &mut best,
-                candidate,
-                source_stars,
-                &self.reference_stars,
-                &self.reference_index,
-                &self.options,
-            );
-        }
+        );
+        self.retain_best(&mut best, &translations, source_stars);
 
         let source_triangles = triangles(source_stars, self.options.triangle_stars);
         let candidates = self.triangle_candidates(&source_triangles, source_stars);
-
-        for candidate in candidates {
-            retain_scored_transform(
-                &mut best,
-                candidate,
-                source_stars,
-                &self.reference_stars,
-                &self.reference_index,
-                &self.options,
-            );
-        }
+        self.retain_best(&mut best, &candidates, source_stars);
         let best = best.ok_or_else(|| {
             Error::Registration(format!(
                 "no registration transform within the configured {:.1}px drift reached the match threshold",
@@ -1154,6 +1136,33 @@ impl Registrar {
             ))
         })?;
         self.refine_registration(best, source_stars)
+    }
+
+    /// Keep in `best` the best of `candidates` by [`retain_scored_transform`],
+    /// taken in their order. Each candidate's pairs are matched on its own,
+    /// so they are matched in parallel, and only the choice runs in order:
+    /// a blind match scores some 450 candidates against 800 stars each.
+    fn retain_best(
+        &self,
+        best: &mut Option<ScoredTransform>,
+        candidates: &[SimilarityTransform],
+        source: &[DetectedStar],
+    ) {
+        let scored = candidates
+            .par_iter()
+            .map(|&candidate| {
+                score_transform(
+                    candidate,
+                    source,
+                    &self.reference_stars,
+                    &self.reference_index,
+                    &self.options,
+                )
+            })
+            .collect::<Vec<_>>();
+        for scored in scored.into_iter().flatten() {
+            retain_scored_transform(best, scored);
+        }
     }
 
     /// The best similarities by triangle ratio error, at most
@@ -2946,14 +2955,15 @@ fn translation_candidates(
         .collect()
 }
 
-fn retain_scored_transform(
-    best: &mut Option<ScoredTransform>,
+/// `candidate` with the star pairs it matches and their squared error, or
+/// `None` when it matches fewer than the options' minimum.
+fn score_transform(
     candidate: SimilarityTransform,
     source: &[DetectedStar],
     reference: &[DetectedStar],
     reference_index: &StarSpatialIndex,
     options: &RegistrationOptions,
-) {
+) -> Option<ScoredTransform> {
     let pairs = matched_pairs(
         candidate,
         source,
@@ -2962,14 +2972,20 @@ fn retain_scored_transform(
         options.match_tolerance_pixels,
     );
     if pairs.len() < options.minimum_matches {
-        return;
+        return None;
     }
     let squared_error = pair_squared_error(candidate, &pairs, source, reference);
+    Some((pairs.len(), squared_error, candidate, pairs))
+}
+
+/// Keep `scored` in `best` when it matches more pairs, or as many with a
+/// smaller squared error.
+fn retain_scored_transform(best: &mut Option<ScoredTransform>, scored: ScoredTransform) {
     let replace = best.as_ref().is_none_or(|(count, error, _, _)| {
-        pairs.len() > *count || (pairs.len() == *count && squared_error < *error)
+        scored.0 > *count || (scored.0 == *count && scored.1 < *error)
     });
     if replace {
-        *best = Some((pairs.len(), squared_error, candidate, pairs));
+        *best = Some(scored);
     }
 }
 
@@ -5270,5 +5286,55 @@ mod tests {
                 expected
             );
         }
+    }
+
+    /// Candidates scored in parallel keep the same best, ties and all, as
+    /// scoring them one by one in order: a field whose shifts match equally
+    /// well, so the order of the tie-break decides.
+    #[test]
+    fn candidates_scored_in_parallel_keep_the_same_best() {
+        let reference = (0..12)
+            .flat_map(|row| {
+                (0..12)
+                    .map(move |column| star(40.0 + 70.0 * column as f64, 40.0 + 70.0 * row as f64))
+            })
+            .collect::<Vec<_>>();
+        let source = reference
+            .iter()
+            .map(|reference| star(reference.x - 3.25, reference.y + 1.5))
+            .collect::<Vec<_>>();
+        let registrar = Registrar::from_stars(
+            900,
+            900,
+            reference.clone(),
+            RegistrationOptions::default(),
+            Scale::NATIVE,
+            &crate::GpuOptions::default(),
+        )
+        .unwrap();
+        let candidates = (0..200)
+            .map(|index| SimilarityTransform {
+                translation_x: 3.25 + 70.0 * f64::from(index % 5) - 140.0
+                    + 0.01 * f64::from(index % 3),
+                translation_y: -1.5 + 70.0 * f64::from(index / 5 % 5) - 140.0,
+                ..SimilarityTransform::IDENTITY
+            })
+            .collect::<Vec<_>>();
+        let mut sequential = None;
+        for &candidate in &candidates {
+            if let Some(scored) = score_transform(
+                candidate,
+                &source,
+                &registrar.reference_stars,
+                &registrar.reference_index,
+                &registrar.options,
+            ) {
+                retain_scored_transform(&mut sequential, scored);
+            }
+        }
+        let mut parallel = None;
+        registrar.retain_best(&mut parallel, &candidates, &source);
+        assert!(sequential.is_some());
+        assert_eq!(parallel, sequential);
     }
 }
