@@ -969,8 +969,9 @@ impl LiveStacker {
     /// narrow overlap need not hold the canvas's brightest stars, and a frame
     /// lying mostly within one panel also gets the registration model's
     /// warp against that panel. Each panel starts from a frame on the
-    /// anchor's side of the pier where one connects. Bayer drizzle and
-    /// drizzled reintegration are not supported on the canvas.
+    /// anchor's side of the pier where one connects. Bayer drizzle, local
+    /// normalization and drizzled reintegration are not supported on the
+    /// canvas.
     pub fn with_expanding_reference(
         paths: &[PathBuf],
         calibration: CalibrationMasters,
@@ -989,6 +990,15 @@ impl LiveStacker {
         if options.cfa_integration == CfaIntegration::BayerDrizzle {
             return Err(Error::Stack(
                 "an expanded canvas does not support Bayer drizzle".into(),
+            ));
+        }
+        // Local normalization fits every tile of a frame against the canvas
+        // beneath it, and a frame joining a growing canvas has tiles with
+        // no canvas beneath them: every frame of a mosaic was turned away,
+        // one by one, after planning. Say so before planning reads a frame.
+        if matches!(options.normalization, NormalizationMode::Local { .. }) {
+            return Err(Error::Stack(
+                "an expanded canvas does not support local normalization, whose tiles each need canvas beneath them; use local-background or global".into(),
             ));
         }
         // Sessions differ in rotation whenever the camera comes off between

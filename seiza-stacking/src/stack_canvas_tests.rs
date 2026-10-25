@@ -281,6 +281,39 @@ fn footprints_stack_as_the_whole_canvas_does(
     );
 }
 
+/// An expanded canvas refuses local normalization before planning reads a
+/// frame, and keeps the modes it supports.
+#[test]
+fn an_expanded_canvas_refuses_local_normalization() {
+    let with = |normalization| StackOptions {
+        normalization,
+        ..StackOptions::default()
+    };
+    let error = LiveStacker::expanding_options(with(NormalizationMode::Local { tile_size: 256 }))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("local normalization"), "{error}");
+    let paths = vec![PathBuf::from("never-read.fit")];
+    let refused = LiveStacker::with_expanding_reference(
+        &paths,
+        CalibrationMasters::default(),
+        with(NormalizationMode::Local { tile_size: 256 }),
+        usize::MAX,
+        |_, _, _, _| Continue::Yes,
+    );
+    assert!(
+        matches!(&refused, Err(Error::Stack(message)) if message.contains("local normalization")),
+        "refused before the missing frame was read"
+    );
+    for supported in [
+        NormalizationMode::None,
+        NormalizationMode::Global,
+        NormalizationMode::LocalBackground { tile_size: 256 },
+    ] {
+        LiveStacker::expanding_options(with(supported)).unwrap();
+    }
+}
+
 /// [`footprints_stack_as_the_whole_canvas_does`] in one channel, globally
 /// normalized, equally weighted, by similarity.
 #[test]
