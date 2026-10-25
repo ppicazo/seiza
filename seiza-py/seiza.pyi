@@ -1254,6 +1254,57 @@ def deconvolve(
     max_correction: float = 2.0,
     masked: bool = False,
 ) -> npt.NDArray[np.float32]: ...
+
+def fit_continuum(
+    stars: Sequence[Mapping[str, Any]],
+    sources: Mapping[str, Any],
+    *,
+    options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Fit isolated stellar fluxes; return tagged fitted/skipped core JSON."""
+    ...
+
+def measure_and_fit_continuum(
+    narrowband: npt.NDArray[np.float32],
+    references: Sequence[npt.NDArray[np.float32]],
+    sources: Mapping[str, Any],
+    *,
+    positions: Sequence[tuple[float, float]] | None = None,
+    fit_options: Mapping[str, Any] | None = None,
+    photometry_options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Measure aligned linear planes; empty positions requests star detection."""
+    ...
+
+def measure_and_fit_continuum_masked(
+    narrowband: npt.NDArray[np.float32], references: Sequence[npt.NDArray[np.float32]],
+    sources: Mapping[str, Any], clipping_masks: Sequence[npt.NDArray[np.uint8]], *,
+    positions: Sequence[tuple[float, float]] | None = None,
+    fit_options: Mapping[str, Any] | None = None,
+    photometry_options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Fit with exact producer clipping masks; no scalar ceiling is required."""
+    ...
+
+def subtract_continuum(
+    narrowband: npt.NDArray[np.float32],
+    references: Sequence[npt.NDArray[np.float32]],
+    sources: Mapping[str, Any],
+    plan: Mapping[str, Any],
+) -> npt.NDArray[np.float32]:
+    """Apply an exact-source plan; preserve signed residuals and NaN coverage."""
+    ...
+
+
+def balance_narrowband(
+    image: npt.NDArray[np.float32], *, shadow_protection: float = 1.0,
+    oiii_boost: float = 1.0, sii_boost: float = 1.0, max_samples: int = 1_000_000, has_sii: bool = True,
+    star_mask_radius: float | None = None,
+) -> tuple[npt.NDArray[np.float32], dict[str, Any]]: ...
+def screen_rgb_stars(
+    nebula: npt.NDArray[np.float32], original: npt.NDArray[np.float32],
+    starless: npt.NDArray[np.float32],
+) -> npt.NDArray[np.float32]: ...
 def combine_rgb(
     red: npt.NDArray[np.float32],
     green: npt.NDArray[np.float32],
@@ -1759,3 +1810,39 @@ def dust_match_features(
 # 4.0): anything that shows them must carry the returned "attribution".
 def constellation_figures() -> dict[str, Any]: ...
 def project_constellations(wcs: Wcs, width: int, height: int) -> dict[str, Any]: ...
+
+def blend_emission_rgb(
+    broadband: npt.NDArray[np.float32], residuals: Sequence[npt.NDArray[np.float32]],
+    lines: Sequence[Mapping[str, Any]], *, negative: str = "preserve",
+) -> npt.NDArray[np.float32]:
+    """Add line residuals in empirical reference units; preserve signed data."""
+    ...
+
+def blend_display_structure(
+    narrowband: npt.NDArray[np.float32], broadband: npt.NDArray[np.float32], amount: float,
+) -> npt.NDArray[np.float32]:
+    """Blend matching starless display structures before restoring stars."""
+    ...
+
+def add_rgb_contribution(base: npt.NDArray[np.float32], contribution: npt.NDArray[np.float32], *, gains: tuple[float, float, float] = ...) -> npt.NDArray[np.float32]: ...
+
+
+def reduce_green_excess(image: npt.NDArray[np.float32], amount: float) -> npt.NDArray[np.float32]:
+    """Return bounded display RGB with excess green reduced before star restoration."""
+    ...
+
+
+def solve_emission_flux(
+    residuals: Sequence[npt.NDArray[np.float32]], plans: Sequence[Mapping[str, Any]],
+    calibration: Mapping[str, Any],
+) -> tuple[list[npt.NDArray[np.float32]], dict[str, Any]]:
+    """Solve exact calibrated NB-minus-reference responses; signed flux and covariance report."""
+    ...
+
+
+def screen_rgb_stars_reduced(
+    nebula: npt.NDArray[np.float32], original: npt.NDArray[np.float32],
+    starless: npt.NDArray[np.float32], reduction: float,
+) -> npt.NDArray[np.float32]:
+    """Screen a linked RGB star layer reduced toward one-pixel erosion; inputs unchanged."""
+    ...

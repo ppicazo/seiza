@@ -47,10 +47,13 @@ mod calibration_plan;
 mod color;
 mod color_calibration;
 mod context;
+mod continuum;
 mod cosmetic;
 mod crop;
 mod defects;
 mod drizzle;
+mod emission;
+mod emission_flux;
 mod expand;
 mod external;
 mod fits;
@@ -62,6 +65,7 @@ mod gpu;
 mod gpu_options;
 mod mapping;
 mod master;
+mod narrowband_balance;
 mod normalization;
 mod orientation;
 mod paths;
@@ -98,12 +102,24 @@ pub use color_calibration::{
     calibrate_and_stretch, calibrate_color, calibrate_color_image, neutralize_clipped,
     place_gaia_sources, transform_wcs,
 };
+pub use continuum::{
+    ContinuumDiagnostics, ContinuumFitOptions, ContinuumFitOutcome, ContinuumOrigin,
+    ContinuumPhotometry, ContinuumPhotometryOptions, ContinuumPixelValidation, ContinuumPlan,
+    ContinuumPsfMatch, ContinuumPsfOptions, ContinuumSkipReason, ContinuumSource, ContinuumSources,
+    ContinuumStar, ContinuumStarDiagnostic, ContinuumTransfer, fit_continuum,
+    measure_and_fit_continuum, measure_and_fit_continuum_masked, subtract_continuum,
+};
 pub use cosmetic::{ImpulseFilterOptions, suppress_impulses};
 pub use crop::{
     ChannelCoverage, ChannelSamples, ColorCrop, CropReport, covered_region, crop_report,
 };
 pub use defects::{DefectDetectionOptions, DefectMap, detect_defects};
 pub use drizzle::{DrizzleOptions, DrizzleResult};
+pub use emission::{
+    EmissionBlendLine, EmissionBlendOptions, EmissionNegativePolicy, add_rgb_contribution,
+    blend_display_structure, blend_emission_rgb, reduce_green_excess,
+};
+pub use emission_flux::{EmissionFluxCalibration, EmissionFluxReport, solve_emission_flux};
 pub use external::{
     ExternalParameterKind, ExternalParameterValue, ExternalToolParameter, ExternalToolRequest,
     ExternalToolRun, ExternalToolSchema, ProcessedStackImage, RC_ASTRO_TOOLS, RcAstroCli,
@@ -122,6 +138,10 @@ pub use master::{
     MasterBuildOptions, MasterBuildProgress, MasterBuildStage, MasterFrame, MasterFrameKind,
     MasterInputStatistics, MasterProgress, MasterRejectionMethod, MasterRejectionOptions,
     build_master_from_fits, build_master_from_fits_with_scratch, screen_dark_levels,
+};
+pub use narrowband_balance::{
+    NarrowbandBalanceOptions, NarrowbandBalanceReport, NarrowbandChannelBalance,
+    balance_narrowband, screen_rgb_stars, screen_rgb_stars_reduced,
 };
 pub use normalization::{NormalizationMap, NormalizationMode};
 pub use orientation::{SKY_ORIENTATION_NAME, SKY_ORIENTATION_VERSION, SkyOrientationPlan};
@@ -180,7 +200,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// folds back onto the frame far beyond it, which 0.40.0 sampled (#307). The
 /// value stayed at "0.40.0" because no cache keyed on it predates 0.42.0,
 /// the first release to export it.
-pub const OUTPUT_VERSION: &str = "0.45.0";
+pub const OUTPUT_VERSION: &str = "0.50.0";
 
 /// Anything that can go wrong while calibrating, registering, normalizing, or
 /// stacking frames.

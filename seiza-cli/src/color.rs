@@ -18,12 +18,138 @@ pub(crate) struct ColorArgs {
 
 #[derive(Subcommand)]
 enum ColorCommand {
+    /// Project signed residuals or blend prepared starless display structures
+    Blend(crate::emission::BlendArgs),
+    /// Fit and subtract continuum on aligned linear mono images
+    Continuum(crate::continuum::ContinuumArgs),
+    /// Balance prepared display planes ordered H-alpha/OIII/SII
+    Balance(DisplayBalanceArgs),
+    /// Reduce display green excess before independently restoring stars
+    ReduceGreen(ReduceGreenArgs),
+    /// Screen display RGB stars onto a starless display nebula
+    ScreenStars(ScreenStarsArgs),
     /// Combine red, green, and blue mono stacks
     Rgb(RgbArgs),
     /// Combine luminance, red, green, and blue mono stacks
     Lrgb(LrgbArgs),
     /// Map H-alpha, OIII, and optional SII stacks into a false-color palette
     Narrowband(NarrowbandArgs),
+}
+
+#[derive(Args)]
+struct DisplayBalanceArgs {
+    #[arg(long)]
+    input: PathBuf,
+    #[arg(long)]
+    output: PathBuf,
+    #[arg(long)]
+    report: Option<PathBuf>,
+    /// Third plane duplicates OIII, rather than supplying SII
+    #[arg(long)]
+    hoo: bool,
+    #[arg(long, default_value_t = 1.0)]
+    shadow_protection: f64,
+    #[arg(long, default_value_t = 1.0)]
+    oiii_boost: f64,
+    #[arg(long, default_value_t = 1.0)]
+    sii_boost: f64,
+    /// Exclude detected stars from balance statistics within this radius
+    #[arg(long)]
+    star_mask_radius: Option<f64>,
+}
+
+#[derive(Args)]
+struct ReduceGreenArgs {
+    #[arg(long)]
+    input: PathBuf,
+    #[arg(long)]
+    output: PathBuf,
+    #[arg(long, default_value_t = 0.5)]
+    amount: f64,
+}
+fn run_reduce_green(args: ReduceGreenArgs) -> Result<()> {
+    validate_path_roles([
+        ("input".into(), args.input.as_path()),
+        ("output".into(), args.output.as_path()),
+    ])?;
+    let mut frame = FitsFrame::open(&args.input)?;
+    if !frame.headers.iter().any(|(k,v)| k.eq_ignore_ascii_case("SEIZATRF") && matches!(v, seiza_fits::HeaderValue::String(tag) if tag.trim().eq_ignore_ascii_case("DISPLAY"))) { anyhow::bail!("Green reduction needs SEIZATRF=DISPLAY"); }
+    seiza_stacking::reduce_green_excess(&mut frame.image, args.amount)?;
+    write_display(&args.output, &frame)
+}
+
+#[derive(Args)]
+struct ScreenStarsArgs {
+    /// Linked RGB star-layer reduction (0 keeps stars; 1 full one-pixel cross erosion)
+    #[arg(long, default_value_t = 0.0)]
+    reduction: f64,
+    #[arg(long)]
+    nebula: PathBuf,
+    #[arg(long)]
+    original_rgb: PathBuf,
+    #[arg(long)]
+    starless_rgb: PathBuf,
+    #[arg(long)]
+    output: PathBuf,
+}
+
+fn run_balance(args: DisplayBalanceArgs) -> Result<()> {
+    let mut paths = vec![
+        ("input".into(), args.input.as_path()),
+        ("output".into(), args.output.as_path()),
+    ];
+    if let Some(report) = &args.report {
+        paths.push(("report".into(), report.as_path()));
+    }
+    validate_path_roles(paths)?;
+    let mut frame = FitsFrame::open(&args.input)?;
+    let options = seiza_stacking::NarrowbandBalanceOptions {
+        has_sii: !args.hoo,
+        shadow_protection: args.shadow_protection,
+        oiii_boost: args.oiii_boost,
+        sii_boost: args.sii_boost,
+        star_mask_radius: args.star_mask_radius,
+        ..Default::default()
+    };
+    let report = seiza_stacking::balance_narrowband(&mut frame.image, &options)?;
+    write_display(&args.output, &frame)?;
+    if let Some(path) = args.report {
+        crate::provenance::write_json_atomic(&path, &report)?;
+    }
+    Ok(())
+}
+
+fn run_screen_stars(args: ScreenStarsArgs) -> Result<()> {
+    validate_path_roles([
+        ("nebula".into(), args.nebula.as_path()),
+        ("original RGB".into(), args.original_rgb.as_path()),
+        ("starless RGB".into(), args.starless_rgb.as_path()),
+        ("output".into(), args.output.as_path()),
+    ])?;
+    let mut nebula = FitsFrame::open(&args.nebula)?;
+    let original = FitsFrame::open(&args.original_rgb)?;
+    let starless = FitsFrame::open(&args.starless_rgb)?;
+    seiza_stacking::screen_rgb_stars_reduced(
+        &mut nebula.image,
+        &original.image,
+        &starless.image,
+        args.reduction,
+    )?;
+    write_display(&args.output, &nebula)
+}
+
+fn write_display(path: &Path, frame: &FitsFrame) -> Result<()> {
+    seiza_stacking::write_processed_image_fits_f32(
+        path,
+        &frame.image,
+        &frame.headers,
+        &[seiza_fits::WriteHeaderCard::new(
+            "SEIZATRF",
+            seiza_fits::HeaderValue::String("DISPLAY".into()),
+        )
+        .with_comment("nonlinear display samples")],
+    )?;
+    Ok(())
 }
 
 #[derive(Args)]
@@ -200,6 +326,11 @@ impl From<PaletteArg> for NarrowbandPalette {
 
 pub(crate) fn run(args: ColorArgs) -> Result<()> {
     match args.command {
+        ColorCommand::Blend(args) => crate::emission::run(args),
+        ColorCommand::Continuum(args) => crate::continuum::run(args),
+        ColorCommand::Balance(args) => run_balance(args),
+        ColorCommand::ReduceGreen(args) => run_reduce_green(args),
+        ColorCommand::ScreenStars(args) => run_screen_stars(args),
         ColorCommand::Rgb(args) => run_rgb(args),
         ColorCommand::Lrgb(args) => run_lrgb(args),
         ColorCommand::Narrowband(args) => run_narrowband(args),

@@ -872,3 +872,223 @@ is measured from the nearer of the reference orientation and its 180-degree
 counterpart, while diagnostics retain the full fitted rotation (for example,
 179.3 degrees). The same similarity transform is then used to rotate the
 pixels back onto the reference grid before normalization and integration.
+
+
+## Display narrowband balance and RGB stars
+
+`balance_narrowband(&mut image, &options)` takes three aligned interleaved
+physical planes in H-alpha/OIII/SII order, already stretched into [0, 1]. For
+HOO, duplicate OIII into plane three and set `has_sii=false`. The returned
+report lists each measured channel's background, positive deviation, midpoint,
+and application or skip reason. H-alpha and protected shadows keep their
+samples; flat or noise-dominated channels remain unchanged.
+
+`screen_rgb_stars(&mut nebula, &original_rgb, &starless_rgb)` derives a
+screen-compatible stars layer and screens it onto a starless display nebula.
+All images must share one RGB grid and [0, 1] display scaling. Apply the same
+linked display transfer to original and starless RGB before calling it. Missing
+coverage masks complete pixels. Neither function aligns images or runs external
+tools. Both produce display-referred data, unsuitable for photometry or linear
+continuum subtraction. C ABI, Python and CLI counterparts provide the same
+operations; see the [color composition design](../docs/design/color-composition.md).
+
+## Continuum fitting and signed residuals
+
+Use continuum fitting **before stretching or removing stars**, on mono linear
+inputs already registered to one grid. The host supplies one to three concrete
+broadband references; Seiza does not infer filter roles, integration-time
+scaling or line throughput. R is a starting candidate for H-alpha/SII; G/B are
+candidates for OIII. L is not an automatic reference.
+
+`fit_continuum(stars, sources, options)` consumes common isolated-star aperture
+photometry. `measure_and_fit_continuum(narrowband, references, sources, positions,
+options, photometry)` measures local-background-subtracted fluxes; empty
+positions request Seiza detection on the narrowband plane. All `ContinuumSource`
+records declare a distinct name, exact prepared revision and linear transfer.
+Automatic fitting also needs a physical saturation ceiling or producer clipping
+mask, described below. Change the revision whenever
+pixels, scale, registration, backgrounds or masks change. Saturation must come
+from the image's physical scale, never its observed maximum.
+
+The core fits `F_N = sum(a_j * F_Bj)` with nonnegative weights and no pedestal,
+using column scaling, small deterministic subset starts and iterative MAD
+rejection. Every fourth usable star is held out. Defaults require 12 stars,
+SNR 20, peaks below 80% saturation, width ratios at most 1.3, centroid offsets
+at most one pixel, condition number at most 1000, and fractional RMS at most
+0.15 on both training and validation sets. At least 70% of each set must
+remain after rejection. Image measurement rejects crowded/edge apertures and
+fits a robust local sky plane with default radii 8/12/20 pixels. Supplied
+photometry must already be from isolated stars with consistent PSF widths.
+A rank-deficient multi-reference model may fall back to the best validated
+single reference; otherwise it returns a typed skip. No fixed G/B mixture is
+substituted. These are conservative starting defaults, not a calibration claim
+for every instrument or target.
+
+`ContinuumFitOutcome` distinguishes a fitted plan from skipped work with a
+reason, detail and diagnostics. Diagnostics include used/held-out star counts,
+rejection counts, residuals per star, conditioning, RMS, four ordered quadrant
+medians (null when fewer than three stars), and faint-versus-bright residuals.
+A fit never runs on an image-wide nebular regression. Inspect residuals before
+using automatic subtraction as a default in a host.
+
+`subtract_continuum(narrowband, references, sources, plan)` validates exact
+source revisions, order, grid, transfer, coefficient shape and provenance.
+It returns `N - sum(a_j * B_j)` without changing inputs, clipping negative
+samples, shifting black levels or stretching. Missing contributing coverage
+remains NaN; a zero-weight reference does not mask pixels. Manual plans use
+schema version 1, explicit sources and coefficients, `ContinuumOrigin::Manual`
+and no diagnostics. Fitted plans retain their diagnostics.
+
+The coefficients include the actual input scales. A rescale requires a new
+fit or an explicit host conversion on new revisions; old plans are refused.
+Background offsets remain separate. Applying the same plan to a starless or
+otherwise processed revision is refused until the host establishes and records
+that revision's equivalent flux scale. No implicit PSF matching is performed.
+
+Broadband references can contain line emission. If `B = C + beta*E` and
+`N = a*C + E`, subtraction yields `(1-a*beta)*E`. The result is an **emission
+residual**, not calibrated pure line flux. LRGB+SHO blend weights, negative-noise
+display suppression and luminance integration are separate host policies.
+C exports `seiza_continuum_fit_json`, `seiza_continuum_measure_fit_json` and
+`seiza_continuum_subtract_json` carry the same core types. C images are planar
+NB followed by references; Python uses a list of mono arrays and returns the
+same JSON keys. See [CLI usage](../seiza-cli/README.md#subtract-continuum-from-linear-narrowband-images)
+and [Python usage](../seiza-py/README.md#subtract-stellar-continuum-before-color-composition).
+
+
+### Clipping evidence, sampling and combined images
+
+`measure_and_fit_continuum_masked` accepts one binary clipping plane per input
+(NB then references). Declare exact `clipping_revision` values in the sources;
+a scalar physical `saturation` ceiling may be omitted. Automatic fitting needs
+one of these forms of evidence for every source. Manual signed subtraction
+can omit both. Masks reject stars before sampling and never change image pixels.
+The usable-star budget defaults to 400. Measurement considers up to 4096 candidates independently of that budget, rejects ineligible stars first, samples
+across the remaining flux range, and validates against the complete eligible
+pool. A disagreement or failed broader validation produces a skipped outcome.
+Diagnostics retain eligible/sample counts and sampling stability.
+
+`blend_emission_rgb` projects exact signed residuals into RGB reference units.
+Each `EmissionBlendLine` supplies a plan, destination RGB indices in reference
+order, amount [0,5] and explicit background offset. For stellar ratios
+r_j=F_Bj/F_B0, k_j=sum(a_i*r_i)/r_j; the contribution is amount*(E-offset)/k_j.
+Fitted plans record the ratios. Multi-reference manual plans need measured or
+explicit ratios; single-reference plans use 1. Independent input gains commute
+with projection. `PositiveContribution` clamps the display contribution only;
+the original signed residual stays unchanged. This does not correct broadband
+line transmission or produce calibrated pure line flux.
+
+Calibrate broadband stars before emission addition. `add_rgb_contribution`
+then adds normalized RGB emission with the measured channel gains; calibration
+offsets affect the base only. Add L through the existing luminance composition.
+`blend_display_structure` mixes prepared starless [0,1] RGB display images,
+with endpoints preserving the selected branch's coverage and intermediate
+amounts requiring common coverage. Restore a single RGB star layer afterward.
+These operations are also exposed through the C ABI, Python and CLI.
+
+### Validate stellar profiles and match PSFs explicitly
+
+Image-based continuum measurement now defaults to an independent held-out pixel
+check, controlled by `ContinuumPhotometryOptions.max_pixel_residual` (0.15).
+It compares the local-sky-subtracted NB patch with the fitted reference patches,
+sums absolute residual above a three-sigma local noise allowance, and divides
+by stellar flux. The 90th percentile must pass. At least three profiles and
+70% of eligible held-out profiles must be remeasurable. Reports retain signed
+core/halo fractions separately. Premeasured `fit_continuum` has no pixels and
+therefore reports no pixel validation; manual plans also make no such claim.
+Explicit `None` disables the pixel gate for research callers, not PSF Guard's
+automatic mode.
+
+Set `photometry.psf_matching = Some(ContinuumPsfOptions { target_fwhm: None })`
+to broaden copies before measurement and subtraction. Common unsaturated stars
+supply Gaussian-equivalent widths. The default target is 1.05 times the largest
+median width; an explicit target must be at least every measured width and at
+most 32 pixels. Kernels conserve DC/flux. Missing coverage and unsupported edges
+remain NaN; producer clipping evidence expands over the full kernel support.
+Original saturation evidence is required before preparation creates derived
+mask revisions.
+
+The plan records exact raw sources, derived prepared sources, measured widths,
+target and kernel sigma/radius. `subtract_continuum` replays that preparation
+from the original inputs. Saved plans must pass source, kernel and target
+consistency validation. No deconvolution occurs. A Gaussian-equivalent width
+match does not ensure matched real wings: the held-out pixel gate still applies
+and can skip a broadened result.
+
+`NarrowbandBalanceOptions.star_mask_radius` optionally excludes detected-star
+circles from balance/noise statistics without changing output coverage. It is
+off by default, accepts 1–64 pixels and reports counts. `reduce_green_excess`
+reduces display green above both red and blue by an explicit amount [0,1],
+preserving neutral pixels. Apply it after palette mapping and before adding
+independently prepared RGB stars. It is not a photometric operation or a claim
+of SCNR parity.
+
+### Export calibrated line flux
+
+`solve_emission_flux(residuals, plans, calibration)` solves one to three coupled
+line responses. `EmissionFluxCalibration` supplies exact plan sources, line
+order, common unit, calibration revision, NB responses and each plan's reference
+responses. Responses are in the actual input sample units per common flux unit;
+the producer accounts for throughput, exposure, gain, extinction and doublets.
+No filter-name or bandwidth approximation is inferred.
+
+The effective response is `M[i,k] = N[i,k] − sum_j a[i,j] B[i,j,k]`.
+The operation solves `M F = E − residualZeroLevels`, retaining signed flux and common coverage.
+It refuses stale source identities, inconsistent PSF targets, nonpositive or
+nearly cancelled diagonal response, excessive conditioning and numeric overflow.
+Inversion uses a normalized matrix and restores row units analytically.
+
+Optional residual covariance propagates as `M⁻¹ C M⁻ᵀ`. Missing covariance means
+unknown uncertainty. The report embeds calibration and plan provenance and
+explicitly excludes response/fit-coefficient uncertainty, unmodelled lines and
+spatial PSF errors. The result is calibrated only to the supplied response model.
+It does not replace an artistic display blend. C exports
+`seiza_emission_flux_json`; Python returns `(images, report)`; the CLI exposes
+`seiza color blend flux` with planar residuals, a settings JSON, output paths
+and a report.
+
+Matching also requires `target_fwhm <= aperture_radius` and
+`annulus_inner >= 1.5 * target_fwhm`. The default 8/12/20 photometry therefore
+permits targets up to **8 pixels**. Larger targets require larger photometry
+radii in the options JSON (with a hard target limit of 32 pixels and outer
+sky-annulus radius at most 128 pixels). This keeps the target profile inside
+the measurement aperture and away from its sky annulus.
+
+Calibrated export also requires explicit `residualZeroLevels` (Python alias
+`residual_zero_levels`), one additive zero level per residual in its exact
+sample units. Zero is an explicit calibration declaration. The solver uses
+`M F = E − residualZeroLevels`; it never guesses these values from a sky median
+or the display baseline. Background preparation may retain an additive reference
+level, so response calibration alone cannot establish a physical zero point.
+Zero-level uncertainty is outside the propagated residual covariance unless
+the producer includes it there.
+
+Image-based validation also audits isolated candidates excluded for clipping or
+saturation. They never train the fit. Their observed residual profiles must all
+be measurable and below the same absolute limit; `clippedStars`,
+`clippedProfiles` and `clippedMaxAbsoluteFraction` record this separate check.
+It prevents a clean unsaturated sample from hiding clipped-core artifacts and
+does not infer lost flux. The held-out report keeps both its 90th-percentile
+and maximum profile error.
+
+### Reduce restored RGB stars
+
+`screen_rgb_stars_reduced(nebula, original, starless, reduction)` performs the
+same display screen recombination with optional star minimization. An amount
+in [0,1] blends the isolated star layer's maximum-channel intensity toward a
+one-pixel cross erosion. A shared per-pixel RGB gain preserves layer color
+ratios. The starless nebula is untouched. Invalid neighbours/outer edges retain
+the unreduced layer; central coverage is unchanged. High values also remove
+faint stars. Zero uses the original screen arithmetic bit for bit.
+
+The operation is display-only; it does not sharpen a PSF or alter scientific
+linear artifacts. C exports `seiza_color_screen_rgb_stars_reduced`; Python
+returns a copy with the same name; CLI `seiza color screen-stars --reduction
+0.4` applies it after a consistently stretched original/starless RGB pair.
+
+Calibrated export requires `continuumCoefficients` (Python alias
+`continuum_coefficients`): exact per-plan coefficient snapshots in reference
+order. Residual zero-level calibration depends on these weights. A changed
+fit/manual weight is rejected even when the raw source revisions are unchanged;
+update the explicit zero levels and snapshots after recalibration. Reports and
+cache identities retain the snapshots.

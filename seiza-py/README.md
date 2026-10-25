@@ -1,5 +1,21 @@
 # seiza (Python)
 
+`balance_narrowband(image, shadow_protection=1, oiii_boost=1, sii_boost=1,
+max_samples=1000000)` accepts interleaved display samples in `[0, 1]`, with
+three physical planes H-alpha/OIII/SII, and returns `(image, report)` without
+changing the input. The report's `channels` list gives each physical channel's
+`status`, `reason`, `samples`, `median`, `background`, `positiveDeviation` and
+`midtone`. Curves protect the selected background; unreliable measurements
+are skipped. This nonlinear display operation is not photometric calibration.
+For HOO, duplicate OIII into the third plane and set `has_sii=False`; the
+third plane is ignored and the report includes only H-alpha and OIII.
+
+`screen_rgb_stars(nebula, original, starless)` returns a new display RGB image
+with RGB stars screened onto the starless nebula. All inputs share one grid
+and lie in `[0, 1]`; original and starless RGB must share the same display
+transfer. Missing coverage masks whole pixels. Negative extraction noise is
+suppressed for display. The function does not run a star-separation tool.
+
 Python bindings for [seiza](https://github.com/theatrus/seiza): star detection,
 WCS fitting, hinted/blind plate solving, satellite prediction, calibration,
 deconvolution, and batch/live image stacking for astrophotography, implemented
@@ -12,8 +28,9 @@ pip install seiza
 Binary wheels cover Linux (x86_64, aarch64), macOS (universal2), and
 Windows (x64); each is a single abi3 wheel for every CPython from 3.11 up.
 Type stubs are included, and computational image operations release the GIL.
-Input arrays are read in place, without a copy, while the GIL is released:
-do not mutate an array from another thread until the call returns.
+Some operations read input arrays in place while the GIL is released; others,
+including continuum fitting/subtraction and color composition, copy their
+inputs first. Do not mutate an array from another thread until the call returns.
 
 ## Solve an image
 
@@ -1291,3 +1308,149 @@ maturin develop && python -m pytest tests/ -q
 ## License
 
 Apache-2.0
+
+### Subtract stellar continuum before color composition
+
+`fit_continuum(stars, sources, options=None)` fits premeasured, isolated common
+stars. `measure_and_fit_continuum(narrowband, references, sources, positions=None,
+fit_options=None, photometry_options=None)` measures them on aligned,
+star-containing **linear** mono float32 arrays. Omit positions to detect stars.
+Each function returns the core JSON: either `{"status": "fitted", "plan": ...}`
+or `{"status": "skipped", "reason": ..., "detail": ..., "diagnostics": ...}`.
+A skipped fit has no plan; decide how to recover before composing an image.
+
+```python
+source = lambda name, revision: dict(name=name, revision=revision,
+                                    transfer="linear", saturation=65535)
+sources = dict(width=ha.shape[1], height=ha.shape[0],
+               narrowband=source("ha", "ha:registered:v1"),
+               references=[source("red", "red:registered:v1")])
+fit = seiza.measure_and_fit_continuum(ha, [red], sources,
+                                    fit_options={"minimum_stars": 12})
+if fit["status"] == "fitted":
+    emission = seiza.subtract_continuum(ha, [red], sources, fit["plan"])
+```
+
+`saturation` is the physical saturation level in each plane's working units,
+not its observed maximum. Use `1` for samples scaled from a sensor saturation
+level to one. Change `revision` whenever pixels, scale, background treatment,
+registration or masks change. Names must be distinct; the one to three
+references and their order define coefficient order. Plans reject changed
+sources, scales (through revisions), grids, order or non-linear transfer.
+Python option dicts accept snake_case; returned plan/diagnostic keys match the
+C ABI's camelCase JSON. Input arrays are copied before releasing the GIL.
+
+The default fit requires 12 common unsaturated stars, SNR 20, width ratios at
+most 1.3, centroid differences at most one pixel, and training/held-out RMS
+fractional errors at most 0.15. Every fourth accepted star is held out; at
+least 70% of both sets must remain after rejection. Aperture/sky radii default
+to 8/12/20 pixels. `fit_options` accepts all `ContinuumFitOptions` fields;
+`photometry_options` accepts `aperture_radius`, `annulus_inner`, `annulus_outer`.
+Manual plans have `schemaVersion=1`, the same `sources`, a nonnegative
+`coefficients` list, `origin="manual"`, and `diagnostics=None`.
+`subtract_continuum(narrowband, references, sources, plan)` returns a new signed
+array `N - sum(a_i * B_i)`, keeping negative values and NaN for missing
+contributing coverage. It never clips, rescales, stretches or corrects filter
+line transmission. A broadband reference can contain emission itself, so the
+result is an emission residual rather than calibrated pure line flux.
+
+
+### Use producer clipping masks and add emission
+
+When no physical working-unit saturation ceiling is known, set each source's
+`clipping_revision` and call `measure_and_fit_continuum_masked(narrowband,
+references, sources, clipping_masks, *, positions=None, fit_options=None,
+photometry_options=None)`. Supply a C-contiguous uint8 mono mask for each input,
+narrowband first: 0 is usable and 1 is clipped. The masks select stars; they do
+not alter pixels or signed subtraction. Automatic measurement examines up to
+4096 candidates independently of the usable-star budget, applies eligibility
+checks before that budget, samples across stellar brightness, and checks the
+fit against the complete eligible pool. `eligibleStars`, `sampledStars` and
+`samplingStabilityRms` report these decisions. A failed broader validation
+returns a skipped outcome. Manual subtraction can omit saturation evidence.
+
+`blend_emission_rgb(broadband, residuals, lines, *, negative="preserve")` projects
+signed mono residuals into linear RGB. Each line contains its exact `plan`,
+`reference_channels` (RGB indices in reference order), an artistic `amount`
+from 0 to 5, and optional explicit `background_offset` (default 0). The original
+residual remains signed. `negative="positive_contribution"` limits only the
+added contribution. Fitted plans record `referenceFluxRatios`; manual plans
+with multiple references must supply these measured or explicit ratios.
+For stellar ratios r_j=F_Bj/F_B0, projection uses k_j=sum(a_i*r_i)/r_j and adds
+amount*(E-background_offset)/k_j. Independent input gains commute with this
+conversion. It is an empirical emission residual, not pure line flux.
+
+Calibrate the broadband stars before adding emission. To apply their measured
+gains to an already normalized RGB contribution, call
+`add_rgb_contribution(base, contribution, *, gains=(1,1,1))`; offsets apply to
+the base only. `blend_display_structure(narrowband, broadband, amount)` mixes
+prepared starless RGB display images in [0,1], before restoring RGB stars once.
+Amount 0 keeps narrowband, 1 keeps broadband, and intermediate amounts require
+common coverage. All three functions return new arrays and preserve inputs.
+
+### Validate profiles and export calibrated line flux
+
+`measure_and_fit_continuum` and its masked twin accept
+`photometry_options={"psf_matching": {"target_fwhm": 5.0}}` for explicit Gaussian
+broadening on copies. Omit `target_fwhm` to choose 1.05 times the broadest measured
+profile. The plan records raw/prepared revisions and kernels;
+`subtract_continuum` replays them on the original arrays. Saturation evidence
+is still required for every original input. Held-out pixel validation defaults
+to `max_pixel_residual=0.15` and remains mandatory for automatic host use.
+The result's `pixelValidation` report distinguishes cores/halos from aperture
+flux error. Gaussian matching can still fail this check.
+
+`balance_narrowband(..., star_mask_radius=8)` excludes star circles from curve
+statistics while preserving image coverage. `None` includes stars.
+`reduce_green_excess(image, amount)` returns a copy of bounded display RGB,
+reducing green above both red and blue. Use it after palette mapping and before
+restoring an RGB-star layer. The input is unchanged.
+
+`solve_emission_flux(residuals, plans, calibration)` returns `(images, report)`.
+The calibration mapping supplies `revision`, `unit`, `lines`, exact `sources`,
+`narrowband_response`, `reference_response` and optional `residual_covariance`.
+Rows follow the plan/line order, references follow each plan. Responses include
+all exposure/gain/throughput factors in the exact input units. The operation
+subtracts the fitted broadband responses before solving coupled lines. Signed
+samples and common coverage are retained. The report embeds calibration/plans
+and propagated covariance. Missing covariance means unknown uncertainty;
+response, coefficient and zero-level uncertainty are not included. Filter labels cannot
+supply a physical flux calibration.
+
+Matching also requires `target_fwhm <= aperture_radius` and
+`annulus_inner >= 1.5 * target_fwhm`. The default 8/12/20 photometry therefore
+permits targets up to **8 pixels**. Larger targets require larger photometry
+radii in the options JSON (with a hard target limit of 32 pixels and outer
+sky-annulus radius at most 128 pixels). This keeps the target profile inside
+the measurement aperture and away from its sky annulus.
+
+Calibrated export also requires explicit `residualZeroLevels` (Python alias
+`residual_zero_levels`), one additive zero level per residual in its exact
+sample units. Zero is an explicit calibration declaration. The solver uses
+`M F = E − residualZeroLevels`; it never guesses these values from a sky median
+or the display baseline. Background preparation may retain an additive reference
+level, so response calibration alone cannot establish a physical zero point.
+Zero-level uncertainty is outside the propagated residual covariance unless
+the producer includes it there.
+
+Image-based validation also audits isolated candidates excluded for clipping or
+saturation. They never train the fit. Their observed residual profiles must all
+be measurable and below the same absolute limit; `clippedStars`,
+`clippedProfiles` and `clippedMaxAbsoluteFraction` record this separate check.
+It prevents a clean unsaturated sample from hiding clipped-core artifacts and
+does not infer lost flux. The held-out report keeps both its 90th-percentile
+and maximum profile error.
+
+`screen_rgb_stars_reduced(nebula, original, starless, reduction)` returns display
+RGB with a reduced screen-star layer. Reduction 0 preserves ordinary screen
+recombination; 1 uses full one-pixel cross erosion of star intensity. A shared
+RGB gain preserves star-layer color ratios, while invalid neighbours/borders
+retain the unreduced layer. The inputs and starless nebula are unchanged.
+This changes display prominence/apparent size, not linear or PSF measurements.
+
+Calibrated export requires `continuumCoefficients` (Python alias
+`continuum_coefficients`): exact per-plan coefficient snapshots in reference
+order. Residual zero-level calibration depends on these weights. A changed
+fit/manual weight is rejected even when the raw source revisions are unchanged;
+update the explicit zero levels and snapshots after recalibration. Reports and
+cache identities retain the snapshots.

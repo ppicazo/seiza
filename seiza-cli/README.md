@@ -941,6 +941,78 @@ one-channel and are applied before debayering. See the
 [stacking design](https://github.com/theatrus/seiza/blob/main/docs/design/image-stacking.md)
 for the live API, rejection semantics, and PSF Guard integration boundary.
 
+### Display narrowband balance and RGB stars
+
+Prepare aligned display samples in [0, 1] before these operations. For
+balance, store the physical planes as H-alpha/OIII/SII, independent of the
+final palette. For HOO, duplicate OIII into the third plane and pass `--hoo`.
+
+```sh
+seiza color balance --input physical-display.fits --output balanced.fits \
+  --report balance.json --shadow-protection 1 --oiii-boost 1 --sii-boost 1
+seiza color screen-stars --nebula starless-nebula.fits \
+  --original-rgb rgb-display.fits --starless-rgb rgb-starless-display.fits \
+  --output combined.fits
+```
+
+Balance protects each background and uses H-alpha as its reference. A flat,
+noise-dominated, or insufficiently sampled channel remains unchanged, with a
+reason in the JSON report. This is an aesthetic display operation, unsuitable
+for photometry or continuum fitting. These commands write `SEIZATRF='DISPLAY'`.
+
+`screen-stars` does not run a star-removal tool. Supply aligned original and
+starless RGB with the same linked display transfer already applied. It derives
+a screen-compatible RGB stars layer and screens it onto the nebula. Negative
+extraction noise is suppressed for display; missing coverage masks the whole
+output pixel. Source paths and output paths must be distinct.
+
+### Subtract continuum from linear narrowband images
+
+Register the mono narrowband and broadband references onto the same grid.
+Keep stars in each input. Correct backgrounds consistently, then fit and
+subtract **before** stretching, display balance, star removal or LRGB blending.
+This command does not register or normalize inputs.
+
+```sh
+seiza color continuum --narrowband ha-linear.fits --reference red-linear.fits \
+  --saturation 65535 --assume-linear --output ha-emission.fits \
+  --report continuum.json --save-plan continuum-plan.json
+seiza color continuum --narrowband ha-linear.fits --reference red-linear.fits \
+  --saturation 65535 --assume-linear --plan continuum-plan.json \
+  --output ha-emission-reused.fits
+```
+
+Declare physical saturation in each image's sample units: use `1` for unit-scaled
+samples, or the known sensor saturation on an ADU scale. `--reference-saturation`
+accepts one comma-separated value per reference when their scales differ.
+The observed maximum is not a saturation estimate. `SEIZATRF=LINEAR` inputs
+need no `--assume-linear`; that flag permits only untagged inputs. DISPLAY or
+unknown transfer tags are always refused. FITS and XISF are supported through
+the shared image reader/writer.
+
+Supply one to three repeated `--reference` paths (or one path list). Their
+order defines coefficient order. Automatic fitting detects common isolated
+stars, rejects saturation, low SNR, PSF and registration mismatches, and checks
+held-out residuals. A skipped fit writes `--report` with `status=skipped` and a
+reason, exits unsuccessfully, and writes no new image or plan. It never silently
+returns the original image. Existing files remain untouched on a skipped fit.
+Inspect the JSON diagnostics before accepting a subtraction.
+
+For a manual model, pass `--coefficients 0.35` or a comma-separated list instead
+of `--plan`. The values must be nonnegative and match reference order. For
+premeasured stars, `--stars stars.json` accepts the core's `ContinuumStar` array.
+`--positions positions.json` supplies `[x,y]` locations instead of detection.
+`--fit-options options.json` and `--photometry-options apertures.json` override
+the core defaults. Omit `--output` and supply `--report` or `--save-plan` for
+fit-only use. Plans record content fingerprints and declared saturation;
+changed files, scales, reference order or processing versions are refused.
+
+Output preserves signed linear samples and missing coverage, carries
+`SEIZATRF=LINEAR` and `SEIZACON=EMISSION-RESIDUAL`, and is replaced atomically.
+It is not pure line flux: broadband filters can transmit emission themselves.
+No clipping, pedestal, filter-throughput correction or LRGB blending is applied.
+See [the fit contract and defaults](../seiza-stacking/README.md#continuum-fitting-and-signed-residuals).
+
 ### Color composition
 
 `seiza color` consumes mono `float32` FITS stacks. It can emit an RGB
@@ -1279,3 +1351,96 @@ library caller explicitly requests it. See the
 ## License
 
 Apache-2.0
+
+
+Producer clipping maps can replace an unknown physical ceiling:
+
+```sh
+seiza color continuum --narrowband ha-linear.fits --reference red-linear.fits \
+  --clipping-mask ha-clipped.fits red-clipped.fits --report fit.json \
+  --save-plan plan.json --output ha-residual.fits
+```
+
+Maps contain mono fractions on the exact input grid. Any positive or nonfinite
+sample excludes the star from fitting. Map file identities are part of the
+source revisions. Manual `--coefficients` subtraction needs no guessed ceiling.
+The usable-star budget is applied after eligibility checks and validated
+against the broader eligible pool; inspect skip reasons before blending.
+
+Use the same core projection and display mixing from files:
+
+```sh
+seiza color blend emission --broadband rgb-linear.fits \
+  --residual ha-residual.fits --settings blend.json --output combined.fits
+seiza color blend contribution --base calibrated-rgb.fits \
+  --contribution normalized-emission.fits --gains 1.2,1,0.9 --output combined.fits
+seiza color blend structure --narrowband sho-starless.fits \
+  --broadband rgb-starless.fits --amount 0.25 --output structure.fits
+```
+
+Emission settings use the C ABI JSON shape `{"lines":[...],"options":{...}}`.
+Each line has an exact continuum plan, `referenceChannels` in RGB index order,
+`amount` and optional `backgroundOffset`. Multi-reference plans include
+`referenceFluxRatios`. For a manual continuum plan, pass
+`--reference-flux-ratios 1,2` alongside `--coefficients` to record explicit
+stellar ratios in reference order. Linear commands require `SEIZATRF=LINEAR`; structure
+inputs require `SEIZATRF=DISPLAY`. Structure mixing does not extract stars.
+
+### Match continuum PSFs and export calibrated line flux
+
+Pass `--photometry-options options.json` to `seiza color continuum` with:
+
+```json
+{"psfMatching":{"targetFwhm":5.0},"maxPixelResidual":0.15}
+```
+
+Use an empty `psfMatching` object for an automatic target, or omit it to leave
+matching off. Matching broadens copies before fitting/subtraction, retains
+coverage gaps and records kernels. It requires original saturation evidence.
+The target must be at least every measured width, at most 32 pixels. Held-out
+pixel validation still checks core/halo cancellation. A reused saved plan
+replays the exact preparation.
+
+`seiza color balance --star-mask-radius 8` excludes detected stars from display
+balance statistics. `seiza color reduce-green --input mapped.fits --output
+reduced.fits --amount 0.5` reduces green excess on DISPLAY RGB before RGB stars
+are restored.
+
+For scientific export, `seiza color blend flux --residual ha-residual.fits
+--settings response.json --output ha-flux.fits --report flux-report.json`
+accepts a settings object with `plans` and `calibration`. Supply exact source
+identities, calibrated NB/reference response arrays, line order, revision and
+common unit. Use one output per residual. The solver accounts for broadband
+line leakage and coupled responses, retaining signed flux and declared BUNIT.
+The report includes complete provenance and optional propagated residual
+covariance. Unknown covariance is not a zero-error claim. Response/fit
+uncertainty and unmodelled lines remain outside that covariance.
+
+Matching also requires `target_fwhm <= aperture_radius` and
+`annulus_inner >= 1.5 * target_fwhm`. The default 8/12/20 photometry therefore
+permits targets up to **8 pixels**. Larger targets require larger photometry
+radii in the options JSON (with a hard target limit of 32 pixels and outer
+sky-annulus radius at most 128 pixels). This keeps the target profile inside
+the measurement aperture and away from its sky annulus.
+
+Calibrated export also requires explicit `residualZeroLevels` (Python alias
+`residual_zero_levels`), one additive zero level per residual in its exact
+sample units. Zero is an explicit calibration declaration. The solver uses
+`M F = E − residualZeroLevels`; it never guesses these values from a sky median
+or the display baseline. Background preparation may retain an additive reference
+level, so response calibration alone cannot establish a physical zero point.
+Zero-level uncertainty is outside the propagated residual covariance unless
+the producer includes it there.
+
+For RGB star minimization, add `--reduction 0.4` to `seiza color screen-stars`.
+The input original/starless RGB images must use the same display transfer.
+Zero preserves normal screen recombination; higher amounts shrink/fade the
+restored layer with one linked RGB gain and can remove faint stars. The
+starless nebula stays unchanged; this does not alter scientific linear data.
+
+Calibrated export requires `continuumCoefficients` (Python alias
+`continuum_coefficients`): exact per-plan coefficient snapshots in reference
+order. Residual zero-level calibration depends on these weights. A changed
+fit/manual weight is rejected even when the raw source revisions are unchanged;
+update the explicit zero levels and snapshots after recalibration. Reports and
+cache identities retain the snapshots.

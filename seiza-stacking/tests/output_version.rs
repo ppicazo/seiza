@@ -487,6 +487,129 @@ fn output_version_is_no_newer_than_the_next_minor_version() {
     );
 }
 
+// Reference coefficients and signed samples were recorded from the planted
+// linear model before implementing the continuum operations.
+#[test]
+fn continuum_linear_modes_keep_their_output() {
+    use seiza_stacking::{
+        ContinuumFitOutcome, ContinuumOrigin, ContinuumPhotometry, ContinuumPlan, ContinuumSource,
+        ContinuumSources, ContinuumStar, ContinuumTransfer, fit_continuum, subtract_continuum,
+    };
+    let source = |name: &str| ContinuumSource {
+        name: name.into(),
+        revision: "v1".into(),
+        transfer: ContinuumTransfer::Linear,
+        saturation: Some(65535.0),
+        clipping_revision: None,
+    };
+    let mut sources = ContinuumSources {
+        width: 256,
+        height: 256,
+        narrowband: source("ha"),
+        references: vec![source("red"), source("green")],
+    };
+    let measurement = |flux: f64, i: usize| ContinuumPhotometry {
+        x: 25.0 + (i % 7) as f64 * 30.0,
+        y: 25.0 + (i / 7) as f64 * 20.0,
+        flux,
+        peak: 100.0 + flux / 20.0,
+        fwhm: 3.0,
+        snr: 100.0,
+    };
+    let stars: Vec<_> = (0..40)
+        .map(|i| {
+            let r = 1000.0 + ((i * 17) % 157) as f64 * 50.0;
+            let g = 1000.0 + ((i * 28 + 83) % 157) as f64 * 50.0;
+            ContinuumStar {
+                narrowband: measurement(0.4 * r + 0.2 * g, i),
+                references: vec![measurement(r, i), measurement(g, i)],
+            }
+        })
+        .collect();
+    let ContinuumFitOutcome::Fitted { plan } =
+        fit_continuum(&stars, &sources, &Default::default()).unwrap()
+    else {
+        panic!("planted continuum fit was skipped")
+    };
+    check("CONTINUUM_COEFFICIENTS", &plan.coefficients, &[0.4, 0.2]);
+    sources.width = 3;
+    sources.height = 1;
+    sources.references.truncate(1);
+    let plan = ContinuumPlan {
+        psf_matching: None,
+        schema_version: 1,
+        sources: sources.clone(),
+        coefficients: vec![0.35],
+        reference_flux_ratios: Vec::new(),
+        origin: ContinuumOrigin::Manual,
+        diagnostics: None,
+    };
+    let broad = LinearImage::new(3, 1, 1, vec![0.5, 0.3, 0.4]).unwrap();
+    let narrow = LinearImage::new(3, 1, 1, vec![0.2, 0.1, 0.5]).unwrap();
+    let output = subtract_continuum(&narrow, &[&broad], &sources, &plan).unwrap();
+    let signed: Vec<_> = output.data.iter().map(|v| f64::from(*v)).collect();
+    check(
+        "CONTINUUM_SIGNED",
+        &signed,
+        &[
+            0.02500000223517418,
+            -0.005000002682209015,
+            0.36000001430511475,
+        ],
+    );
+}
+
+#[test]
+fn narrowband_display_modes_keep_their_output() {
+    let mut physical = LinearImage::new(
+        1,
+        4,
+        3,
+        vec![
+            0.1, 0.05, 0.025, 0.1, 0.05, 0.025, 0.2, 0.1, 0.05, 0.5, 0.2, 0.1,
+        ],
+    )
+    .unwrap();
+    seiza_stacking::balance_narrowband(&mut physical, &Default::default()).unwrap();
+    let ha = LinearImage::new(1, 4, 1, physical.data.iter().step_by(3).copied().collect()).unwrap();
+    let oiii = LinearImage::new(
+        1,
+        4,
+        1,
+        physical.data.iter().skip(1).step_by(3).copied().collect(),
+    )
+    .unwrap();
+    let sii = LinearImage::new(
+        1,
+        4,
+        1,
+        physical.data.iter().skip(2).step_by(3).copied().collect(),
+    )
+    .unwrap();
+    let sums: Vec<f64> = [&ha, &oiii, &sii]
+        .iter()
+        .map(|image| image.data.iter().map(|value| f64::from(*value)).sum())
+        .collect();
+    check(
+        "NARROWBAND_BALANCE",
+        &sums,
+        &[9.0000001e-1, 6.5793314e-1, 5.4459879e-1],
+    );
+    let mut nebula = LinearImage::new(1, 1, 3, vec![0.1, 0.2, 0.3]).unwrap();
+    let original = LinearImage::new(1, 1, 3, vec![0.4, 0.5, 0.6]).unwrap();
+    let starless = nebula.clone();
+    seiza_stacking::screen_rgb_stars(&mut nebula, &original, &starless).unwrap();
+    check(
+        "RGB_STARS",
+        &nebula
+            .data
+            .iter()
+            .map(|v| f64::from(*v))
+            .collect::<Vec<_>>(),
+        &[4.0000004e-1, 5.0000000e-1, 6.0000002e-1],
+    );
+}
+
 #[test]
 fn a_mono_stack_with_default_options_keeps_its_output() {
     check(
@@ -2396,3 +2519,292 @@ const SUPERPIXEL_MAPPING: &[f64] = &[
     3.0147623e2,
     2.0163464e2,
 ];
+
+#[path = "common/continuum.rs"]
+mod continuum_measurement_fixture;
+
+#[test]
+fn continuum_saturated_candidate_sampling_keeps_its_output() {
+    check(
+        "CONTINUUM_CANDIDATE_SAMPLING",
+        &continuum_measurement_fixture::measurement_summary(),
+        &[1.0, 0.35, 12.0, 4.0, 16.0],
+    );
+}
+
+fn emission_fixture() -> seiza_stacking::EmissionBlendLine {
+    use seiza_stacking::*;
+    let source = |name: &str| ContinuumSource {
+        name: name.into(),
+        revision: "fixture-v1".into(),
+        transfer: ContinuumTransfer::Linear,
+        saturation: Some(1000.0),
+        clipping_revision: None,
+    };
+    EmissionBlendLine {
+        plan: ContinuumPlan {
+            psf_matching: None,
+            schema_version: 1,
+            sources: ContinuumSources {
+                width: 1,
+                height: 1,
+                narrowband: source("ha"),
+                references: vec![source("red")],
+            },
+            coefficients: vec![0.2],
+            reference_flux_ratios: vec![1.0],
+            origin: ContinuumOrigin::Manual,
+            diagnostics: None,
+        },
+        reference_channels: vec![0],
+        amount: 0.25,
+        background_offset: 0.0,
+    }
+}
+#[test]
+fn emission_blending_keeps_its_output() {
+    use seiza_stacking::*;
+    let base = LinearImage::new(1, 1, 3, vec![0.2, 0.3, 0.4]).unwrap();
+    let residual = LinearImage::new(1, 1, 1, vec![0.04]).unwrap();
+    let projected = blend_emission_rgb(
+        &base,
+        &[&residual],
+        &[emission_fixture()],
+        &Default::default(),
+    )
+    .unwrap();
+    check(
+        "EMISSION_RGB",
+        &projected
+            .data
+            .iter()
+            .map(|v| f64::from(*v))
+            .collect::<Vec<_>>(),
+        &[0.25, 0.3, 0.4],
+    );
+    let nebula = LinearImage::new(1, 1, 3, vec![0.1, 0.2, 0.3]).unwrap();
+    let broadband = LinearImage::new(1, 1, 3, vec![0.5, 0.6, 0.7]).unwrap();
+    let mixed = blend_display_structure(&nebula, &broadband, 0.25).unwrap();
+    check(
+        "EMISSION_STRUCTURE",
+        &mixed.data.iter().map(|v| f64::from(*v)).collect::<Vec<_>>(),
+        &[0.2, 0.3, 0.4],
+    );
+}
+#[test]
+fn calibrated_emission_addition_keeps_its_output() {
+    use seiza_stacking::*;
+    let base = LinearImage::new(1, 1, 3, vec![0.2, 0.3, 0.4]).unwrap();
+    let delta = LinearImage::new(1, 1, 3, vec![0.1, 0.2, 0.3]).unwrap();
+    let result = add_rgb_contribution(&base, &delta, [2.0, 1.0, 0.5]).unwrap();
+    check(
+        "CALIBRATED_EMISSION",
+        &result
+            .data
+            .iter()
+            .map(|v| f64::from(*v))
+            .collect::<Vec<_>>(),
+        &[0.4, 0.5, 0.55],
+    );
+}
+#[test]
+fn continuum_clipping_map_keeps_its_output() {
+    use seiza_stacking::*;
+    let (n, b, positions, mut sources, options) = continuum_measurement_fixture::saturated_field();
+    let masks: Vec<Vec<u8>> = [&n, &b]
+        .iter()
+        .map(|image| image.data.iter().map(|v| u8::from(*v >= 1000.0)).collect())
+        .collect();
+    for source in std::iter::once(&mut sources.narrowband).chain(&mut sources.references) {
+        source.saturation = None;
+        source.clipping_revision = Some("producer-v1".into());
+    }
+    let outcome = measure_and_fit_continuum_masked(
+        &n,
+        &[&b],
+        &sources,
+        &masks.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+        &positions,
+        &options,
+        &Default::default(),
+    )
+    .unwrap();
+    let ContinuumFitOutcome::Fitted { plan } = outcome else {
+        panic!("masked fit skipped: {outcome:?}")
+    };
+    let d = plan.diagnostics.unwrap();
+    check(
+        "CONTINUUM_CLIPPING",
+        &[
+            plan.coefficients[0],
+            d.used_stars as f64,
+            d.validation_stars as f64,
+            d.rejected[&ContinuumSkipReason::Saturated] as f64,
+        ],
+        &[0.35, 12.0, 4.0, 16.0],
+    );
+}
+
+#[test]
+fn continuum_deeper_candidate_search_keeps_its_output() {
+    check(
+        "CONTINUUM_DEEPER_CANDIDATES",
+        &continuum_measurement_fixture::deeper_candidate_summary(),
+        &[1.0, 0.35, 12.0, 4.0, 100.0],
+    );
+}
+
+#[test]
+fn continuum_profile_validation_keeps_its_output() {
+    check(
+        "CONTINUUM_PROFILE",
+        &continuum_measurement_fixture::profile_summary(),
+        &[0.0, 0.0],
+    );
+}
+
+#[test]
+fn continuum_psf_matching_keeps_its_output() {
+    use seiza_stacking::*;
+    let (n, b, positions, sources, options) = continuum_measurement_fixture::profile_field();
+    let photo = ContinuumPhotometryOptions {
+        psf_matching: Some(ContinuumPsfOptions {
+            target_fwhm: Some(5.0),
+        }),
+        ..Default::default()
+    };
+    let ContinuumFitOutcome::Fitted { plan } =
+        measure_and_fit_continuum(&n, &[&b], &sources, &positions, &options, &photo).unwrap()
+    else {
+        panic!("Matching should pass");
+    };
+    let residual = subtract_continuum(&n, &[&b], &sources, &plan).unwrap();
+    let report = plan.psf_matching.as_ref().unwrap();
+    check(
+        "CONTINUUM_PSF",
+        &[
+            plan.coefficients[0],
+            report.kernel_sigma[0],
+            report.kernel_sigma[1],
+            residual.data[30 * n.width + 30] as f64,
+            plan.diagnostics
+                .as_ref()
+                .unwrap()
+                .pixel_validation
+                .as_ref()
+                .unwrap()
+                .p90_absolute_fraction,
+        ],
+        &[
+            3.4987700e-1,
+            1.5519567e0,
+            1.6884675e0,
+            4.9436164e0,
+            2.3122674e-2,
+        ],
+    );
+}
+
+#[test]
+fn green_reduction_and_response_calibration_keep_their_output() {
+    use seiza_stacking::*;
+    let mut display = LinearImage::new(1, 1, 3, vec![0.2, 0.8, 0.3]).unwrap();
+    reduce_green_excess(&mut display, 0.5).unwrap();
+    check(
+        "GREEN_REDUCTION",
+        &display
+            .data
+            .iter()
+            .map(|v| f64::from(*v))
+            .collect::<Vec<_>>(),
+        &[0.2, 0.55, 0.3],
+    );
+    let plan = emission_fixture().plan;
+    let cal = EmissionFluxCalibration {
+        revision: "fixture-v1".into(),
+        unit: "flux/pixel".into(),
+        lines: vec!["ha".into()],
+        sources: vec![plan.sources.clone()],
+        narrowband_response: vec![vec![1.0]],
+        continuum_coefficients: vec![vec![0.2]],
+        residual_zero_levels: vec![0.0],
+        reference_response: vec![vec![vec![1.0]]],
+        residual_covariance: Some(vec![vec![4.0]]),
+    };
+    let residual = LinearImage::new(1, 1, 1, vec![4.0]).unwrap();
+    let (flux, report) = solve_emission_flux(&[&residual], &[plan], &cal).unwrap();
+    check(
+        "CALIBRATED_FLUX",
+        &[
+            f64::from(flux[0].data[0]),
+            report.effective_response[0][0],
+            report.flux_covariance.unwrap()[0][0],
+        ],
+        &[5.0, 0.8, 6.25],
+    );
+}
+
+#[test]
+fn star_excluded_balance_statistics_keep_their_output() {
+    use seiza_stacking::*;
+    let (n, b, _, _, _) = continuum_measurement_fixture::profile_field();
+    let mut data = Vec::new();
+    for (n, b) in n.data.iter().zip(&b.data) {
+        data.extend_from_slice(&[*n / 1000.0, *b / 2500.0, *n / 2000.0]);
+    }
+    let mut image = LinearImage::new(n.width, n.height, 3, data).unwrap();
+    let report = balance_narrowband(
+        &mut image,
+        &NarrowbandBalanceOptions {
+            star_mask_radius: Some(8.0),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    check(
+        "STAR_EXCLUDED_BALANCE",
+        &[
+            report.masked_pixels as f64,
+            report.detected_stars as f64,
+            report.channels[0].samples as f64,
+            report.channels[1].positive_deviation.unwrap(),
+        ],
+        &[6.3040000e3, 9.6000000e1, 8.9696000e4, 6.5510077e-9],
+    );
+}
+
+fn rgb_star_reduction_fixture(center_gain: f32) -> (LinearImage, LinearImage, LinearImage) {
+    let nebula = LinearImage::new(3, 3, 3, [0.1, 0.2, 0.3].repeat(9)).unwrap();
+    let starless = LinearImage::new(3, 3, 3, vec![0.2; 27]).unwrap();
+    let mut original = Vec::new();
+    for (i, level) in [0.05, 0.2, 0.05, 0.2, 0.8, 0.2, 0.05, 0.2, 0.05]
+        .iter()
+        .enumerate()
+    {
+        let level = level * if i == 4 { center_gain } else { 1.0 };
+        for color in [1.0, 0.5, 0.25] {
+            original.push(1.0 - (1.0 - 0.2) * (1.0 - level * color));
+        }
+    }
+    (
+        nebula,
+        LinearImage::new(3, 3, 3, original).unwrap(),
+        starless,
+    )
+}
+
+#[test]
+fn reduced_rgb_stars_keep_their_output() {
+    // Reference: half blend of centre .8 and cross-neighbour minimum .2
+    // gives .5, or a common RGB star-layer gain of .625.
+    let (mut nebula, original, starless) = rgb_star_reduction_fixture(1.0);
+    seiza_stacking::screen_rgb_stars_reduced(&mut nebula, &original, &starless, 0.5).unwrap();
+    check(
+        "RGB_STAR_REDUCTION",
+        &nebula.data[12..15]
+            .iter()
+            .map(|v| f64::from(*v))
+            .collect::<Vec<_>>(),
+        &[0.55, 0.4, 0.3875],
+    );
+}
