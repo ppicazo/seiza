@@ -1155,10 +1155,11 @@ fn solve_with_prior(
 /// the image's own samples, and detected again at full resolution when that
 /// does not solve. A photo's EXIF focal length gives the first scale to try.
 /// ``catalog_dir`` is a directory of catalogs, or ``None`` for the standard
-/// places; the deepest star catalog there is used, with the blind index
-/// beside it and, when the star file has one, its proper-motion sidecar,
-/// which moves the catalog to the image's capture time. The other arguments
-/// are as for :func:`solve_blind`.
+/// places; the deepest star catalog directly there is used (no recursive
+/// search), or pass a star catalog file. The blind index beside it is opened
+/// only if the header/hinted solve fails. A proper-motion sidecar, when
+/// present, moves the catalog to the image's capture time. The other
+/// arguments are as for :func:`solve_blind`.
 #[pyfunction]
 #[pyo3(signature = (path, *, catalog_dir=None, min_scale_arcsec_px=0.1,
     max_scale_arcsec_px=20.0, sip_order=0, time_limit=None, cancel=None))]

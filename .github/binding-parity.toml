@@ -117,6 +117,7 @@ core = "seiza-calibration::FrameSignature"
 
 [rust.SeizaMatchTolerances]
 core = "seiza-calibration::MatchTolerances"
+allow_flat_gain_offset_mismatch = { c = "known" }
 light_rotation = { none = "SeizaMatchTolerances is a fixed C layout callers allocate: seiza_live_stacker_set_light_rotation and seiza_live_stacker_light_rotation carry a stack's light angle, and a host matching one light by hand puts the angle it measured in the light's signature" }
 
 [rust.CalibrationPlanTolerancesRequest]

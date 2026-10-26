@@ -44,6 +44,43 @@ def no_adjustment_options():
     return seiza.StackOptions(normalization="none", rejection="none")
 
 
+def test_dark_calibrated_flat_readout_policy_and_context(tmp_path):
+    def write(name, data, **cards):
+        header = fits.Header()
+        for key, value in cards.items():
+            header[key] = value
+        path = tmp_path / name
+        fits.writeto(path, data, header, overwrite=True)
+        return path
+
+    light = write("light.fits", synthetic_star_field(), GAIN=100, OFFSET=50, EXPTIME=60)
+    next_light = write("next.fits", synthetic_star_field(), GAIN=100, OFFSET=50, EXPTIME=60)
+    dark = write("dark.fits", np.ones((128, 160), np.float32), SEIZAMST="DARK", GAIN=100, OFFSET=50, EXPTIME=60)
+    flat = write("flat.fits", np.ones((128, 160), np.float32), SEIZAMST="FLAT", GAIN=0, OFFSET=10, DARKSUB=True, BIASSUB=True, FLATNORM=True)
+    assert not seiza.MatchTolerances().allow_flat_gain_offset_mismatch
+    with pytest.raises(seiza.StackError, match="master flat"):
+        seiza.LiveStacker(light, dark=dark, flat=flat, options=no_adjustment_options())
+    gate = seiza.MatchTolerances(allow_flat_gain_offset_mismatch=True)
+    options = seiza.StackOptions(normalization="none", rejection="none", match_tolerances=gate)
+    stacker = seiza.LiveStacker(light, dark=dark, flat=flat, options=options)
+    assert stacker.push_fits(next_light).accepted
+    context = tmp_path / "flat.seiza-stack"
+    stacker.save_context(context)
+    restored = seiza.LiveStacker.open_context(context)
+    assert restored.match_tolerances().allow_flat_gain_offset_mismatch
+    assert restored.reintegrate().accepted_frames == 2
+    restored.set_match_tolerances()
+    signature = seiza.FrameSignature(width=160, height=128, channels=1, gain=100, offset=50, exposure_seconds=60)
+    with pytest.raises(seiza.StackError, match="master flat"):
+        restored.validate_calibration(signature)
+    bad_dark = write("bad-dark.fits", np.ones((128, 160), np.float32), SEIZAMST="DARK", GAIN=0, OFFSET=10, EXPTIME=60)
+    with pytest.raises(seiza.StackError, match="master dark"):
+        seiza.LiveStacker(light, dark=bad_dark, flat=flat, options=options)
+    uncalibrated = write("normalized-only.fits", np.ones((128, 160), np.float32), SEIZAMST="FLAT", GAIN=0, OFFSET=10, FLATNORM=True)
+    with pytest.raises(seiza.StackError, match="master flat"):
+        seiza.LiveStacker(light, flat=uncalibrated, options=options)
+
+
 def test_stack_options_reject_unknown_modes():
     with pytest.raises(ValueError, match="normalization"):
         seiza.StackOptions(normalization="mystery")

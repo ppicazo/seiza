@@ -301,7 +301,14 @@ pub fn plan_calibration(request: CalibrationPlanRequest) -> Result<CalibrationPl
         let candidate = &record.signature;
         let reason = if record.role != kind.role() {
             Some(CalibrationExclusionReason::RoleMismatch)
-        } else if !every_reference(&|light| seiza_calibration::sensor_matches(light, candidate)) {
+        } else if !every_reference(&|light| {
+            let mut light = light.clone();
+            if kind == CalibrationPlanKind::Flat && tolerances.allow_flat_gain_offset_mismatch {
+                light.gain = candidate.gain;
+                light.offset = candidate.offset;
+            }
+            seiza_calibration::sensor_matches(&light, candidate)
+        }) {
             Some(CalibrationExclusionReason::SensorMismatch)
         } else if kind.uses_dark_matching()
             && (!dark_targets_have_exposure || !has_positive_exposure(candidate))
@@ -536,6 +543,65 @@ mod tests {
             minimum: 2,
             tolerances: MatchTolerances::default(),
             bias_available: false,
+        }
+    }
+
+    #[test]
+    fn flat_readout_policy_never_relaxes_dark_flat_matching_or_master_coherence() {
+        for kind in [
+            CalibrationPlanKind::Flat,
+            CalibrationPlanKind::Dark,
+            CalibrationPlanKind::DarkFlat,
+        ] {
+            let mut reference = signature(Some(60.0), Some(-10.0), Some(1000));
+            reference.gain = Some(100);
+            reference.offset = Some(50);
+            let candidates = [0, 1]
+                .map(|gain| {
+                    let mut candidate = reference.clone();
+                    candidate.gain = Some(gain);
+                    candidate.offset = Some(10);
+                    record(&format!("candidate-{gain}.fits"), kind.role(), candidate)
+                })
+                .to_vec();
+            let request = CalibrationPlanRequest {
+                kind,
+                reference: record(
+                    "reference.fits",
+                    if kind == CalibrationPlanKind::DarkFlat {
+                        FrameSourceRole::Flat
+                    } else {
+                        FrameSourceRole::Light
+                    },
+                    reference,
+                ),
+                references: vec![],
+                candidates,
+                minimum: 2,
+                tolerances: MatchTolerances {
+                    allow_flat_gain_offset_mismatch: true,
+                    ..Default::default()
+                },
+                bias_available: false,
+            };
+            let plan = plan_calibration(request).unwrap();
+            assert!(!plan.ready);
+            assert_eq!(
+                plan.matched_paths.len(),
+                if kind == CalibrationPlanKind::Flat {
+                    2
+                } else {
+                    0
+                }
+            );
+            assert_eq!(
+                plan.selected_paths.len(),
+                if kind == CalibrationPlanKind::Flat {
+                    1
+                } else {
+                    0
+                }
+            );
         }
     }
 

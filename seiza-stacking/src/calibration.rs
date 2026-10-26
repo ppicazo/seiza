@@ -90,6 +90,7 @@ pub struct CalibrationMasters {
     pub(crate) flat_response: Option<LinearImage>,
     pub(crate) flat_signature: Option<FrameSignature>,
     pub(crate) flat_bayer: Option<BayerLayout>,
+    pub(crate) flat_dark_subtracted: bool,
 }
 
 impl CalibrationMasters {
@@ -137,6 +138,9 @@ impl CalibrationMasters {
         flat: Option<FitsFrame>,
         dark_exposure_seconds: Option<f64>,
     ) -> Result<Self> {
+        let flat_dark_subtracted = flat
+            .as_ref()
+            .is_some_and(|frame| header_bool(frame, "DARKSUB") == Some(true));
         let bias = bias
             .map(|frame| {
                 frame.validate_master_kind("BIAS")?;
@@ -167,6 +171,7 @@ impl CalibrationMasters {
         masters.bias_signature = bias_signature;
         masters.dark_signature = dark_signature;
         masters.flat_signature = flat_signature;
+        masters.flat_dark_subtracted = flat_dark_subtracted;
         masters.validate_master_set_signatures()?;
         Ok(masters)
     }
@@ -288,6 +293,7 @@ impl CalibrationMasters {
             flat_response,
             flat_signature,
             flat_bayer,
+            flat_dark_subtracted: false,
         })
     }
 
@@ -315,11 +321,12 @@ impl CalibrationMasters {
     ///
     /// Matching against a light is intentionally asymmetric: a light with an
     /// unknown gain cannot rule out a calibration frame whose gain is known.
-    /// That does not make two masters with different known gains safe to mix,
-    /// though. Requiring sensor compatibility in both directions catches both
-    /// explicit disagreement and a known-vs-unknown setting before pixels are
-    /// combined. Missing signatures are retained only for legacy v1 contexts;
-    /// their per-light admission path fails closed until masters are reloaded.
+    /// Two masters whose pixels are combined must not contradict one another.
+    /// A flat that records dark subtraction is already a response map: its
+    /// gain/offset agreement is deferred to the light's admission policy,
+    /// while its sensor geometry and readout mode remain strict. Missing
+    /// signatures are retained only for legacy v1 contexts; their per-light
+    /// admission path fails closed until masters are reloaded.
     pub(crate) fn validate_master_set_signatures(&self) -> Result<()> {
         let signatures = [
             ("bias", self.bias.is_some(), self.bias_signature.as_ref()),
@@ -345,7 +352,16 @@ impl CalibrationMasters {
                 let Some(right_signature) = right_signature else {
                     continue;
                 };
-                if right_active && !sensor_consistent(left_signature, right_signature) {
+                // A dark-calibrated flat is already a response map. Its
+                // readout settings are checked against each light under that
+                // light's policy; no pixels from the light's dark/bias are
+                // subtracted from it here.
+                let mut left_signature = left_signature.clone();
+                if right_kind == "flat" && self.flat_dark_subtracted {
+                    left_signature.gain = right_signature.gain;
+                    left_signature.offset = right_signature.offset;
+                }
+                if right_active && !sensor_consistent(&left_signature, right_signature) {
                     return Err(Error::Calibration(format!(
                         "master {left_kind} and master {right_kind} have incompatible sensor or readout metadata"
                     )));
@@ -478,6 +494,7 @@ impl CalibrationMasters {
                     kept.flat_response = None;
                     kept.flat_signature = None;
                     kept.flat_bayer = None;
+                    kept.flat_dark_subtracted = false;
                 }
             }
             dropped.push(format!(
@@ -600,7 +617,34 @@ impl CalibrationMasters {
                 ));
                 continue;
             };
-            if !sensor_consistent(light, signature) {
+            // Loading keeps an independently calibrated response usable by
+            // an opted-in stack. Without the opt-in, missing light metadata
+            // must not hide a known disagreement between its masters.
+            if kind == MasterKind::Flat && !tolerances.allow_flat_gain_offset_mismatch {
+                let conflict = [self.bias_signature.as_ref(), self.dark_signature.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .find(|other| !sensor_consistent(other, signature));
+                if let Some(other) = conflict {
+                    refusals.push(refusal(
+                        Problem::Sensor,
+                        format!(
+                            "flat conflicts with another active master: {}",
+                            seiza_calibration::describe_sensor_mismatch(other, signature)
+                        ),
+                    ));
+                    continue;
+                }
+            }
+            let mut sensor_light = light.clone();
+            if kind == MasterKind::Flat
+                && self.flat_dark_subtracted
+                && tolerances.allow_flat_gain_offset_mismatch
+            {
+                sensor_light.gain = signature.gain;
+                sensor_light.offset = signature.offset;
+            }
+            if !sensor_consistent(&sensor_light, signature) {
                 refusals.push(refusal(
                     Problem::Sensor,
                     seiza_calibration::describe_sensor_mismatch(light, signature),
@@ -832,6 +876,8 @@ pub(crate) fn check_tolerances(tolerances: &MatchTolerances) -> Result<()> {
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct LightGate {
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    allow_flat_gain_offset_mismatch: bool,
     exposure_seconds: f64,
     exposure_fraction: f64,
     dark_temperature_c: f64,
@@ -849,6 +895,7 @@ impl LightGate {
         // zero it equals, so the two write and hash alike.
         Self {
             exposure_seconds: tolerances.exposure_seconds + 0.0,
+            allow_flat_gain_offset_mismatch: tolerances.allow_flat_gain_offset_mismatch,
             exposure_fraction: tolerances.exposure_fraction + 0.0,
             dark_temperature_c: tolerances.dark_temperature_c + 0.0,
             rotation_deg: tolerances.rotation_deg + 0.0,
@@ -872,6 +919,7 @@ impl LightGate {
     /// comparison could use them.
     pub(crate) fn tolerances(self) -> Result<MatchTolerances> {
         let tolerances = MatchTolerances {
+            allow_flat_gain_offset_mismatch: self.allow_flat_gain_offset_mismatch,
             exposure_seconds: self.exposure_seconds,
             exposure_fraction: self.exposure_fraction,
             dark_temperature_c: self.dark_temperature_c,
@@ -1669,6 +1717,65 @@ mod tests {
                 .unwrap_err()
                 .to_string();
         assert!(error.contains("incompatible sensor or readout"), "{error}");
+    }
+
+    #[test]
+    fn only_dark_calibrated_flats_can_opt_out_of_gain_and_offset_matching() {
+        let mut masters = recorded_masters();
+        masters.dark_signature.as_mut().unwrap().gain = Some(100);
+        masters.dark_signature.as_mut().unwrap().offset = Some(50);
+        let flat = masters.flat_signature.as_mut().unwrap();
+        flat.gain = Some(0);
+        flat.offset = Some(10);
+        // Use only sensor fields here: the optical gate is independent.
+        let mut signature = matching_light();
+        signature.offset = Some(50);
+        signature.rotation_deg = flat.rotation_deg;
+        signature.filter = flat.filter.clone();
+        signature.telescope = flat.telescope.clone();
+        signature.focal_length_mm = flat.focal_length_mm;
+        let permissive = MatchTolerances {
+            allow_flat_gain_offset_mismatch: true,
+            ..Default::default()
+        };
+        assert!(
+            masters
+                .validate_light_signature_with(&signature, &permissive)
+                .is_err()
+        );
+        masters.flat_dark_subtracted = true;
+        assert!(masters.validate_master_set_signatures().is_ok());
+        assert!(masters.validate_light_signature(&signature).is_err());
+        let mut unknown_readout = signature.clone();
+        unknown_readout.gain = None;
+        unknown_readout.offset = None;
+        assert!(masters.validate_light_signature(&unknown_readout).is_err());
+        masters
+            .validate_light_signature_with(&signature, &permissive)
+            .unwrap();
+        assert!(
+            masters
+                .compatible_for_light_with(&signature, &permissive)
+                .unwrap()
+                .1
+                .is_empty()
+        );
+        signature.gain = Some(101);
+        assert!(
+            masters
+                .validate_light_signature_with(&signature, &permissive)
+                .unwrap_err()
+                .to_string()
+                .contains("master dark")
+        );
+        signature.gain = Some(100);
+        signature.readout_mode = Some(2);
+        masters.flat_signature.as_mut().unwrap().readout_mode = Some(1);
+        assert!(
+            masters
+                .validate_light_signature_with(&signature, &permissive)
+                .is_err()
+        );
     }
 
     #[test]

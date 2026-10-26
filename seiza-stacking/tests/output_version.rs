@@ -2162,6 +2162,20 @@ fn mosaic_stack(model: RegistrationModel) -> StackSnapshot {
 /// path PSF Guard's banded stacks took before #295.
 #[test]
 fn calibrated_faint_lights_and_a_bias_calibrated_flat_keep_their_output() {
+    calibrated_faint_lights(false, false);
+}
+
+#[test]
+fn calibrated_faint_lights_and_a_dark_calibrated_flat_keep_their_output() {
+    calibrated_faint_lights(true, false);
+}
+
+#[test]
+fn different_gain_dark_calibrated_flats_keep_the_same_pixel_output() {
+    calibrated_faint_lights(true, true);
+}
+
+fn calibrated_faint_lights(dark_flat: bool, different_gain: bool) {
     let directory = tempfile::tempdir().unwrap();
     // A fixed pattern the dark carries and subtracts.
     let pattern = |index: usize| 2.0 * (index.wrapping_mul(2_654_435_761) % 7) as f32;
@@ -2182,11 +2196,17 @@ fn calibrated_faint_lights_and_a_bias_calibrated_flat_keep_their_output() {
     });
     let bias = build_master_from_fits(&bias, MasterFrameKind::Bias, &MasterBuildOptions::default())
         .unwrap();
-    let flat = build_master_from_fits(
+    let mut flat = build_master_from_fits(
         &flats,
         MasterFrameKind::Flat,
         &MasterBuildOptions {
-            bias: Some(bias.image),
+            bias: (!dark_flat).then(|| bias.image.clone()),
+            dark: dark_flat.then_some(seiza_stacking::MasterDark {
+                image: bias.image,
+                exposure_seconds: Some(60.0),
+                bias_subtracted: false,
+                bayer: None,
+            }),
             ..MasterBuildOptions::default()
         },
     )
@@ -2206,6 +2226,12 @@ fn calibrated_faint_lights_and_a_bias_calibrated_flat_keep_their_output() {
         directory.path().join("master-dark.fits"),
         directory.path().join("master-flat.fits"),
     );
+    if different_gain {
+        flat.reference_headers
+            .push(("GAIN".into(), HeaderValue::Integer(0)));
+        flat.reference_headers
+            .push(("OFFSET".into(), HeaderValue::Integer(10)));
+    }
     write_master_fits_f32(&dark_path, &dark).unwrap();
     write_master_fits_f32(&flat_path, &flat).unwrap();
     let lights = (0..SHIFTS.len())
@@ -2217,11 +2243,29 @@ fn calibrated_faint_lights_and_a_bias_calibrated_flat_keep_their_output() {
                 .enumerate()
                 .map(|(index, &value)| 325.0 + pattern(index) + vignetting(index) * value)
                 .collect();
-            write_raw(&directory, "light", frame, data, "LIGHT")
+            let path = write_raw(&directory, "light", frame, data, "LIGHT");
+            if different_gain {
+                let frame = seiza_stacking::FitsFrame::open(&path).unwrap();
+                write_processed_image_fits_f32(
+                    &path,
+                    &frame.image,
+                    &frame.headers,
+                    &[
+                        WriteHeaderCard::new("GAIN", HeaderValue::Integer(100)),
+                        WriteHeaderCard::new("OFFSET", HeaderValue::Integer(50)),
+                    ],
+                )
+                .unwrap();
+            }
+            path
         })
         .collect::<Vec<_>>();
     let options = StackOptions {
         interpolation: Interpolation::Lanczos3,
+        match_tolerances: seiza_calibration::MatchTolerances {
+            allow_flat_gain_offset_mismatch: different_gain,
+            ..Default::default()
+        },
         ..StackOptions::default()
     };
     let mut stacker = LiveStacker::open_fits(

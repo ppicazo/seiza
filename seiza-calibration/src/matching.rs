@@ -76,6 +76,12 @@ pub enum FrameRole {
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MatchTolerances {
+    /// Allow different gain/offset when selecting flats for lights and when
+    /// applying a master flat that records dark subtraction. The caller must
+    /// establish that the camera's normalized response is transferable across
+    /// these settings. Dark/light and flat/dark-flat matching remain strict.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub allow_flat_gain_offset_mismatch: bool,
     /// Dark exposure against light exposure: the floor, in seconds.
     ///
     /// The comparison takes whichever of this and
@@ -177,6 +183,7 @@ impl LightRotation {
 impl Default for MatchTolerances {
     fn default() -> Self {
         Self {
+            allow_flat_gain_offset_mismatch: false,
             exposure_seconds: 0.05,
             exposure_fraction: 1.0e-3,
             dark_temperature_c: 3.0,
@@ -825,6 +832,7 @@ mod tests {
             focal_length_mm: 0.0,
             flat_session_seconds: 0,
             light_rotation: LightRotation::Unknown,
+            allow_flat_gain_offset_mismatch: false,
         }
         .validate()
         .unwrap();

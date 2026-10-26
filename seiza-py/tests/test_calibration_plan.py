@@ -35,6 +35,22 @@ def signature(exposure_seconds=60.0, camera_temp_c=-10.0, captured_at_unix=1000)
 LIGHT = seiza.CalibrationRecord("light.fits", signature(), role="light")
 
 
+def test_flat_readout_override_preserves_dark_flat_matching():
+    def record(name, role, gain):
+        return seiza.CalibrationRecord(name, seiza.FrameSignature(camera="ASI6200MM", gain=gain, offset=50, exposure_seconds=60), role=role)
+
+    light = record("light.fits", "light", 100)
+    flat = record("flat.fits", "flat", 0)
+    gate = seiza.MatchTolerances(allow_flat_gain_offset_mismatch=True)
+    assert not seiza.plan_calibration("flat", light, [flat], minimum=1).ready
+    assert seiza.plan_calibration("flat", light, [flat], minimum=1, tolerances=gate).ready
+    bad = record("bad.fits", "dark-flat", 100)
+    good = record("good.fits", "dark-flat", 0)
+    plan = seiza.plan_calibration("dark-flat", flat, [bad, good], minimum=1, tolerances=gate)
+    assert plan.selected_paths == [Path("good.fits")]
+    assert plan.excluded == [(Path("bad.fits"), "sensor-mismatch")]
+
+
 def test_a_probe_reads_role_master_flag_signature_and_state(tmp_path):
     path = write_frame(
         tmp_path / "master-dark.fits",

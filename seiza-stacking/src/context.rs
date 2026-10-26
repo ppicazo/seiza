@@ -180,6 +180,8 @@ struct CalibrationMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     flat_signature: Option<FrameSignature>,
     flat_bayer: Option<BayerMetadata>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    flat_dark_subtracted: bool,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -677,6 +679,7 @@ pub(crate) fn read(path: &Path) -> Result<RestoredContext> {
             .map_err(|message| context_read_error(path, message))?,
         flat_response,
         flat_signature: metadata.calibration.flat_signature.clone(),
+        flat_dark_subtracted: metadata.calibration.flat_dark_subtracted,
         flat_bayer: metadata
             .calibration
             .flat_bayer
@@ -932,6 +935,7 @@ impl From<&CalibrationMasters> for CalibrationMetadata {
             dark_bayer: calibration.dark_bayer.map(BayerMetadata::from),
             flat_response: calibration.flat_response.as_ref().map(ImageMetadata::from),
             flat_signature: calibration.flat_signature.clone(),
+            flat_dark_subtracted: calibration.flat_dark_subtracted,
             flat_bayer: calibration.flat_bayer.map(BayerMetadata::from),
         }
     }

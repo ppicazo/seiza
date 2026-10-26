@@ -356,6 +356,7 @@ class FrameSignature:
     ) -> None: ...
 
 class MatchTolerances:
+    allow_flat_gain_offset_mismatch: bool
     exposure_seconds: float
     exposure_fraction: float
     dark_temperature_c: float
@@ -374,6 +375,7 @@ class MatchTolerances:
         focal_length_mm: float | None = None,
         flat_session_seconds: int | None = None,
         light_rotation: float | str | None = None,
+        allow_flat_gain_offset_mismatch: bool = False,
     ) -> None: ...
 
 class FrameCalibrationState:
