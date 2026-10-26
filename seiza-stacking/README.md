@@ -22,6 +22,19 @@ The first release supports:
 
 ## Completed-stack rejection
 
+Registration admission uses an absolute `maximum_registration_rms_pixels`
+limit in original sensor pixels, independent of earlier frames' residuals.
+There is no running-median RMS gate. Plate-solve catalog residuals measure a
+different fit; a similarity registration cannot model the curvature a quadratic
+mapping can address. Fraction admission thresholds accept equality.
+
+For a camera whose normalized flat response transfers across gain/offset
+settings, `StackOptions::match_tolerances.allow_flat_gain_offset_mismatch`
+opts into using a different-gain flat. The loaded master must record
+`DARKSUB=T`; normalization alone does not qualify. Gain/offset matching for
+light darks and flat-darks, sensor/readout-mode matching, and coherence within
+each master remain strict. The policy is retained in contexts and replay.
+
 `LiveStacker::with_reference_image` starts an empty stack using a separate
 FITS/XISF image for alignment only. It also takes a channel reference light,
 which it calibrates and registers onto the alignment grid to supply the

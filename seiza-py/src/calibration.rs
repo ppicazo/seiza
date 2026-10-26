@@ -228,6 +228,7 @@ impl PyMatchTolerances {
         focal_length_mm=None,
         flat_session_seconds=None,
         light_rotation=None,
+        allow_flat_gain_offset_mismatch=false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -239,8 +240,12 @@ impl PyMatchTolerances {
         focal_length_mm: Option<f64>,
         flat_session_seconds: Option<u64>,
         light_rotation: Option<&Bound<'_, PyAny>>,
+        allow_flat_gain_offset_mismatch: bool,
     ) -> PyResult<Self> {
-        let mut inner = MatchTolerances::default();
+        let mut inner = MatchTolerances {
+            allow_flat_gain_offset_mismatch,
+            ..MatchTolerances::default()
+        };
         if let Some(value) = exposure_seconds {
             inner.exposure_seconds = value;
         }
@@ -271,6 +276,10 @@ impl PyMatchTolerances {
     #[getter]
     fn exposure_seconds(&self) -> f64 {
         self.inner.exposure_seconds
+    }
+    #[getter]
+    fn allow_flat_gain_offset_mismatch(&self) -> bool {
+        self.inner.allow_flat_gain_offset_mismatch
     }
     #[getter]
     fn exposure_fraction(&self) -> f64 {

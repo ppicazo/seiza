@@ -25,7 +25,10 @@ use std::path::Path;
 pub struct ImageSolveOptions<'a> {
     /// Where the catalogs are: a directory, or `None` for the standard
     /// places (see [`crate::data_paths`]). The deepest star catalog there is
-    /// used, with the blind index beside it.
+    /// used, with the blind index beside it. Files must be directly in this
+    /// directory (subdirectories are not searched). A star catalog file is
+    /// also accepted. Hinted solves need no blind index; it is opened only
+    /// if the header stages fail to solve.
     pub catalog_directory: Option<&'a Path>,
     /// The pixel scales a blind solve tries, arcseconds per pixel.
     pub min_scale_arcsec_px: f64,
@@ -135,13 +138,6 @@ pub fn solve_image(
     let data_error =
         |error: crate::data_paths::DataPathError| crate::Error::Catalog(error.to_string());
     let star_path = crate::data_paths::star_data(options.catalog_directory).map_err(data_error)?;
-    let index_path = crate::data_paths::blind_index_beside(options.catalog_directory, &star_path)
-        .map_err(data_error)?
-        .ok_or_else(|| {
-            crate::Error::Catalog(
-                "no blind index found; install a complete Seiza catalog bundle first".into(),
-            )
-        })?;
     let catalog = TileCatalog::open(&star_path).map_err(|error| {
         crate::Error::Catalog(format!("failed to open {}: {error}", star_path.display()))
     })?;
@@ -158,28 +154,62 @@ pub fn solve_image(
         .and_then(crate::field_objects::capture_julian_date)
         .map(crate::catalog::julian_year);
     let dated = DatedCatalog::new(&catalog, motions.as_ref(), epoch);
-    let index = BlindIndex::open(&index_path).map_err(|error| {
-        crate::Error::Catalog(format!("failed to open {}: {error}", index_path.display()))
-    })?;
+    let index = std::cell::OnceCell::new();
 
     let params = BlindParams {
         min_scale_arcsec_px: options.min_scale_arcsec_px.max(0.01),
         max_scale_arcsec_px: options
             .max_scale_arcsec_px
             .max(options.min_scale_arcsec_px.max(0.01)),
-        index_mag_limit: index.index_mag_limit(),
-        max_pattern_deg: index.max_pattern_deg(),
         sip_order: options.sip_order.min(5),
         ..Default::default()
     };
     let dimensions = (width, height);
     let solve = |stars: &[DetectedStar], params: &BlindParams| {
+        let hinted = solve_with_prior(stars, &dated, None, &prior, params, dimensions, limits);
+        match &hinted {
+            Ok(found) if found.source != SolveSource::HeaderUnchecked => return hinted,
+            Err(error) if crate::solve::is_stop(error) => return hinted,
+            _ => {}
+        }
+        let index = index.get_or_init(|| {
+            let directory = options.catalog_directory.map(|path| {
+                if path.is_file() {
+                    path.parent().unwrap_or(Path::new("."))
+                } else {
+                    path
+                }
+            });
+            let path = crate::data_paths::blind_index_beside(directory, &star_path)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    "no blind index found; install a complete Seiza catalog bundle".to_string()
+                })?;
+            BlindIndex::open(&path)
+                .map_err(|error| format!("failed to open {}: {error}", path.display()))
+        });
+        let index = match index {
+            Ok(index) => index,
+            Err(error) => {
+                return match hinted {
+                    Ok(found) => Ok(found),
+                    Err(hint_error) => Err(crate::Error::Catalog(format!(
+                        "{hint_error}; blind fallback unavailable: {error}"
+                    ))),
+                };
+            }
+        };
+        let params = BlindParams {
+            index_mag_limit: index.index_mag_limit(),
+            max_pattern_deg: index.max_pattern_deg(),
+            ..params.clone()
+        };
         solve_with_prior(
             stars,
             &dated,
-            Some(&index),
+            Some(index),
             &prior,
-            params,
+            &params,
             dimensions,
             limits,
         )
@@ -410,5 +440,75 @@ mod tests {
             let off = crate::catalog::angular_separation_deg(ra, dec, true_ra, true_dec) * 3600.0;
             assert!(off < 3.0, "({x}, {y}) is {off:.2}\" off");
         }
+
+        // A hinted solve must not open an absent or even corrupt index.
+        // Insert pointing cards before END, keeping the data block in place.
+        let mut hinted = fits_bytes(width, height, &pixels);
+        for (i, (key, value)) in [("RA", center.0), ("DEC", center.1), ("PIXSCALE", 12.0)]
+            .into_iter()
+            .enumerate()
+        {
+            let card = format!("{key:<8}= {value:>20}");
+            let padded = format!("{card:<80}");
+            hinted[(7 + i) * 80..(8 + i) * 80].copy_from_slice(padded.as_bytes());
+        }
+        hinted[10 * 80..11 * 80].copy_from_slice(format!("{:<80}", "END").as_bytes());
+        std::fs::write(&image_path, hinted).unwrap();
+        for corrupt in [false, true] {
+            let index_path = dir.path().join("blind-gaia16.idx");
+            if corrupt {
+                std::fs::write(&index_path, b"not an index").unwrap();
+            } else {
+                std::fs::remove_file(&index_path).unwrap();
+            }
+            for catalog_directory in [dir.path(), star_path.as_path()] {
+                let solved = solve_image(
+                    &image_path,
+                    &ImageSolveOptions {
+                        catalog_directory: Some(catalog_directory),
+                        min_scale_arcsec_px: 5.0,
+                        max_scale_arcsec_px: 30.0,
+                        sip_order: 0,
+                    },
+                    &SolveLimits::default(),
+                )
+                .unwrap();
+                assert_eq!(solved.source, SolveSource::HeaderHint);
+                assert!(solved.solution.matched_stars >= 20);
+            }
+        }
+        std::fs::write(&image_path, fits_bytes(width, height, &pixels)).unwrap();
+        let error = solve_image(
+            &image_path,
+            &ImageSolveOptions {
+                catalog_directory: Some(dir.path()),
+                min_scale_arcsec_px: 5.0,
+                max_scale_arcsec_px: 30.0,
+                sip_order: 0,
+            },
+            &SolveLimits::default(),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("blind fallback unavailable"));
+
+        // An unusable detection still preserves a supplied WCS, explicitly
+        // marked unchecked, even when blind fallback cannot be opened.
+        let mut blank = fits_bytes(width, height, &vec![1000; width * height]);
+        let wcs_header = truth.fits_header_text();
+        blank[7 * 80..7 * 80 + wcs_header.len()].copy_from_slice(wcs_header.as_bytes());
+        std::fs::write(&image_path, blank).unwrap();
+        let unchecked = solve_image(
+            &image_path,
+            &ImageSolveOptions {
+                catalog_directory: Some(dir.path()),
+                min_scale_arcsec_px: 5.0,
+                max_scale_arcsec_px: 30.0,
+                sip_order: 0,
+            },
+            &SolveLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(unchecked.source, SolveSource::HeaderUnchecked);
     }
 }

@@ -873,6 +873,7 @@ struct CalibrationPlanRecord {
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CalibrationPlanTolerancesRequest {
+    allow_flat_gain_offset_mismatch: Option<bool>,
     exposure_seconds: Option<f64>,
     exposure_fraction: Option<f64>,
     dark_temperature_c: Option<f64>,
@@ -947,6 +948,9 @@ impl CalibrationPlanTolerancesRequest {
         }
         if let Some(light_rotation) = self.light_rotation {
             tolerances.light_rotation = light_rotation;
+        }
+        if let Some(allow) = self.allow_flat_gain_offset_mismatch {
+            tolerances.allow_flat_gain_offset_mismatch = allow;
         }
         tolerances
     }
@@ -6374,6 +6378,9 @@ pub unsafe extern "C" fn seiza_rendered_image16_free(image: *mut SeizaRenderedIm
 
 #[unsafe(no_mangle)]
 /// Solves an image and returns a JSON string for the C ABI.
+/// `catalog_directory` names the directory directly containing the catalogs
+/// (subdirectories are not searched), or a star catalog file. The blind
+/// index is opened only when the header/hinted stages cannot solve.
 ///
 /// # Safety
 /// `path` must be a valid NUL-terminated string. `catalog_directory` may be
@@ -9501,6 +9508,23 @@ mod tests {
         assert!(stack_options(unknown.as_ptr()).is_err());
     }
     use std::io::Write;
+
+    #[test]
+    fn flat_readout_policy_survives_c_and_json_translation() {
+        let core = seiza_calibration::MatchTolerances {
+            allow_flat_gain_offset_mismatch: true,
+            ..Default::default()
+        };
+        let carried = SeizaMatchTolerances::from(core);
+        assert_ne!(
+            carried.known & SEIZA_TOLERANCE_ALLOW_FLAT_GAIN_OFFSET_MISMATCH,
+            0
+        );
+        assert_eq!(unsafe { match_tolerances(&carried) }, core);
+        let json: CalibrationPlanTolerancesRequest =
+            serde_json::from_str(r#"{"allowFlatGainOffsetMismatch":true}"#).unwrap();
+        assert_eq!(json.into_core(), core);
+    }
 
     /// A tolerance a caller cannot express is one that falls back, not one
     /// that silently matches nothing.
@@ -16863,6 +16887,10 @@ pub const SEIZA_TOLERANCE_HAS_ROTATION: u32 = 1 << 3;
 pub const SEIZA_TOLERANCE_HAS_FOCAL_LENGTH: u32 = 1 << 4;
 pub const SEIZA_TOLERANCE_HAS_FLAT_SESSION: u32 = 1 << 5;
 pub const SEIZA_TOLERANCE_HAS_EXPOSURE_FRACTION: u32 = 1 << 6;
+/// Opt in to gain/offset differences between lights and dark-calibrated
+/// flats. This bit is the value, not a presence flag; clear means strict.
+/// Dark/light and flat/dark-flat comparisons remain strict.
+pub const SEIZA_TOLERANCE_ALLOW_FLAT_GAIN_OFFSET_MISMATCH: u32 = 1 << 7;
 
 /// How close two readings have to be to count as the same.
 ///
@@ -16881,7 +16909,8 @@ pub const SEIZA_TOLERANCE_HAS_EXPOSURE_FRACTION: u32 = 1 << 6;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SeizaMatchTolerances {
-    /// Bitwise OR of the `SEIZA_TOLERANCE_HAS_*` flags this struct overrides.
+    /// Bitwise OR of the `SEIZA_TOLERANCE_HAS_*` flags this struct overrides,
+    /// optionally with `SEIZA_TOLERANCE_ALLOW_FLAT_GAIN_OFFSET_MISMATCH`.
     pub known: u32,
     /// Dark exposure against light exposure: the floor, in seconds. The
     /// comparison takes whichever of this and `exposure_fraction` is larger.
@@ -16902,7 +16931,7 @@ pub struct SeizaMatchTolerances {
     pub flat_session_seconds: u64,
 }
 
-/// Fill `tolerances` with the built-in defaults and every flag set, so a
+/// Fill `tolerances` with the built-in defaults and every numeric override flag set, so a
 /// caller can read them or adjust one and pass the rest through unchanged.
 ///
 /// # Safety
@@ -16920,7 +16949,8 @@ pub unsafe extern "C" fn seiza_match_tolerances_default(tolerances: *mut SeizaMa
 }
 
 impl From<seiza_calibration::MatchTolerances> for SeizaMatchTolerances {
-    /// Every tolerance, with every flag set. How the light's angle is read
+    /// Every numeric tolerance, with its override flag set, and the flat
+    /// readout policy bit. How the light's angle is read
     /// (`light_rotation`) has no field here and is dropped: the result
     /// reads the recorded angle.
     fn from(tolerances: seiza_calibration::MatchTolerances) -> Self {
@@ -16931,7 +16961,12 @@ impl From<seiza_calibration::MatchTolerances> for SeizaMatchTolerances {
                 | SEIZA_TOLERANCE_HAS_MASTER_TEMPERATURE
                 | SEIZA_TOLERANCE_HAS_ROTATION
                 | SEIZA_TOLERANCE_HAS_FOCAL_LENGTH
-                | SEIZA_TOLERANCE_HAS_FLAT_SESSION,
+                | SEIZA_TOLERANCE_HAS_FLAT_SESSION
+                | if tolerances.allow_flat_gain_offset_mismatch {
+                    SEIZA_TOLERANCE_ALLOW_FLAT_GAIN_OFFSET_MISMATCH
+                } else {
+                    0
+                },
             exposure_seconds: tolerances.exposure_seconds,
             exposure_fraction: tolerances.exposure_fraction,
             dark_temperature_c: tolerances.dark_temperature_c,
@@ -17001,6 +17036,9 @@ unsafe fn match_tolerances(
     if overrides.known & SEIZA_TOLERANCE_HAS_FLAT_SESSION != 0 {
         resolved.flat_session_seconds = overrides.flat_session_seconds;
     }
+
+    resolved.allow_flat_gain_offset_mismatch =
+        overrides.known & SEIZA_TOLERANCE_ALLOW_FLAT_GAIN_OFFSET_MISMATCH != 0;
     resolved
 }
 

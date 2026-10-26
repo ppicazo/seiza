@@ -177,6 +177,13 @@
 #define SEIZA_TOLERANCE_HAS_EXPOSURE_FRACTION (1 << 6)
 
 /*
+ Opt in to gain/offset differences between lights and dark-calibrated
+ flats. This bit is the value, not a presence flag; clear means strict.
+ Dark/light and flat/dark-flat comparisons remain strict.
+ */
+#define SEIZA_TOLERANCE_ALLOW_FLAT_GAIN_OFFSET_MISMATCH (1 << 7)
+
+/*
  The light's recorded rotator angle is compared, as for any frame.
  */
 #define SEIZA_LIGHT_ROTATION_RECORDED 0
@@ -365,7 +372,8 @@ typedef struct {
  */
 typedef struct {
   /*
-   Bitwise OR of the `SEIZA_TOLERANCE_HAS_*` flags this struct overrides.
+   Bitwise OR of the `SEIZA_TOLERANCE_HAS_*` flags this struct overrides,
+   optionally with `SEIZA_TOLERANCE_ALLOW_FLAT_GAIN_OFFSET_MISMATCH`.
    */
   uint32_t known;
   /*
@@ -2573,6 +2581,9 @@ void seiza_rendered_image16_free(SeizaRenderedImage16 *image);
 
 /*
  Solves an image and returns a JSON string for the C ABI.
+ `catalog_directory` names the directory directly containing the catalogs
+ (subdirectories are not searched), or a star catalog file. The blind
+ index is opened only when the header/hinted stages cannot solve.
 
  # Safety
  `path` must be a valid NUL-terminated string. `catalog_directory` may be
@@ -2827,7 +2838,7 @@ int32_t seiza_calibration_sensor_matches(const SeizaFrameSignature *reference,
                                          char **error_out);
 
 /*
- Fill `tolerances` with the built-in defaults and every flag set, so a
+ Fill `tolerances` with the built-in defaults and every numeric override flag set, so a
  caller can read them or adjust one and pass the rest through unchanged.
 
  # Safety

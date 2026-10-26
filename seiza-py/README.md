@@ -47,6 +47,13 @@ print(solution.source)          # "header-checked", "header-hint", "blind" or "h
 ra, dec = solution.wcs.pixel_to_world(100.0, 200.0)
 ```
 
+`catalog_dir` must directly contain the named star catalog `.bin` files;
+subdirectories are not searched. You can also pass a star catalog file.
+Header-checked and hinted solves need only that catalog. The blind `.idx`
+file is opened only when those stages cannot solve; an unavailable index
+then produces a specific fallback error, or preserves the existing
+`header-unchecked` result if the image contains a usable WCS.
+
 FITS and XISF images have their stars measured on their own linear samples;
 PNG, JPEG and TIFF images are detected as decoded, with a photo's EXIF focal
 length as the first scale to try. To control each step instead, detect and
@@ -658,6 +665,25 @@ wide = seiza.MatchTolerances(rotation_deg=180.0)
 stacker.validate_calibration(light, wide)        # None, or raises StackError
 kept, dropped = stacker.compatible_calibration(light, wide)
 ```
+
+For flats taken at a different gain or offset, opt in with
+`MatchTolerances(allow_flat_gain_offset_mismatch=True)` and pass it as
+`StackOptions(match_tolerances=...)`. Use this only after verifying that
+the camera's normalized flat response transfers across those settings.
+The loaded master flat must record `DARKSUB=T`; normalization alone does
+not qualify. Build it with flat-darks matching the flats' gain, offset,
+readout mode and exposure. Light darks still need to match the lights.
+The option also permits selecting different-gain flats in `plan_calibration`,
+but never mixes different gains within one master or relaxes dark-flat
+selection. Saved contexts and reintegration retain the policy.
+
+`StackOptions(maximum_registration_rms=2.0)` sets an absolute registration
+limit in original sensor pixels. There is no running-median RMS gate.
+Plate-solve RMS measures a different fit and does not establish that a
+similarity transform aligns mosaic panels. `registration_model="quadratic"`
+can model curvature a similarity transform cannot; inspect alignment before
+choosing it. Rejections include the actual reason. Fraction thresholds accept
+equality, and their messages preserve the precision of the measured fraction.
 
 Passing `tolerances` replaces the stack's own whole: a field you leave unset
 takes the built-in default, not the stack's value. Both calls raise

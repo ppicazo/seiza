@@ -40,7 +40,7 @@ pub const CATALOG_DIR_ENV: &str = "SEIZA_CATALOG_DIR";
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum DataPathError {
-    #[error("no {kind} found in {} (expected one of: {expected})", path.display())]
+    #[error("no {kind} found directly in {} (expected one of: {expected}; subdirectories are not searched)", path.display())]
     NotFoundInDirectory {
         kind: &'static str,
         path: PathBuf,

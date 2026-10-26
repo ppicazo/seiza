@@ -435,7 +435,10 @@ impl StackOptions {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FrameAcceptanceCriteria {
-    /// Largest registration RMS residual, in pixels, still accepted.
+    /// Largest registration RMS residual, in sensor pixels, still accepted.
+    /// An absolute limit, independent of previously admitted frames; there
+    /// is no running-median RMS gate. This is image registration error, not
+    /// the catalog residual reported by plate solving.
     pub maximum_registration_rms_pixels: f64,
     /// Largest departure of the transform's scale from unity still accepted.
     pub maximum_scale_deviation: f64,
@@ -563,7 +566,7 @@ pub enum FrameRejectionReason {
         maximum_degrees: f64,
     },
     /// Too little of the frame overlapped the reference.
-    #[error("overlap fraction {measured:.3} is below {minimum:.3}")]
+    #[error("overlap fraction {measured} is below {minimum}")]
     InsufficientOverlap {
         /// Measured overlap fraction.
         measured: f32,
@@ -588,7 +591,7 @@ pub enum FrameRejectionReason {
         maximum: f32,
     },
     /// Too few samples would survive rejection to be worth integrating.
-    #[error("integrated sample fraction {measured:.3} is below {minimum:.3}")]
+    #[error("integrated sample fraction {measured} is below {minimum}")]
     InsufficientIntegratedSamples {
         /// Measured surviving fraction.
         measured: f32,
@@ -6724,6 +6727,50 @@ mod tests {
             restored.options.registration.model,
             crate::RegistrationModel::Quadratic
         );
+    }
+
+    #[test]
+    fn registration_rms_limit_does_not_follow_previous_frames() {
+        let options = StackOptions {
+            normalization: NormalizationMode::None,
+            rejection: RejectionMode::None,
+            ..StackOptions::default()
+        };
+        let reference = crate::registration::test_star_field(false);
+        let distorted = crate::registration::test_star_field(true);
+        let mut stacker = LiveStacker::from_linear(reference.clone(), options.clone()).unwrap();
+        for _ in 0..12 {
+            assert!(matches!(
+                stacker.push_linear(reference.clone()).unwrap(),
+                FrameDisposition::Accepted(_)
+            ));
+        }
+        let FrameDisposition::Accepted(diagnostics) =
+            stacker.push_linear(distorted.clone()).unwrap()
+        else {
+            panic!("previous near-zero residuals must not tighten the absolute gate");
+        };
+        assert!(diagnostics.registration_rms_pixels > 0.3);
+        assert!(diagnostics.registration_rms_pixels < 2.0);
+        let mut strict = options;
+        strict.acceptance.maximum_registration_rms_pixels = 0.2;
+        let mut stacker = LiveStacker::from_linear(reference, strict).unwrap();
+        assert!(matches!(
+            stacker.push_linear(distorted).unwrap(),
+            FrameDisposition::Rejected(FrameRejectionReason::RegistrationRms { .. })
+        ));
+    }
+
+    #[test]
+    fn fraction_diagnostics_do_not_round_a_refusal_to_equality() {
+        let measured = f32::from_bits(0.5_f32.to_bits() - 1);
+        let error = FrameRejectionReason::InsufficientIntegratedSamples {
+            measured,
+            minimum: 0.5,
+        };
+        assert!(error.to_string().contains(&measured.to_string()));
+        assert_ne!(measured.to_string(), "0.5");
+        assert_eq!(admission_count(&|count| count as f32 / 1000.0, 0.5), 500);
     }
 
     /// Local background normalization matches every frame's background to
