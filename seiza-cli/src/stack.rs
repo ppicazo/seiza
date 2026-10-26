@@ -126,9 +126,10 @@ pub(crate) struct StackArgs {
     /// be dithered or have drifted
     #[arg(long, value_enum, default_value = "auto")]
     defects: DefectsArg,
-    /// Background normalization applied after registration
-    #[arg(long, value_enum, default_value = "local-background")]
-    normalization: NormalizationArg,
+    /// Background normalization applied after registration [default:
+    /// local-background, or global with --reference expand]
+    #[arg(long, value_enum)]
+    normalization: Option<NormalizationArg>,
     /// Tile size for --normalization local
     #[arg(long, default_value_t = 256)]
     local_tile_size: usize,
@@ -356,8 +357,28 @@ fn known_temperature(metadata: &seiza_stacking::FrameMetadata) -> Option<f64> {
         .filter(|value| value.is_finite())
 }
 
+/// The normalization a stack uses when the caller names none: global on an
+/// expanded canvas, local-background otherwise.
+///
+/// On a mosaic local-background matches each frame's background to the
+/// canvas under it, whose panels each keep their first frame's sky, and
+/// its photometric gains scale the hazier, brighter-sky frames up, so the
+/// stack keeps a large smooth gradient. On a 362-frame Seestar S50 mosaic,
+/// global left a gradient two to three times smaller (3.0 / 2.4 / 3.4
+/// sky-noise units against 8.1 / 6.2 / 5.1), a quarter to a half less lumpy
+/// background, and the same seams, for 0.7% more noise. The library's own
+/// default, which the C ABI and Python take, is global already.
+fn normalization_or_default(chosen: Option<NormalizationArg>, expand: bool) -> NormalizationArg {
+    chosen.unwrap_or(if expand {
+        NormalizationArg::Global
+    } else {
+        NormalizationArg::LocalBackground
+    })
+}
+
 pub(crate) fn run(options: StackArgs) -> Result<()> {
     let expand = matches!(options.reference, ReferenceArg::Expand);
+    let normalization_arg = normalization_or_default(options.normalization, expand);
     let registration_model = options.registration_model;
     let min_overlap = options.min_overlap.unwrap_or(if expand {
         FrameAcceptanceCriteria::EXPANDED_MINIMUM_OVERLAP_FRACTION
@@ -459,7 +480,7 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
         anyhow::bail!("--min-overlap must be between zero and one");
     }
     if matches!(
-        options.normalization,
+        normalization_arg,
         NormalizationArg::Local | NormalizationArg::LocalBackground
     ) && options.local_tile_size < 16
     {
@@ -495,7 +516,7 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
     let calibration =
         CalibrationMasters::from_fits_frames(bias, dark, flat, options.dark_exposure_seconds)?;
 
-    let normalization = match options.normalization {
+    let normalization = match normalization_arg {
         NormalizationArg::None => NormalizationMode::None,
         NormalizationArg::Global => NormalizationMode::Global,
         NormalizationArg::Local => NormalizationMode::Local {
@@ -627,7 +648,7 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
         registration_effective_maximum_drift_pixels: effective_maximum_drift_pixels,
         registration_minimum_matches: stack_options.registration.minimum_matches,
         registration_maximum_candidates: stack_options.registration.maximum_candidates,
-        normalization: match options.normalization {
+        normalization: match normalization_arg {
             NormalizationArg::None => "none",
             NormalizationArg::Global => "global",
             NormalizationArg::Local => "local",

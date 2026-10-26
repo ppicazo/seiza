@@ -438,6 +438,57 @@ fn cli_expand_preserves_all_panels_online_and_reintegrated() {
     }
 }
 
+/// An expanded canvas normalizes globally unless asked otherwise, and
+/// another stack keeps local-background, as the run report records.
+#[test]
+fn cli_expand_defaults_to_global_normalization() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = panels(directory.path());
+    for (arguments, lights, expected) in [
+        (vec!["--reference", "expand"], &paths[..], "global"),
+        (
+            vec![
+                "--reference",
+                "expand",
+                "--normalization",
+                "local-background",
+            ],
+            &paths[..],
+            "local-background",
+        ),
+        (
+            vec!["--reference", "first", "--min-overlap", "0.1"],
+            &paths[..2],
+            "local-background",
+        ),
+    ] {
+        let output = directory.path().join("normalized.fits");
+        let report = output.with_extension("json");
+        let result = Command::new(env!("CARGO_BIN_EXE_seiza"))
+            .arg("stack")
+            .args(lights)
+            .args(&arguments)
+            .arg("--output")
+            .arg(&output)
+            .arg("--report")
+            .arg(&report)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{arguments:?}
+{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+        assert_eq!(
+            report["configuration"]["normalization"], expected,
+            "{arguments:?}"
+        );
+    }
+}
+
 #[test]
 fn expansion_refuses_disconnected_panels_and_canvas_overflow() {
     let directory = tempfile::tempdir().unwrap();
