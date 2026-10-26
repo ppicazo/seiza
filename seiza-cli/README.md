@@ -669,7 +669,7 @@ changed:
 | `--max-canvas-megasamples` | `256` | Largest canvas `expand` may grow, in millions of samples (pixels times color channels). A run peaks at about 40 bytes per sample, so the default allows about 10 GB. |
 | `--min-overlap` | `0.60`, or `0.05` with `expand` | Expansion requires this fraction of the smaller finite footprint to overlap the growing template. Fixed canvases measure coverage of the reference grid. |
 | `--registration-model similarity\|affine\|quadratic` | `quadratic` | After the similarity match, fit a polynomial to up to 2 000 stars to follow lens distortion. A frame with too few stars keeps its similarity. Under `expand`, each panel's first frame is placed through the lens the panels' overlaps measure (see below). |
-| `--normalization none\|global\|local\|local-background` | `local-background` | `local-background` keeps one gain per channel, measured from star photometry, and matches each tile's background to the reference's, so frames whose sky gradients differ leave no seams where coverage changes. `local` also fits a gain per tile. |
+| `--normalization none\|global\|local\|local-background` | `local-background`; `global` with `--reference expand` | `local-background` keeps one gain per channel, measured from star photometry, and matches each tile's background to the reference's, so frames whose sky gradients differ leave no seams where coverage changes. `local` also fits a gain per tile. An expanded canvas defaults to `global`; see [Expanding beyond the reference frame](#expanding-beyond-the-reference-frame). |
 | `--local-tile-size` | `256` | Tile size for `local` and `local-background`. |
 | `--weighting equal\|inverse-noise` | `inverse-noise` | Weight each frame by the inverse of its noise variance relative to the reference, so hazy frames count for less. |
 | `--interpolation bilinear\|lanczos3` | `lanczos3` | Lanczos-3 resampling, with PixInsight-style clamping against ringing; sharper, at about twice the resampling cost. |
@@ -803,9 +803,18 @@ of transparency. On synthetic 3x3 mosaics with 12% overlaps, every corner
 landed within 0.11 px of its true position.
 
 `--normalization none` preserves the input intensities; it does not disable
-registration or canvas expansion. The default `local-background` matches panel
-brightness through their overlaps: panels differing only in gain and offset
-match exactly. A gradient within one panel cannot be told apart from the sky,
+registration or canvas expansion. An expanded canvas defaults to `global`,
+which takes each frame's gain from the spread of its sky against the canvas's.
+`local-background` takes it from star photometry instead, which scales the
+hazier, brighter-sky frames up and their sky gradients with them, while each
+frame's background follows the canvas under it, whose panels keep their first
+frames' skies. On a 362-frame Seestar S50 mosaic, `local-background` left a
+smooth gradient two to three times larger and a background a quarter to a half
+more lumpy, for 0.7% less noise; seams were level. Pass
+`--normalization local-background` for mosaics whose panels come from nights
+of different transparency, where only stars measure it. `local-background`
+matches panel brightness through their overlaps from stars: panels differing
+only in gain and offset match exactly. A gradient within one panel cannot be told apart from the sky,
 though, and the canvas does not feather. Uncalibrated lights also carry their
 vignetting into every overlap. In a synthetic test, a gradient spanning a third of the sky level across one panel
 left steps of about a tenth of it, and shifted the panel beyond by about half of
