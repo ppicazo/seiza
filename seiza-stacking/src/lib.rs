@@ -74,6 +74,11 @@ mod recycle;
 mod reference;
 mod registration;
 mod replay;
+mod report;
+pub use report::{
+    PostStackReport, StackReportChannel, StackReportContext, StackReportFrame, StackReportMap,
+    StackReportSamples, drizzle_report, stack_report,
+};
 mod residual_flat;
 mod saturation;
 mod sessions;

@@ -1548,3 +1548,17 @@ stellar overlap; normalization needs overlap within each individual filter.
 For faster reference-only planning, retain `--reference expand --save-canvas`
 and then `--reference-canvas`; that fixes the field to the reference filter's
 coverage. `--joint-canvas` and `--reference-canvas` are mutually exclusive.
+
+## Completed-stack report
+
+Add `--report-html stack.html` to `seiza stack` for an offline report of the
+actual output. `--report stack.json` keeps the existing schema-1 admission and
+SHA-256 provenance fields and adds a `post_stack` section. Either report option
+collects provenance; HTML embeds its full report data with a JSON download.
+
+The report separates admission decisions from final reintegration sample counts,
+shows bounded support and rejection maps, and records admitted inputs,
+calibration assignments and admission settings. With `--drizzle`, support
+means accumulated drop area times frame weight, not frame count. Counts for
+final per-frame rejection remain on the reintegration grid. Coverage is not SNR
+or calibrated uncertainty. Reporting does not change the numerical stack.

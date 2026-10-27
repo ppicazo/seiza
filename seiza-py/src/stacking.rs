@@ -988,6 +988,7 @@ const CHANNEL_REFERENCE_ATTEMPTS: usize = 5;
 
 #[pyclass(frozen, name = "StackSnapshot", module = "seiza")]
 pub(crate) struct PyStackSnapshot {
+    final_samples: Option<Vec<seiza_stacking::BatchFrameDiagnostics>>,
     inner: StackSnapshot,
     reference_headers: Vec<(String, seiza_fits::HeaderValue)>,
     input_paths: Vec<PathBuf>,
@@ -999,6 +1000,7 @@ impl PyStackSnapshot {
     fn of(stacker: &LiveStacker, inner: StackSnapshot) -> Self {
         Self {
             inner,
+            final_samples: None,
             reference_headers: stacker.reference_headers().to_vec(),
             input_paths: stacker.protected_paths(),
         }
@@ -1020,6 +1022,31 @@ fn check_output_path(inputs: &[PathBuf], path: &Path) -> PyResult<()> {
 
 #[pymethods]
 impl PyStackSnapshot {
+    /// Summarize this output; capture context at the same point as this result.
+    #[pyo3(signature = (context=None))]
+    fn report<'py>(
+        &self,
+        py: Python<'py>,
+        context: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let context: Option<seiza_stacking::StackReportContext> = context
+            .map(|value| -> PyResult<_> {
+                let json: String = py
+                    .import("json")?
+                    .call_method1("dumps", (value,))?
+                    .extract()?;
+                serde_json::from_str(&json).map_err(|e| PyValueError::new_err(e.to_string()))
+            })
+            .transpose()?;
+        let report = seiza_stacking::stack_report(
+            &self.inner,
+            context.as_ref(),
+            self.final_samples.as_deref(),
+        )
+        .map_err(stack_error)?;
+        crate::flat_response::to_python(py, &report)
+    }
+
     #[getter]
     fn width(&self) -> usize {
         self.inner.image.width
@@ -1105,6 +1132,7 @@ impl PyStackSnapshot {
 /// A drizzled stack from :meth:`LiveStacker.reintegrate_drizzled`.
 #[pyclass(frozen, name = "DrizzleResult", module = "seiza")]
 pub(crate) struct PyDrizzleResult {
+    final_samples: Option<Vec<seiza_stacking::BatchFrameDiagnostics>>,
     inner: DrizzleResult,
     accepted_frames: u32,
     rejected_frames: u32,
@@ -1114,6 +1142,33 @@ pub(crate) struct PyDrizzleResult {
 
 #[pymethods]
 impl PyDrizzleResult {
+    /// Summarize this output; capture context at the same point as this result.
+    #[pyo3(signature = (context=None))]
+    fn report<'py>(
+        &self,
+        py: Python<'py>,
+        context: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let context: Option<seiza_stacking::StackReportContext> = context
+            .map(|value| -> PyResult<_> {
+                let json: String = py
+                    .import("json")?
+                    .call_method1("dumps", (value,))?
+                    .extract()?;
+                serde_json::from_str(&json).map_err(|e| PyValueError::new_err(e.to_string()))
+            })
+            .transpose()?;
+        let report = seiza_stacking::drizzle_report(
+            &self.inner,
+            self.accepted_frames,
+            self.rejected_frames,
+            context.as_ref(),
+            self.final_samples.as_deref(),
+        )
+        .map_err(stack_error)?;
+        crate::flat_response::to_python(py, &report)
+    }
+
     #[getter]
     fn width(&self) -> usize {
         self.inner.image.width
@@ -1268,6 +1323,11 @@ pub(crate) struct PyLiveStacker {
 
 #[pymethods]
 impl PyLiveStacker {
+    /// Capture recorded admitted inputs and settings without rereading images.
+    fn report_context<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        crate::flat_response::to_python(py, &self.active()?.report_context())
+    }
+
     #[new]
     #[pyo3(signature = (
         reference,
@@ -2294,7 +2354,9 @@ impl PyLiveStacker {
         let result = py
             .detach(|| stacker.reintegrate(&options, |_, _, _| {}))
             .map_err(stack_error)?;
-        Ok(PyStackSnapshot::of(stacker, result.snapshot))
+        let mut snapshot = PyStackSnapshot::of(stacker, result.snapshot);
+        snapshot.final_samples = Some(result.frames);
+        Ok(snapshot)
     }
 
     /// :meth:`reintegrate`, also drizzling every admitted frame onto a grid
@@ -2333,13 +2395,16 @@ impl PyLiveStacker {
             .detach(|| stacker.reintegrate_drizzled(&options, &drizzle, |_, _, _| {}))
             .map_err(stack_error)?;
         let drizzled = PyDrizzleResult {
+            final_samples: Some(result.frames.clone()),
             inner: drizzled,
             accepted_frames: result.snapshot.accepted_frames,
             rejected_frames: result.snapshot.rejected_frames,
             reference_headers: stacker.reference_headers().to_vec(),
             input_paths: stacker.protected_paths(),
         };
-        Ok((PyStackSnapshot::of(stacker, result.snapshot), drizzled))
+        let mut snapshot = PyStackSnapshot::of(stacker, result.snapshot);
+        snapshot.final_samples = Some(result.frames);
+        Ok((snapshot, drizzled))
     }
 
     /// :meth:`reintegrate` at the sensor's full resolution: every admitted
@@ -2369,6 +2434,7 @@ impl PyLiveStacker {
             .map_err(stack_error)?;
         Ok((
             PyStackSnapshot {
+                final_samples: Some(full.result.frames),
                 inner: full.result.snapshot,
                 reference_headers: full.reference_headers,
                 input_paths: stacker.protected_paths(),
@@ -2397,6 +2463,7 @@ impl PyLiveStacker {
             })
             .map_err(stack_error)?;
         Ok(PyStackSnapshot {
+            final_samples: None,
             inner: snapshot,
             reference_headers,
             input_paths,
@@ -3192,6 +3259,7 @@ fn integrate_registered_frames(
         .collect();
     Ok((
         PyStackSnapshot {
+            final_samples: Some(result.frames),
             inner: result.snapshot,
             reference_headers,
             input_paths: images,

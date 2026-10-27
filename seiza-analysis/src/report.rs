@@ -10,8 +10,26 @@ pub fn render_html(report: &AnalysisReport) -> Result<String, Error> {
         .replace('&', "\\u0026")
         .replace('<', "\\u003c")
         .replace('>', "\\u003e");
-    Ok(include_str!("report.html").replace("__REPORT_DATA__", &json))
+    Ok(include_str!("report.html")
+        .replace("__REPORT_STYLE__", include_str!("report.css"))
+        .replace("__REPORT_DATA__", &json))
 }
+/// Render a completed-stack report with bounded support maps and embedded JSON.
+pub fn render_stack_html(report: &seiza_stacking::PostStackReport) -> Result<String, Error> {
+    if report.schema_version != 1 {
+        return Err(Error::Invalid(
+            "unsupported post-stack report schema".into(),
+        ));
+    }
+    let json = serde_json::to_string(report)?
+        .replace('&', "\\u0026")
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e");
+    Ok(include_str!("stack-report.html")
+        .replace("__REPORT_STYLE__", include_str!("report.css"))
+        .replace("__REPORT_DATA__", &json))
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

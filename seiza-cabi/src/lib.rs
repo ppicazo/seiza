@@ -535,6 +535,7 @@ pub struct SeizaCancelSignal {
 /// An immutable owned stack result. Its image and count pointers are borrowed
 /// until [`seiza_stack_snapshot_free`] is called.
 pub struct SeizaStackSnapshot {
+    final_samples: Option<Vec<seiza_stacking::BatchFrameDiagnostics>>,
     snapshot: RustStackSnapshot,
     reference_headers: Vec<(String, HeaderValue)>,
     input_paths: Vec<PathBuf>,
@@ -544,6 +545,7 @@ pub struct SeizaStackSnapshot {
 /// image and weight pointers are borrowed until
 /// [`seiza_drizzle_result_free`] is called.
 pub struct SeizaDrizzleResult {
+    final_samples: Option<Vec<seiza_stacking::BatchFrameDiagnostics>>,
     result: seiza_stacking::DrizzleResult,
     accepted_frames: u32,
     rejected_frames: u32,
@@ -5176,6 +5178,7 @@ pub unsafe extern "C" fn seiza_live_stacker_snapshot(
             .snapshot()
             .map_err(|error| error.to_string())?;
         Ok(SeizaStackSnapshot {
+            final_samples: None,
             snapshot,
             reference_headers,
             input_paths: stacker.stacker.protected_paths(),
@@ -5356,6 +5359,7 @@ pub unsafe extern "C" fn seiza_live_stacker_reintegrate(
             })
             .map_err(|error| error.to_string())?;
         Ok(SeizaStackSnapshot {
+            final_samples: Some(result.frames),
             snapshot: result.snapshot,
             reference_headers: stacker.stacker.reference_headers().to_vec(),
             input_paths: stacker.stacker.protected_paths(),
@@ -5455,6 +5459,7 @@ pub unsafe extern "C" fn seiza_live_stacker_reintegrate_drizzled(
         let reference_headers = stacker.stacker.reference_headers().to_vec();
         let input_paths = stacker.stacker.protected_paths();
         let drizzled = SeizaDrizzleResult {
+            final_samples: Some(result.frames.clone()),
             result: drizzled,
             accepted_frames: result.snapshot.accepted_frames,
             rejected_frames: result.snapshot.rejected_frames,
@@ -5464,6 +5469,7 @@ pub unsafe extern "C" fn seiza_live_stacker_reintegrate_drizzled(
         let snapshot_out = snapshot_out as *mut *mut SeizaStackSnapshot;
         if !snapshot_out.is_null() {
             let snapshot = SeizaStackSnapshot {
+                final_samples: Some(result.frames),
                 snapshot: result.snapshot,
                 reference_headers,
                 input_paths,
@@ -5593,6 +5599,7 @@ pub unsafe extern "C" fn seiza_live_stacker_reintegrate_full_resolution(
             unsafe { *registration_rms_out = full.registration_rms_pixels.unwrap_or(f64::NAN) };
         }
         Ok(SeizaStackSnapshot {
+            final_samples: Some(full.result.frames),
             snapshot: full.result.snapshot,
             reference_headers: full.reference_headers,
             input_paths: stacker.stacker.protected_paths(),
@@ -5787,6 +5794,7 @@ pub unsafe extern "C" fn seiza_live_stacker_finish(
         let input_paths = stacker.protected_paths();
         let snapshot = stacker.into_snapshot().map_err(|error| error.to_string())?;
         Ok(SeizaStackSnapshot {
+            final_samples: None,
             snapshot,
             reference_headers,
             input_paths,
@@ -19669,6 +19677,7 @@ pub unsafe extern "C" fn seiza_stack_integrate_registered_json(
             unsafe { *report_out = report };
         }
         Ok(SeizaStackSnapshot {
+            final_samples: Some(result.frames),
             snapshot: result.snapshot,
             reference_headers: reference_headers.unwrap_or_default(),
             input_paths: paths,

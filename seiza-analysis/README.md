@@ -224,3 +224,23 @@ The next performance investigation would target quality measurement, not assume
 registration is the bottleneck. Source images were not modified.
 
 ![SHO metrics-only report](../docs/images/analysis/report-metrics.jpg)
+
+## Completed-stack reports
+
+`render_stack_html` renders a `seiza_stacking::PostStackReport` using the same
+offline layout and shared styles as project analysis. Obtain that report with
+`seiza_stacking::stack_report` or `drizzle_report`; capture
+`LiveStacker::report_context` alongside the result for admitted inputs,
+calibration assignments and admission settings.
+
+The CLI exposes this as `seiza stack ... --report-html stack.html`.
+The existing `--report stack.json` keeps its admission/provenance fields and
+adds a `post_stack` section. Python and C expose matching report and rendering
+APIs.
+
+The screenshots show ten 180-second H-alpha exposures from the small SHO
+dataset, reintegrated at 6248 × 4176. Rejection counts describe actual final
+sample decisions; drizzle support is explicitly weighted drop area.
+
+![Completed stack report, light theme](../docs/images/stacking/report-light.jpg)
+![Completed stack report, dark theme](../docs/images/stacking/report-dark.jpg)

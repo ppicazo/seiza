@@ -1745,3 +1745,27 @@ and stellar SNR, plus gain-normalized noise. Raw noise/background retain native
 input units; normalized noise uses reference units. Missing measurements are
 null/None. See [measurement definitions](../seiza-analysis/README.md#measurements-and-physical-meaning)
 for population, units and limitations. Thresholds and rejection remain caller-owned.
+
+### Completed-stack reports
+
+Capture context at the same point as the result, before finishing or adding
+more frames. Reporting reads the result's existing maps; it does not reread
+images or run star detection.
+
+```python
+context = stacker.report_context()
+snapshot = stacker.reintegrate()  # or stacker.snapshot()
+report = snapshot.report(context)
+Path("stack.html").write_text(seiza.stack_report_html(report), encoding="utf-8")
+Path("stack.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+```
+
+`DrizzleResult.report(context)` uses accumulated drop area times frame weight,
+not frame counts. Final sample decisions refer to the reintegration grid.
+Both `report` methods accept no context when input history is unavailable.
+Use context from the same run; matching counts alone cannot establish identity.
+Restored contexts can lack exposures and registration measurements. In-memory
+inputs without file provenance have unknown exposures. The admitted ledger
+does not retain failed attempts; preserve push outcomes separately if needed.
+The standalone HTML has light/dark themes, bounded per-channel support maps,
+expandable input records, and a download of its embedded JSON.

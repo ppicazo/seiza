@@ -1038,3 +1038,19 @@ and stellar SNR, plus gain-normalized noise. Raw noise/background retain native
 input units; normalized noise uses reference units. Missing measurements are
 null/None. See [measurement definitions](../seiza-analysis/README.md#measurements-and-physical-meaning)
 for population, units and limitations. Thresholds and rejection remain caller-owned.
+
+### Completed-stack reports
+
+`seiza_live_stacker_report_context_json` captures the admitted-input ledger,
+calibration assignments and admission settings without rereading images.
+Capture it with the result, then pass it (or null if unavailable) to
+`seiza_stack_snapshot_report_json` or `seiza_drizzle_result_report_json`.
+The result uses camelCase keys and includes bounded per-channel support maps.
+Batch handles retain final sample counts; drizzle support is drop area times
+weight, not frame count. Admission RMS/mappings describe the admission pass,
+even after full-resolution refinement.
+
+`seiza_stack_report_html` renders that JSON as a self-contained report with
+light/dark mode, expandable inputs and downloadable JSON. Free all returned
+strings with `seiza_string_free`. Matching context/result counts are checked,
+but callers must ensure they came from the same run.

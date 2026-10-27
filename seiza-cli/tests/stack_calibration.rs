@@ -581,3 +581,101 @@ fn a_dark_master_without_a_temperature_is_used_with_a_warning() {
     );
     assert!(output.exists());
 }
+
+#[test]
+fn completed_reports_preserve_pixels_and_existing_provenance() {
+    let directory = tempfile::tempdir().unwrap();
+    let lights = write_lights(directory.path());
+    for reintegrate in [false, true] {
+        let output = directory.path().join(format!("plain-{reintegrate}.fits"));
+        let reported = directory
+            .path()
+            .join(format!("reported-{reintegrate}.fits"));
+        let json = directory.path().join(format!("report-{reintegrate}.json"));
+        let html = directory.path().join(format!("report-{reintegrate}.html"));
+        for path in [&output, &reported] {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_seiza"));
+            command.arg("stack").args(&lights).arg("--output").arg(path);
+            if reintegrate {
+                command.arg("--reintegrate");
+            }
+            if path == &reported {
+                command
+                    .arg("--report")
+                    .arg(&json)
+                    .arg("--report-html")
+                    .arg(&html);
+            }
+            let result = command.output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let plain = seiza_stacking::FitsFrame::open(&output).unwrap();
+        let with_report = seiza_stacking::FitsFrame::open(&reported).unwrap();
+        assert_eq!(plain.image.data, with_report.image.data);
+        let document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(json).unwrap()).unwrap();
+        assert_eq!(document["schema_version"], 1);
+        assert!(document["output"]["sha256"].is_string());
+        assert!(document["frames"].is_array());
+        assert_eq!(
+            document["post_stack"]["stage"],
+            if reintegrate { "batch" } else { "online" }
+        );
+        assert_eq!(
+            document["post_stack"]["accepted_frames"],
+            document["accepted_frames"]
+        );
+        let html = std::fs::read_to_string(html).unwrap();
+        assert!(html.contains("Completed stack"));
+        assert!(!html.contains("__REPORT_"));
+    }
+}
+
+#[test]
+fn html_report_alone_collects_provenance_and_protects_inputs() {
+    let directory = tempfile::tempdir().unwrap();
+    let lights = write_lights(directory.path());
+    let html = directory.path().join("only.html");
+    let output = directory.path().join("only.fits");
+    let result = Command::new(env!("CARGO_BIN_EXE_seiza"))
+        .arg("stack")
+        .args(&lights)
+        .arg("--output")
+        .arg(&output)
+        .arg("--report-html")
+        .arg(&html)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let html = std::fs::read_to_string(html).unwrap();
+    let embedded = html
+        .split("<script id=\"data\" type=\"application/json\">")
+        .nth(1)
+        .unwrap()
+        .split("</script>")
+        .next()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_str(embedded).unwrap();
+    assert!(report["provenance"]["output"]["sha256"].is_string());
+    assert!(report["provenance"]["frames"].is_array());
+    let before = std::fs::read(&lights[0]).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_seiza"))
+        .arg("stack")
+        .args(&lights)
+        .arg("--output")
+        .arg(&output)
+        .arg("--report-html")
+        .arg(&lights[0])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert_eq!(std::fs::read(&lights[0]).unwrap(), before);
+}
