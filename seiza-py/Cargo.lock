@@ -2350,6 +2350,8 @@ dependencies = [
  "seiza-imgproc",
  "seiza-stats",
  "serde",
+ "serde_json",
+ "sha2 0.11.1",
  "thiserror",
 ]
 
@@ -2508,6 +2510,7 @@ dependencies = [
  "pollster",
  "postcard",
  "rayon",
+ "same-file",
  "seiza",
  "seiza-calibration",
  "seiza-fits",
