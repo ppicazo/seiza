@@ -156,6 +156,19 @@ pub(crate) struct PlannedRegistration {
     starts_panel: bool,
 }
 
+impl PlannedRegistration {
+    pub(crate) fn shared(
+        result: std::result::Result<RegistrationResult, String>,
+        stamp: Option<crate::replay::SourceStamp>,
+    ) -> Self {
+        Self {
+            result,
+            stamp,
+            starts_panel: false,
+        }
+    }
+}
+
 /// The planned registration of the frame read from `path`: its placement,
 /// the reason it could not join the canvas, or `None` when it was not
 /// planned.
@@ -529,6 +542,10 @@ pub(crate) struct CanvasRegistrar {
 }
 
 impl CanvasRegistrar {
+    pub(crate) fn update_photometry(&mut self, image: &LinearImage) {
+        self.ceilings = crate::normalization::photometric_ceilings(image);
+    }
+
     /// Panels at `regions` of `canvas`, matching the stars planning saved
     /// for them, or, for a context saved before panels kept their stars,
     /// the stars of the canvas beneath them. `canvas`, its panels and `lens`
@@ -600,16 +617,16 @@ impl CanvasRegistrar {
         &self.planning_notes
     }
 
-    fn with_planning_notes(mut self, notes: Vec<String>) -> Self {
+    pub(crate) fn with_planning_notes(mut self, notes: Vec<String>) -> Self {
         self.planning_notes = notes;
         self
     }
 
-    fn with_summary(self, summary: Option<crate::ExpandedLens>) -> Self {
+    pub(crate) fn with_summary(self, summary: Option<crate::ExpandedLens>) -> Self {
         Self { summary, ..self }
     }
 
-    fn with_largest_frame(self, largest_frame: (usize, usize)) -> Self {
+    pub(crate) fn with_largest_frame(self, largest_frame: (usize, usize)) -> Self {
         Self {
             largest_frame: Some(largest_frame),
             ..self

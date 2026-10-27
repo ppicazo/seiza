@@ -882,6 +882,184 @@ def test_stack_options_choose_a_registration_model():
         seiza.StackOptions(registration_model="thin-plate")
 
 
+@pytest.mark.parametrize("normalization", ["none", "global", "local-background"])
+def test_shared_mosaic_canvas_keeps_channel_photometry(tmp_path, normalization):
+    paths = overlapping_panels(tmp_path)
+    options = seiza.StackOptions(
+        normalization=normalization, rejection="none", minimum_overlap=0.1,
+        gpu=seiza.GpuOptions(enabled=False),
+    )
+    source = seiza.LiveStacker.open_fits_expanding(paths, options=options)
+    channels = []
+    for index, path in enumerate(paths):
+        other = tmp_path / f"oiii-{index}.fits"
+        fits.writeto(other, fits.getdata(path) * 0.25)
+        channels.append(other)
+    # No integration is needed to reuse an in-memory plan. Start on the far
+    # panel and defer the disconnected near panel until the middle joins.
+    first = source.open_fits_on_canvas([paths[2], paths[0], paths[1]], options=options)
+    second = source.open_fits_on_canvas(
+        [channels[2], channels[0], channels[1]], options=options
+    )
+    assert source.accepted_frames == first.accepted_frames == second.accepted_frames == 0
+    assert not second.reference_integrated
+    for path in paths:
+        assert first.push_fits(path).accepted
+    for path in channels:
+        assert second.push_fits(path).accepted
+    a, b = first.snapshot(), second.snapshot()
+    assert (a.width, a.height) == (b.width, b.height)
+    valid = np.isfinite(a.image) & np.isfinite(b.image)
+    assert valid.mean() > 0.9
+    np.testing.assert_allclose(b.image[valid], a.image[valid] * 0.25, rtol=0.005, atol=0.05)
+    partial = source.open_fits_on_canvas([channels[2], channels[1]], options=options)
+    for path in channels[1:]:
+        assert partial.push_fits(path).accepted
+    sparse = partial.snapshot()
+    assert sparse.image.shape == a.image.shape
+    assert 0.5 < np.isfinite(sparse.image).mean() < 0.9
+    common = np.isfinite(sparse.image) & np.isfinite(b.image)
+    # Fewer exposures change the pixel averages, but star positions stay on
+    # the same grid throughout the shared coverage.
+    assert np.corrcoef(sparse.image[common], b.image[common])[0, 1] > 0.995
+    context = tmp_path / "oiii.seiza-stack"
+    second.save_context(context)
+    restored = seiza.LiveStacker.open_context(context)
+    third = restored.open_fits_on_canvas([paths[2], paths[0], paths[1]], options=options)
+    for path in paths:
+        assert third.push_fits(path).accepted
+    c = third.snapshot()
+    assert (c.width, c.height) == (a.width, a.height)
+    np.testing.assert_allclose(c.image, a.image, rtol=0.005, atol=0.05, equal_nan=True)
+
+
+def test_shared_mosaic_canvas_validates_source_and_cancel(tmp_path):
+    paths = overlapping_panels(tmp_path)
+    options = seiza.StackOptions(normalization="none", gpu=seiza.GpuOptions(enabled=False))
+    ordinary = seiza.LiveStacker(paths[0], options=options)
+    with pytest.raises(seiza.StackError, match="expanded stack"):
+        ordinary.open_fits_on_canvas(paths, options=options)
+    canvas = seiza.LiveStacker.open_fits_expanding(paths, options=options)
+    with pytest.raises(ValueError, match="at least one light"):
+        canvas.open_fits_on_canvas([], options=options)
+    with pytest.raises(seiza.StackError, match="bin factor"):
+        canvas.open_fits_on_canvas(paths, options=seiza.StackOptions(bin_factor=2))
+    with pytest.raises(seiza.StackError, match="cancel"):
+        canvas.open_fits_on_canvas(paths, options=options, cancel=lambda: True)
+    def interrupt():
+        raise KeyboardInterrupt("shared canvas interrupted")
+    with pytest.raises(KeyboardInterrupt, match="shared canvas interrupted"):
+        canvas.open_fits_on_canvas(paths, options=options, cancel=interrupt)
+    assert canvas.accepted_frames == 0
+
+
+def test_shared_mosaic_canvas_uses_each_filters_calibration(tmp_path):
+    paths = overlapping_panels(tmp_path)
+    channels = []
+    for index, path in enumerate(paths):
+        data = fits.getdata(path, memmap=False)
+        fits.writeto(path, data, fits.Header({"FILTER": "Ha"}), overwrite=True)
+        other = tmp_path / f"oiii-{index}.fits"
+        fits.writeto(other, data * 0.25, fits.Header({"FILTER": "OIII"}))
+        channels.append(other)
+    flats = []
+    for name in ("Ha", "OIII"):
+        flat = tmp_path / f"flat-{name}.fits"
+        fits.writeto(flat, np.ones((160, 192), dtype=np.float32),
+                     fits.Header({"SEIZAMST": "FLAT", "FILTER": name, "DARKSUB": True}))
+        flats.append(flat)
+    options = seiza.StackOptions(normalization="none", gpu=seiza.GpuOptions(enabled=False))
+    source = seiza.LiveStacker.open_fits_expanding(paths, options=options, flat=flats[0])
+    with pytest.raises(seiza.StackError, match="filter"):
+        source.open_fits_on_canvas(channels, options=options, flat=flats[0])
+    channel = source.open_fits_on_canvas(channels, options=options, flat=flats[1])
+    for path in channels:
+        assert channel.push_fits(path).accepted
+    assert channel.accepted_frames == 3
+
+
+@pytest.mark.parametrize("normalization", ["none", "global", "local-background"])
+def test_joint_canvas_preserves_each_filters_unique_coverage(tmp_path, normalization):
+    paths = overlapping_panels(tmp_path)
+    other = []
+    for i, path in enumerate(paths[1:]):
+        out = tmp_path / f"oiii-{i}.fits"
+        fits.writeto(out, fits.getdata(path) * 0.01, fits.Header({"FILTER": "OIII"}))
+        other.append(out)
+    flat = tmp_path / "oiii-flat.fits"
+    fits.writeto(flat, np.ones((160, 192), np.float32),
+                 fits.Header({"SEIZAMST": "FLAT", "FILTER": "OIII", "DARKSUB": True}))
+    groups = [seiza.CanvasChannel(paths[:2]), seiza.CanvasChannel(other, flat=flat)]
+    assert groups[1].paths == other and groups[1].flat == flat
+    assert groups[0].bias is groups[0].dark is groups[0].dark_exposure_seconds is None
+    options = seiza.StackOptions(normalization=normalization, rejection="none",
+                                minimum_overlap=0.1, gpu=seiza.GpuOptions(enabled=False))
+    first = seiza.LiveStacker.open_fits_joint_canvas(groups, options=options)
+    assert first.accepted_frames == 0
+    for path in paths[:2]:
+        assert first.push_fits(path).accepted
+    context = tmp_path / "union.seiza-stack"
+    first.save_context(context)
+    restored = seiza.LiveStacker.open_context(context)
+    second = restored.open_fits_on_canvas(other, flat=flat, options=options)
+    for path in other:
+        assert second.push_fits(path).accepted
+    a, b = first.snapshot().image, second.snapshot().image
+    assert a.shape == b.shape and a.shape[1] >= 416
+    va, vb = np.isfinite(a), np.isfinite(b)
+    assert (va & ~vb).mean() > 0.2 and (vb & ~va).mean() > 0.2
+    common = va & vb
+    assert np.corrcoef(a[common], b[common])[0, 1] > 0.995
+    assert 0.009 < b[common].mean() / a[common].mean() < 0.011
+    # The selected channel can be any group, with its own flat and brightness.
+    selected = seiza.LiveStacker.open_fits_joint_canvas(groups, 1, options=options)
+    for path in other:
+        assert selected.push_fits(path).accepted
+    np.testing.assert_allclose(selected.snapshot().image, b, rtol=0.005, atol=0.005, equal_nan=True)
+
+
+def test_joint_canvas_validation_and_cancellation(tmp_path):
+    paths = overlapping_panels(tmp_path)
+    options = seiza.StackOptions(normalization="none", gpu=seiza.GpuOptions(enabled=False))
+    groups = [seiza.CanvasChannel(paths[:2]), seiza.CanvasChannel(paths[2:])]
+    for invalid, message in [([], "index"), ([seiza.CanvasChannel([])], "light"),
+                             ([groups[0], groups[0]], "unique"),
+                             ([seiza.CanvasChannel(paths, dark_exposure_seconds=10)], "dark")]:
+        with pytest.raises(seiza.StackError, match=message):
+            seiza.LiveStacker.open_fits_joint_canvas(invalid, options=options)
+    with pytest.raises(seiza.StackError, match="index"):
+        seiza.LiveStacker.open_fits_joint_canvas(groups, 2, options=options)
+    with pytest.raises(ValueError, match="positive"):
+        seiza.LiveStacker.open_fits_joint_canvas(groups, max_canvas_megasamples=0)
+    with pytest.raises(seiza.StackError, match="cancel"):
+        seiza.LiveStacker.open_fits_joint_canvas(groups, options=options, cancel=lambda: True)
+    def interrupt():
+        raise KeyboardInterrupt("joint interrupted")
+    with pytest.raises(KeyboardInterrupt, match="joint interrupted"):
+        seiza.LiveStacker.open_fits_joint_canvas(groups, options=options, cancel=interrupt)
+    flat = tmp_path / "wrong-flat.fits"
+    fits.writeto(flat, np.ones((160, 192), np.float32),
+                 fits.Header({"SEIZAMST": "FLAT", "FILTER": "wrong", "DARKSUB": True}))
+    for path in paths:
+        data = fits.getdata(path, memmap=False)
+        fits.writeto(path, data, fits.Header({"FILTER": "Ha"}), overwrite=True)
+    with pytest.raises(seiza.StackError, match="filter"):
+        seiza.LiveStacker.open_fits_joint_canvas(
+            [groups[0], seiza.CanvasChannel(paths[2:], flat=flat)], options=options)
+
+
+def test_joint_canvas_keeps_omitted_group_notes(tmp_path):
+    paths = overlapping_panels(tmp_path)
+    blank = tmp_path / "blank.fits"
+    fits.writeto(blank, np.ones((160, 192), np.float32))
+    options = seiza.StackOptions(normalization="none", gpu=seiza.GpuOptions(enabled=False))
+    stacker = seiza.LiveStacker.open_fits_joint_canvas(
+        [seiza.CanvasChannel(paths[:2]), seiza.CanvasChannel([blank])], options=options)
+    assert stacker.expansion_planning_notes
+    channel = stacker.open_fits_on_canvas(paths[:2], options=options)
+    assert channel.expansion_planning_notes == stacker.expansion_planning_notes
+
+
 def test_expanding_stack_holds_every_panel(tmp_path):
     paths = overlapping_panels(tmp_path)
     options = seiza.StackOptions(
@@ -1019,6 +1197,24 @@ def test_expanding_stack_measures_the_lens_across_panels(tmp_path, model, bin_fa
         assert continued.registration_rms_pixels < 0.3
 
 
+def test_shared_mosaic_canvas_preserves_binned_lens_geometry(tmp_path):
+    paths, _ = lens_panels(tmp_path)
+    options = seiza.StackOptions(
+        normalization="none", minimum_overlap=0.1, registration_model="quadratic",
+        bin_factor=2, gpu=seiza.GpuOptions(enabled=False),
+    )
+    source = seiza.LiveStacker.open_fits_expanding(paths, options=options)
+    assert source.expanded_lens is not None
+    channel = source.open_fits_on_canvas(paths, options=options)
+    assert channel.expanded_lens == source.expanded_lens
+    for path in paths:
+        result = channel.push_fits(path)
+        assert result.accepted, result.reason
+        assert result.registration_rms_pixels < 0.3
+        assert source.push_fits(path).accepted
+    assert channel.snapshot().image.shape == source.snapshot().image.shape
+
+
 def test_expanding_stack_refuses_bad_inputs_and_honours_cancel(tmp_path):
     paths = overlapping_panels(tmp_path)
     options = seiza.StackOptions(minimum_overlap=0.1)
@@ -1053,7 +1249,7 @@ def test_expanding_session_assignments_calibrate_plan_push_and_resume(tmp_path):
         fits.writeto(bias_path, np.full((160, 192), bias, np.float32), header)
         sessions.append({"bias": bias_path})
     for index, path in enumerate(paths):
-        data = fits.getdata(path)
+        data = fits.getdata(path, memmap=False)
         session = index % 2
         fits.writeto(path, data + (500.0 if session == 0 else 1500.0),
                      fits.Header({"GAIN": 100 + session * 100}), overwrite=True)
@@ -1082,6 +1278,46 @@ def test_expanding_session_assignments_calibrate_plan_push_and_resume(tmp_path):
         resumed.reintegrate()
     with pytest.raises(seiza.StackError, match="changed|missing|fingerprint"):
         seiza.LiveStacker.open_context(context)
+
+
+def test_session_canvas_can_be_reused_by_an_independent_filter(tmp_path):
+    sky = overlapping_panels(tmp_path)
+    raw, channel, sessions = [], [], []
+    for index, bias in enumerate((500.0, 1500.0)):
+        master = tmp_path / f"shared-bias-{index}.fits"
+        fits.writeto(master, np.full((160, 192), bias, np.float32))
+        sessions.append({"bias": master})
+    for index, path in enumerate(sky):
+        data = fits.getdata(path, memmap=False)
+        light = tmp_path / f"raw-{index}.fits"
+        fits.writeto(light, data + (500.0 if index % 2 == 0 else 1500.0))
+        raw.append(light)
+        light = tmp_path / f"other-{index}.fits"
+        fits.writeto(light, data * 0.25)
+        channel.append(light)
+    options = seiza.StackOptions(normalization="none", rejection="none", minimum_overlap=0.1,
+                                gpu=seiza.GpuOptions(enabled=False))
+    source = seiza.LiveStacker.open_fits_expanding_sessions(
+        raw, sessions, [0, 1, 0], options=options)
+    for path in raw:
+        assert source.push_fits(path).accepted
+    context = tmp_path / "session-canvas.seiza-stack"
+    source.save_context(context)
+    source = seiza.LiveStacker.open_context(context)
+    other = source.open_fits_on_canvas(channel, options=options)
+    for path in channel:
+        assert other.push_fits(path).accepted
+    a, b = source.snapshot().image, other.snapshot().image
+    assert a.shape == b.shape
+    valid = np.isfinite(a) & np.isfinite(b)
+    assert valid.mean() > 0.9
+    # Saved panel stars refine registration again for this channel; compare
+    # spatial agreement and flux rather than requiring identical resampling.
+    assert np.corrcoef(a[valid], b[valid])[0, 1] > 0.999
+    assert b[valid].mean() / a[valid].mean() == pytest.approx(0.25, rel=0.001)
+    # The source keeps its authoritative session assignments for replay.
+    replay = source.reintegrate(sigma_low=100, sigma_high=100).image
+    np.testing.assert_allclose(replay, a, atol=0.02, equal_nan=True)
 
 
 def test_expanding_session_plan_refuses_assignments_aliases_and_cancel(tmp_path):
