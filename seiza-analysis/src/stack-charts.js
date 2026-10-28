@@ -1,6 +1,7 @@
 // Charts use only retained values unless an explicit rich-analysis result is present.
 function renderStackCharts(r,host,frames){
  const basename=p=>String(p||'In-memory input').replaceAll('\\','/').split('/').pop();
+ host.append(el('h2','Frame diagnostics','section-heading'),el('p','Alignment during admission and sample rejection in the final integration.','section-intro'));
  const section=el('div',null,'charts');section.style.marginBottom='24px';host.append(section);
  function panel(title,note){const p=el('section',null,'panel'),head=el('div',null,'panel-head'),controls=el('div',null,'controls'),plot=el('div',null,'chart'),foot=el('p',note,'panel-foot');head.append(el('h2',title));p.append(head,controls,plot,foot);section.append(p);return {p,controls,plot,foot};}
  function selectControl(p,label,items){const wrap=el('label',label+' '),select=el('select');for(const [value,text] of items){const o=el('option',text);o.value=value;select.append(o)}wrap.append(select);p.controls.append(wrap);return select;}
@@ -22,8 +23,8 @@ function renderStackCharts(r,host,frames){
  scatter(final,frames.map((f,i)=>{const s=r.final_samples?.[i];return {x:i+1,label:basename(f.source),y:s?.finite_samples>0?100*(s.finite_samples-s.integrated_samples)/s.finite_samples:null}}),'Rejected finite samples · %');
  const a=r.provenance?.reporting?.analysis;
  if(!a)return;
- const note=el('section',null,'panel');note.style.marginBottom='20px';const head=el('div',null,'panel-head');head.append(el('h2','Source analysis · rich report'),el('p','Additional pass over the supplied source images, without applying stack calibration. Includes measured inputs independently of stack admission. Curves are sampled equal-weight diagnostics, not the final stack’s noise or SNR.'));note.append(head);
- const timing=el('p','Analysis pass: '+fmt(a.timings?.total_seconds)+' s · image reads '+fmt(a.timings?.read_seconds)+' s · measurements '+fmt(a.timings?.measurement_seconds)+' s · registration '+fmt(a.timings?.registration_seconds)+' s','panel-foot');note.append(timing);host.append(note);
+ host.append(el('h2','Image quality & integration depth','section-heading'),el('p','Additional source measurements · independent of final stack admission','section-intro'));
+ const note=el('details',null,'analysis-method');note.append(el('summary','How these measurements are calculated'),el('p','Additional pass over supplied source images, without applying stack calibration. Curves use sampled equal-weight diagnostics; they do not measure the final stack’s noise or SNR.'),el('p','Analysis pass: '+fmt(a.timings?.total_seconds)+' s · image reads '+fmt(a.timings?.read_seconds)+' s · measurements '+fmt(a.timings?.measurement_seconds)+' s · registration '+fmt(a.timings?.registration_seconds)+' s'));host.append(note);
  const rich=el('div',null,'charts');rich.style.marginBottom='24px';host.append(rich);
  const quality=panel('Source frame measurements','Native source measurements; compare consistently scaled inputs within one pointing and filter.'),depth=panel('Sampled integration depth','Split-noise measurement versus the ideal 1/√N comparison. Shared systematic errors cancel; this does not reproduce production weighting or rejection.');rich.append(quality.p,depth.p);
  const groups=Array.isArray(a.groups)?a.groups:[],groupItems=groups.map((g,i)=>[String(i),g.filter??'Unknown filter']);
