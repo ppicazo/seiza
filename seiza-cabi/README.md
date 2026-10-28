@@ -12,7 +12,7 @@ FITS/XISF projects without producing a stack. Example request:
 Only `inputs` is required. Inputs may be files, nonrecursive directories or
 UTF-8 text lists. The response is the core analysis report with camelCase
 keys (`schemaVersion`, `algorithmVersion`, `options`, `frames`, `groups`,
-`timings`, `warnings`), with schema/algorithm version 2. `metricsOnly` defaults
+`timings`, `warnings`), with schema/algorithm version 3. `metricsOnly` defaults
 to false; true skips registration, normalization, sampling and replay. Frames
 have separate `measurementStatus` and `depthStatus`, with `error` and
 `depthError` respectively. Groups expose `measuredFrames`, `depthFrames` and

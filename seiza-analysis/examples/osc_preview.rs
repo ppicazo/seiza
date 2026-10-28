@@ -17,8 +17,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for frame in 0..6 {
             let mut state = 90210u64 + frame * 999;
             let mut uniform = || {
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-                ((state >> 11) as f64 + 1.) / ((1u64 << 53) as f64 + 1.)
+                state = state.wrapping_add(0x9e3779b97f4a7c15);
+                let mut z = state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+                z ^= z >> 31;
+                ((z >> 11) as f64 + 1.) / ((1u64 << 53) as f64 + 1.)
             };
             let channels = if kind == "cfa" { 1 } else { 3 };
             let mut pixels = vec![0.; side * side * channels];
@@ -102,6 +106,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ["rgb", "cfa"]
         } {
             let report = analyze(&[root.join(kind)], &options)?;
+            assert_eq!(report.groups.len(), if kind == "cfa" { 4 } else { 3 });
             assert!(
                 report
                     .groups

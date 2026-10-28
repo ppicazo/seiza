@@ -17,7 +17,7 @@ accepts paths to files, nonrecursive directories or UTF-8 text lists; relative
 list entries resolve beside the list. `max_frames` limits sorted deduplicated
 paths before header filtering. It releases the GIL during analysis and returns
 a snake_case dictionary with `schema_version`, `algorithm_version`, `options`,
-`frames`, `groups`, `timings`, and `warnings` (schema/algorithm version 2). Invalid requests raise `ValueError`;
+`frames`, `groups`, `timings`, and `warnings` (schema/algorithm version 3). Invalid requests raise `ValueError`;
 individual inputs stay in `frames` with separate `measurement_status` and
 `depth_status`. Measurement failures use `error`; depth failures use `depth_error`.
 Measured frames contribute to native quality medians even if registration fails.
