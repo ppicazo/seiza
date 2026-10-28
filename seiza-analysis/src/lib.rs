@@ -5,7 +5,10 @@
 mod report;
 mod sampling;
 mod trend;
-pub use report::{render_html, render_stack_html};
+pub use report::{
+    NamedStackReport, StackReportCollection, render_html, render_stack_collection_html,
+    render_stack_html,
+};
 
 use seiza_stacking::{FitsFrame, GpuOptions, Registrar, RegistrationOptions, RegistrationResult};
 use seiza_stars::{HocusFocusDetectionResult, HocusFocusParams, PSFType};

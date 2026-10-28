@@ -2259,3 +2259,6 @@ def master_flat_stability_images(
     dark_exposure_seconds: float | None = None,
     dark_bias_subtracted: bool = False,
 ) -> FlatSetStability: ...
+
+
+def stack_collection_html(report: Mapping[str, Any]) -> str: ...

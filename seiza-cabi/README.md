@@ -1054,3 +1054,27 @@ even after full-resolution refinement.
 light/dark mode, expandable inputs and downloadable JSON. Free all returned
 strings with `seiza_string_free`. Matching context/result counts are checked,
 but callers must ensure they came from the same run.
+
+### Combining completed stacks
+
+Report generation is optional. A collection contains independent stack results; it
+never re-registers images or infers shared sky coverage. Labels are nonempty and
+unique (ignoring case and surrounding whitespace), and input order determines the
+initial selection. Missing filters and different output sizes are supported. RGB
+components remain inside their own stack, distinct from collection labels.
+
+The collection JSON is `{ "schema_version": 1, "title": "SHO", "stacks":
+[{ "label": "S", "report": <PostStackReport> }, ...] }`.
+The HTML embeds the validated collection for download, uses no network resources, and
+supports keyboard controls, search, 100-row pagination and printing all stacks.
+Rejected attempts appear when supplied in host provenance. Empty context remains
+unknown, not zero exposure. Maps are bounded summaries; this is not a crop tool.
+
+Rendering saved JSON does not reread images or compute checksums. Building the
+original post-stack report scans existing support maps and copies ledger metadata;
+CLI provenance additionally hashes input/output files. Reporting never enables
+reintegration by itself.
+
+C: `seiza_stack_collection_html(collection_json, &error)` accepts the same structure with camelCase keys (`schemaVersion`, etc.). Free returned HTML/error strings with `seiza_string_free`. Invalid data returns NULL plus an error.
+
+The HTML download uses canonical snake_case JSON, suitable for `seiza stack-report`; the C input uses camelCase as usual.

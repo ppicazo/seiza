@@ -16,18 +16,123 @@ pub fn render_html(report: &AnalysisReport) -> Result<String, Error> {
 }
 /// Render a completed-stack report with bounded support maps and embedded JSON.
 pub fn render_stack_html(report: &seiza_stacking::PostStackReport) -> Result<String, Error> {
-    if report.schema_version != 1 {
+    validate_stack(report)?;
+    stack_document(report)
+}
+
+/// Named independent stack. Labels are unique within a collection; order is preserved.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct NamedStackReport {
+    pub label: String,
+    pub report: seiza_stacking::PostStackReport,
+}
+
+/// Version 1 collection of independent results, not a shared canvas or color composite.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct StackReportCollection {
+    pub schema_version: u32,
+    pub title: String,
+    pub stacks: Vec<NamedStackReport>,
+}
+
+/// Validate and render independent stacks using the same view as a single-stack report.
+/// The first listed stack is selected. No source images are opened.
+pub fn render_stack_collection_html(report: &StackReportCollection) -> Result<String, Error> {
+    if report.schema_version != 1 || report.title.trim().is_empty() || report.stacks.is_empty() {
         return Err(Error::Invalid(
-            "unsupported post-stack report schema".into(),
+            "collection requires schema 1, a title and at least one stack".into(),
         ));
     }
+    let mut labels = std::collections::HashSet::new();
+    for stack in &report.stacks {
+        if stack.label.trim().is_empty() || !labels.insert(stack.label.trim().to_lowercase()) {
+            return Err(Error::Invalid(
+                "stack labels must be nonempty and unique".into(),
+            ));
+        }
+        validate_stack(&stack.report)?;
+    }
+    stack_document(report)
+}
+
+fn stack_document(report: &impl serde::Serialize) -> Result<String, Error> {
     let json = serde_json::to_string(report)?
         .replace('&', "\\u0026")
         .replace('<', "\\u003c")
         .replace('>', "\\u003e");
     Ok(include_str!("stack-report.html")
         .replace("__REPORT_STYLE__", include_str!("report.css"))
+        .replace("__STACK_SCRIPT__", include_str!("stack-report.js"))
         .replace("__REPORT_DATA__", &json))
+}
+
+fn validate_stack(r: &seiza_stacking::PostStackReport) -> Result<(), Error> {
+    let invalid =
+        || Error::Invalid("invalid post-stack report dimensions, maps, counts or schema".into());
+    let pixels = r
+        .width
+        .checked_mul(r.height)
+        .filter(|n| *n > 0)
+        .ok_or_else(invalid)?;
+    if r.schema_version != 1
+        || !matches!(r.stage.as_str(), "online" | "batch" | "drizzled")
+        || !matches!(r.channels, 1 | 3)
+        || r.support.len() != r.channels
+    {
+        return Err(invalid());
+    }
+    let expected_quantity = if r.stage == "drizzled" {
+        "drop_area_times_frame_weight"
+    } else {
+        "accepted_observations"
+    };
+    if r.support_map.quantity != expected_quantity
+        || r.rejection_map
+            .as_ref()
+            .is_some_and(|map| map.quantity != "rejected_observations")
+        || (r.stage == "drizzled" && r.rejection_map.is_some())
+    {
+        return Err(invalid());
+    }
+    for map in std::iter::once(&r.support_map).chain(r.rejection_map.iter()) {
+        if map.width != r.width.min(128)
+            || map.height != r.height.min(128)
+            || map.channels != r.channels
+            || map.values.len() != map.width * map.height * map.channels
+            || map.values.iter().any(|v| !v.is_finite() || *v < 0.0)
+        {
+            return Err(invalid());
+        }
+    }
+    for s in &r.support {
+        if s.total_pixels != pixels
+            || s.supported_pixels > pixels
+            || [s.support_minimum, s.support_maximum, s.support_mean]
+                .iter()
+                .any(|v| !v.is_finite() || *v < 0.0)
+            || s.support_minimum > s.support_mean
+            || s.support_mean > s.support_maximum
+        {
+            return Err(invalid());
+        }
+    }
+    if r.context.as_ref().is_some_and(|ctx| {
+        ctx.accepted_frames != r.accepted_frames
+            || ctx.rejected_frames != r.rejected_frames
+            || (!ctx.frames.is_empty() && ctx.frames.len() != r.accepted_frames as usize)
+            || ctx.frames.iter().any(|f| {
+                f.exposure_seconds
+                    .is_some_and(|v| !v.is_finite() || v <= 0.0)
+            })
+    }) || r.final_samples.as_ref().is_some_and(|samples| {
+        samples.len() != r.accepted_frames as usize
+            || samples
+                .iter()
+                .any(|s| s.integrated_samples > s.finite_samples)
+    }) {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -63,5 +168,96 @@ mod tests {
         let html = super::render_html(&report).unwrap();
         assert!(html.contains("Legacy depth-included group median"));
         assert!(html.contains("old.fits"));
+    }
+}
+
+#[cfg(test)]
+mod collection_tests {
+    use super::*;
+    fn fixture() -> StackReportCollection {
+        let report = seiza_stacking::stack_report(
+            &seiza_stacking::StackSnapshot {
+                image: seiza_stacking::LinearImage {
+                    width: 2,
+                    height: 1,
+                    channels: 1,
+                    data: vec![1.0; 2],
+                },
+                variance: seiza_stacking::LinearImage {
+                    width: 2,
+                    height: 1,
+                    channels: 1,
+                    data: vec![0.0; 2],
+                },
+                coverage: vec![2, 1],
+                rejected_samples: vec![0, 1],
+                accepted_frames: 2,
+                rejected_frames: 1,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        StackReportCollection {
+            schema_version: 1,
+            title: "SHO </script> & __STACK_SCRIPT__".into(),
+            stacks: vec![NamedStackReport {
+                label: "S".into(),
+                report,
+            }],
+        }
+    }
+    #[test]
+    fn collection_embeds_exact_data_and_reuses_single_renderer() {
+        let collection = fixture();
+        let html = render_stack_collection_html(&collection).unwrap();
+        let data = html
+            .split("<script id=\"data\" type=\"application/json\">")
+            .nth(1)
+            .unwrap()
+            .split("</script>")
+            .next()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(data).unwrap(),
+            serde_json::to_value(&collection).unwrap()
+        );
+        assert!(!html.contains("SHO </script>"));
+        assert!(!html.contains("<iframe"));
+        assert!(html.contains("select(0)"));
+        assert!(
+            render_stack_html(&collection.stacks[0].report)
+                .unwrap()
+                .contains("function renderReport")
+        );
+    }
+    #[test]
+    fn invalid_collections_and_nested_reports_are_rejected() {
+        let original = fixture();
+        let mut c = original.clone();
+        c.stacks.clear();
+        assert!(render_stack_collection_html(&c).is_err());
+        let mut c = original.clone();
+        c.schema_version = 2;
+        assert!(render_stack_collection_html(&c).is_err());
+        let mut c = original.clone();
+        c.stacks.push(c.stacks[0].clone());
+        c.stacks[1].label = " s ".into();
+        assert!(render_stack_collection_html(&c).is_err());
+        let mut c = original.clone();
+        c.stacks[0].label = " ".into();
+        assert!(render_stack_collection_html(&c).is_err());
+        let mut c = original.clone();
+        c.stacks[0].report.support_map.values.pop();
+        assert!(render_stack_collection_html(&c).is_err());
+        let mut c = original.clone();
+        c.stacks[0].report.support[0].supported_pixels = 3;
+        assert!(render_stack_collection_html(&c).is_err());
+        let mut c = original.clone();
+        c.stacks[0].report.support_map.values[0] = f64::NAN;
+        assert!(render_stack_collection_html(&c).is_err());
+        let mut c = original;
+        c.stacks[0].report.final_samples = Some(vec![]);
+        assert!(render_stack_collection_html(&c).is_err());
     }
 }

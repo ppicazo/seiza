@@ -1562,3 +1562,15 @@ calibration assignments and admission settings. With `--drizzle`, support
 means accumulated drop area times frame weight, not frame count. Counts for
 final per-frame rejection remain on the reintegration grid. Coverage is not SNR
 or calibrated uncertainty. Reporting does not change the numerical stack.
+
+### Combine saved stack reports
+
+```sh
+seiza stack-report --title "SHO session" --stack S=s.json --stack H=h.json --stack O=o.json --html sho.html --json sho.json
+```
+
+Accepts standalone snake_case `PostStackReport` JSON or `seiza stack --report`
+files containing `post_stack`. No source images are opened; no stacking is run.
+The first label is selected initially. Labels must be nonempty and unique.
+Destinations must be new files. `--json` is optional. Reports with missing
+context, different dimensions or RGB components retain those distinctions.

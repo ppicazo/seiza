@@ -244,3 +244,36 @@ sample decisions; drizzle support is explicitly weighted drop area.
 
 ![Completed stack report, light theme](../docs/images/stacking/report-light.jpg)
 ![Completed stack report, dark theme](../docs/images/stacking/report-dark.jpg)
+
+### Combining completed stacks
+
+Report generation is optional. A collection contains independent stack results; it
+never re-registers images or infers shared sky coverage. Labels are nonempty and
+unique (ignoring case and surrounding whitespace), and input order determines the
+initial selection. Missing filters and different output sizes are supported. RGB
+components remain inside their own stack, distinct from collection labels.
+
+The collection JSON is `{ "schema_version": 1, "title": "SHO", "stacks":
+[{ "label": "S", "report": <PostStackReport> }, ...] }`.
+The HTML embeds the validated collection for download, uses no network resources, and
+supports keyboard controls, search, 100-row pagination and printing all stacks.
+Rejected attempts appear when supplied in host provenance. Empty context remains
+unknown, not zero exposure. Maps are bounded summaries; this is not a crop tool.
+
+Rendering saved JSON does not reread images or compute checksums. Building the
+original post-stack report scans existing support maps and copies ledger metadata;
+CLI provenance additionally hashes input/output files. Reporting never enables
+reintegration by itself.
+
+Rust: `render_stack_collection_html(&StackReportCollection)`; entries are `NamedStackReport`.
+
+Browser regression check (using the built Python wheel):
+`python seiza-analysis/tests/browser_fixture.py check.html`, then open `check.html`.
+Its first line reports PASS/FAIL for first-stack selection, 100-row pagination,
+search beyond the first page, expansion, selection state, all-stack printing and
+restoration of the interactive state. It uses 1,001 synthetic admitted inputs and
+205 unsuccessful attempts per stack, without opening any images.
+
+![Combined completed stacks in light mode](../docs/images/stacking/collection-light.jpg)
+
+![Combined completed stacks in dark mode](../docs/images/stacking/collection-dark.jpg)

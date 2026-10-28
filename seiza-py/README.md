@@ -1769,3 +1769,25 @@ inputs without file provenance have unknown exposures. The admitted ledger
 does not retain failed attempts; preserve push outcomes separately if needed.
 The standalone HTML has light/dark themes, bounded per-channel support maps,
 expandable input records, and a download of its embedded JSON.
+
+### Combining completed stacks
+
+Report generation is optional. A collection contains independent stack results; it
+never re-registers images or infers shared sky coverage. Labels are nonempty and
+unique (ignoring case and surrounding whitespace), and input order determines the
+initial selection. Missing filters and different output sizes are supported. RGB
+components remain inside their own stack, distinct from collection labels.
+
+The collection JSON is `{ "schema_version": 1, "title": "SHO", "stacks":
+[{ "label": "S", "report": <PostStackReport> }, ...] }`.
+The HTML embeds the validated collection for download, uses no network resources, and
+supports keyboard controls, search, 100-row pagination and printing all stacks.
+Rejected attempts appear when supplied in host provenance. Empty context remains
+unknown, not zero exposure. Maps are bounded summaries; this is not a crop tool.
+
+Rendering saved JSON does not reread images or compute checksums. Building the
+original post-stack report scans existing support maps and copies ledger metadata;
+CLI provenance additionally hashes input/output files. Reporting never enables
+reintegration by itself.
+
+Python: `html = seiza.stack_collection_html(collection)` returns a string and raises `ValueError` for invalid collections or nested reports.

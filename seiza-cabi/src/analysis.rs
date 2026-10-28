@@ -213,6 +213,28 @@ pub unsafe extern "C" fn seiza_stack_report_html(
     .unwrap_or(ptr::null_mut())
 }
 
+/// Render a camelCase schema-1 collection with title and stacks [{label, report}].
+/// Every nested report is validated. Free the result with seiza_string_free.
+/// # Safety
+/// report_json must be NUL-terminated UTF-8; error_out must be null or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn seiza_stack_collection_html(
+    report_json: *const c_char,
+    error_out: *mut *mut c_char,
+) -> *mut c_char {
+    clear_error(error_out);
+    ffi_result(error_out, || {
+        let value: serde_json::Value = parse_request(report_json, "stack collection")?;
+        let report = serde_json::from_value(keys(value, false)).map_err(|e| e.to_string())?;
+        let html =
+            seiza_analysis::render_stack_collection_html(&report).map_err(|e| e.to_string())?;
+        CString::new(html)
+            .map(CString::into_raw)
+            .map_err(|e| e.to_string())
+    })
+    .unwrap_or(ptr::null_mut())
+}
+
 #[cfg(test)]
 mod stack_report_tests {
     use super::*;
@@ -267,6 +289,15 @@ mod stack_report_tests {
                     .contains("Completed stack")
             );
             seiza_string_free(html);
+            let collection = CString::new(serde_json::json!({"schemaVersion":1,"title":"SHO", "stacks":[{"label":"S","report":report}]}).to_string()).unwrap();
+            let html = seiza_stack_collection_html(collection.as_ptr(), &mut error);
+            assert!(error.is_null());
+            assert!(!html.is_null());
+            assert!(CStr::from_ptr(html).to_str().unwrap().contains("SHO"));
+            seiza_string_free(html);
+            assert!(seiza_stack_collection_html(ptr::null(), &mut error).is_null());
+            assert!(!error.is_null());
+            seiza_string_free(error);
             seiza_string_free(json);
         }
     }
