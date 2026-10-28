@@ -35,6 +35,7 @@ const frames=ctx?.frames?.length?ctx.frames:(r.final_samples||[]).map(()=>({sour
 for(const [label,value,note] of [['Output grid',r.width+' × '+r.height,r.channels+' channel(s)'],['Admitted frames',fmt(r.accepted_frames),'Includes the reference only when integrated'],['Rejected attempts',fmt(r.rejected_frames),'Admission outcomes, separate from sample rejection'],['Known exposure',fmt(known.reduce((s,f)=>s+f.exposure_seconds,0))+' s',unknown+' admitted exposure(s) unavailable']]) {
  const d=el('div',null,'stat');d.append(el('div',label,'stat-label'),el('div',value,'stat-value'),el('div',note,'stat-note'));$('summary').append(d);
 }
+renderStackCharts(r,$('charts'),frames);
 $('support-note').textContent=r.stage==='drizzled'?'Accumulated drop area × frame weight; these values are not frame counts.':'Accepted observations per output sample, after this stage’s sample decisions.';
 function mapPanel(map,c,title,stats){
  const box=el('div',null,'map');box.append(el('h3',title));const canvas=el('canvas');canvas.width=map.width;canvas.height=map.height;canvas.style.aspectRatio=r.width+'/'+r.height;canvas.setAttribute('role','img');

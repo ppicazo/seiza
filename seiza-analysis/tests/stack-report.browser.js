@@ -5,6 +5,13 @@ try{
  check(document.querySelector('#selector button').getAttribute('aria-pressed')==='true','first stack selection');
  const host=document.getElementById('stack-0'),rows=()=>host.querySelector('[data-id=frames]').children.length;
  check(rows()===100,'bounded admitted rows');
+ const charts=host.querySelector('[data-id=charts]');
+ check(charts.querySelectorAll('svg')[0].querySelectorAll('circle').length===1000,'reference RMS remains missing');
+ check(charts.querySelectorAll('svg')[1].querySelectorAll('circle').length===1001,'all admitted final sample decisions plotted');
+ const metric=charts.querySelector('select');metric.value='gain';metric.dispatchEvent(new Event('change'));
+ check(charts.querySelector('.chart-empty').textContent.includes('No recorded'),'missing normalization has explicit empty state');
+ metric.value='rms';metric.dispatchEvent(new Event('change'));
+
  host.querySelector('[data-id=next]').click();check(rows()===100,'next page');
  const search=host.querySelector('[data-id=search]');search.value='fixture-1000';search.dispatchEvent(new Event('input'));check(rows()===1,'search reaches last frame');
  const toggle=host.querySelector('.frame-toggle');toggle.click();check(toggle.getAttribute('aria-expanded')==='true','expand details');
@@ -12,5 +19,5 @@ try{
  window.dispatchEvent(new Event('beforeprint'));window.dispatchEvent(new Event('beforeprint'));
  check(rows()===1001,'all admitted rows print');check(host.querySelector('.attempts tbody').children.length===205,'all rejected rows print');check(document.getElementById('stack-2').children.length>0,'unvisited stack prints');
  window.dispatchEvent(new Event('afterprint'));check(rows()===1,'search restored after print');check(host.querySelector('.frame-toggle').getAttribute('aria-expanded')==='true','expanded detail restored');
- result.textContent='PASS: selection, pagination, search, details, switching, all-stack print and state restoration';
+ result.textContent='PASS: charts, missing measurements, selection, pagination, search, details, switching, all-stack print and state restoration';
 }catch(error){result.textContent='FAIL: '+error.message}
