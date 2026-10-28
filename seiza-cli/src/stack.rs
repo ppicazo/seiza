@@ -120,6 +120,9 @@ pub(crate) struct StackArgs {
     /// JSON admission/provenance report with SHA-256 input identities
     #[arg(long)]
     report: Option<PathBuf>,
+    /// Self-contained post-stack HTML report (also collects admission provenance)
+    #[arg(long)]
+    report_html: Option<PathBuf>,
     /// Integrated master bias FITS or XISF
     #[arg(long)]
     bias: Option<PathBuf>,
@@ -437,6 +440,7 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
     // The drizzle follows reintegration's rejection.
     let reintegrate = options.reintegrate || drizzle.is_some();
     let report_path = options.report.clone();
+    let report_requested = options.report.as_ref().or(options.report_html.as_ref());
     let preview_path = options.preview.clone();
     let mut path_roles = options
         .images
@@ -451,6 +455,7 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
         ("stack output", Some(options.output.as_path())),
         ("preview output", options.preview.as_deref()),
         ("report output", options.report.as_deref()),
+        ("HTML report output", options.report_html.as_deref()),
         ("clipped map output", options.clipped.as_deref()),
         ("reference canvas", options.reference_canvas.as_deref()),
         ("joint canvas manifest", options.joint_canvas.as_deref()),
@@ -483,6 +488,7 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
             ("stack output", Some(&options.output)),
             ("preview output", options.preview.as_ref()),
             ("report output", options.report.as_ref()),
+            ("HTML report output", options.report_html.as_ref()),
             ("clipped map output", options.clipped.as_ref()),
             ("saved canvas", options.save_canvas.as_ref()),
         ] {
@@ -503,6 +509,7 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
             ("stack output", Some(options.output.as_path())),
             ("preview output", options.preview.as_deref()),
             ("report output", options.report.as_deref()),
+            ("HTML report output", options.report_html.as_deref()),
         ] {
             if let Some(path) = path {
                 roles.push((role.into(), path));
@@ -548,7 +555,7 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
         path.map(|path| crate::common::open_frame(path, "calibration master"))
             .transpose()
     };
-    let mut calibration_report = report_path
+    let mut calibration_report = report_requested
         .as_ref()
         .map(|_| {
             Ok::<_, anyhow::Error>(CalibrationReport {
@@ -681,7 +688,7 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
         .reference_image
         .clone()
         .unwrap_or_else(|| ordered[0].clone());
-    let reference_identity = report_path
+    let reference_identity = report_requested
         .as_ref()
         .map(|_| file_identity(options.reference_canvas.as_ref().unwrap_or(&reference_path)))
         .transpose()?;
@@ -875,7 +882,7 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
         .reference_image
         .as_ref()
         .or(options.reference_canvas.as_ref())
-        .and(report_path.as_ref())
+        .and(report_requested)
         .map(|_| file_identity(&ordered[0]))
         .transpose()?;
     // A dark master that never recorded its temperature is used, since
@@ -939,7 +946,7 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
     // stacking loop nothing.
     // An integrated reference is already in the stack.
     let paths = ordered[usize::from(options.reference_image.is_none() && !expand)..].to_vec();
-    let mut source_identities = match &report_path {
+    let mut source_identities = match report_requested {
         Some(_) => paths
             .par_iter()
             .map(|path| file_identity(path).map(Some))
@@ -1036,6 +1043,8 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
     let reference_headers = stacker.reference_headers().to_vec();
     // Read before reintegration drops the stacker: the live pass recorded it.
     let clipped = options.clipped.as_ref().map(|_| stacker.clipped_fraction());
+    let mut report_context = report_requested.map(|_| stacker.report_context());
+    let mut final_samples = None;
     let mut drizzled = None;
     let mut snapshot = if reintegrate {
         if let Some(reason) = stacker.reintegration_unavailable() {
@@ -1089,6 +1098,7 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
             .map(|&count| u64::from(count))
             .sum::<u64>();
         println!("reintegrate rejected {rejected} sample(s)");
+        final_samples = Some(result.frames);
         result.snapshot
     } else {
         stacker.into_snapshot()?
@@ -1155,7 +1165,7 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
             format_args!("display stretch only (not used by the stack)"),
         );
     }
-    if let Some(report_path) = report_path {
+    if report_requested.is_some() {
         let report = StackReport {
             schema_version: 1,
             output: file_identity(&options.output)?,
@@ -1169,11 +1179,48 @@ pub(crate) fn run(options: StackArgs) -> Result<()> {
             accepted_frames: snapshot.accepted_frames,
             rejected_frames: snapshot.rejected_frames,
         };
-        write_json_atomic(&report_path, &report)?;
-        crate::common::wrote(
-            &report_path,
-            format_args!("admission and provenance report"),
-        );
+
+        if let Some(context) = &mut report_context {
+            context.rejected_frames = snapshot.rejected_frames;
+        }
+        let mut post_stack = match &drizzled {
+            Some(result) => seiza_stacking::drizzle_report(
+                result,
+                snapshot.accepted_frames,
+                snapshot.rejected_frames,
+                report_context.as_ref(),
+                final_samples.as_deref(),
+            )?,
+            None => seiza_stacking::stack_report(
+                &snapshot,
+                report_context.as_ref(),
+                final_samples.as_deref(),
+            )?,
+        };
+        let mut document = serde_json::to_value(&report)?;
+        post_stack.provenance = Some(document.clone());
+        // Preserve schema 1 admission/provenance fields; final measurements are an additive extension.
+        document["post_stack"] = serde_json::to_value(&post_stack)?;
+        if let Some(path) = report_path {
+            write_json_atomic(&path, &document)?;
+            crate::common::wrote(
+                &path,
+                format_args!("admission, provenance and completed-stack report"),
+            );
+        }
+        if let Some(path) = &options.report_html {
+            use std::io::Write;
+            let html = seiza_analysis::render_stack_html(&post_stack)?;
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| std::path::Path::new("."));
+            let mut file = tempfile::NamedTempFile::new_in(parent)?;
+            file.write_all(html.as_bytes())?;
+            file.as_file().sync_all()?;
+            file.persist(path)?;
+            crate::common::wrote(path, format_args!("completed-stack HTML report"));
+        }
     }
     Ok(())
 }

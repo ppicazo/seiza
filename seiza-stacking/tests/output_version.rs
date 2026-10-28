@@ -2616,6 +2616,10 @@ fn mono_stack(options: StackOptions) -> Vec<f64> {
         admit(stacker.push_linear(image).unwrap());
     }
     let snapshot = stacker.snapshot().unwrap();
+    let report =
+        seiza_stacking::stack_report(&snapshot, Some(&stacker.report_context()), None).unwrap();
+    assert_eq!(report.accepted_frames, snapshot.accepted_frames);
+
     assert_eq!(snapshot.accepted_frames, SHIFTS.len() as u32);
     summary(&snapshot.image)
 }

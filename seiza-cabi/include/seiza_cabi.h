@@ -3584,6 +3584,51 @@ char *seiza_analyze_project_json(const char *request_json,
 char *seiza_analysis_html(const char *report_json, char **error_out);
 
 /*
+ Capture admitted-input history and actual stack settings as camelCase JSON.
+ Free the returned string with seiza_string_free.
+ # Safety
+ stacker must be a live handle; error_out must be null or writable.
+ */
+char *seiza_live_stacker_report_context_json(const SeizaLiveStacker *stacker, char **error_out);
+
+/*
+ Summarize this immutable snapshot as camelCase JSON. Optional context must
+ have been captured with this result. Free with seiza_string_free.
+ # Safety
+ snapshot must be live; context must be null or NUL-terminated UTF-8 JSON;
+ error_out must be null or writable.
+ */
+char *seiza_stack_snapshot_report_json(const SeizaStackSnapshot *snapshot,
+                                       const char *context,
+                                       char **error_out);
+
+/*
+ Summarize drizzle support as drop area times weight, never frame count.
+ Optional context must be captured with this result. Free with seiza_string_free.
+ # Safety
+ result must be live; context must be null or NUL-terminated UTF-8 JSON;
+ error_out must be null or writable.
+ */
+char *seiza_drizzle_result_report_json(const SeizaDrizzleResult *result,
+                                       const char *context,
+                                       char **error_out);
+
+/*
+ Render camelCase post-stack JSON as self-contained HTML. Free with seiza_string_free.
+ # Safety
+ report_json must be NUL-terminated UTF-8; error_out must be null or writable.
+ */
+char *seiza_stack_report_html(const char *report_json, char **error_out);
+
+/*
+ Render a camelCase schema-1 collection with title and stacks [{label, report}].
+ Every nested report is validated. Free the result with seiza_string_free.
+ # Safety
+ report_json must be NUL-terminated UTF-8; error_out must be null or writable.
+ */
+char *seiza_stack_collection_html(const char *report_json, char **error_out);
+
+/*
  Fit premeasured common stellar fluxes. Request JSON contains sources, stars
  and optional options, as defined by the continuum core. Returns a tagged
  fitted/skipped JSON outcome; free it with seiza_string_free. A skip is not

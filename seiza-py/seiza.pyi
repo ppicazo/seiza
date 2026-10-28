@@ -36,6 +36,10 @@ def analyze_project(
     """
     ...
 
+def stack_report_html(report: Mapping[str, Any]) -> str:
+    """Render a portable completed-stack report with embedded JSON."""
+    ...
+
 def analysis_html(report: Mapping[str, Any]) -> str:
     """Render an analyze_project result as portable, self-contained HTML."""
     ...
@@ -677,6 +681,7 @@ class SnrSample:
     def snr(self) -> float: ...
 
 class StackSnapshot:
+    def report(self, context: Mapping[str, Any] | None = None) -> dict[str, Any]: ...
     width: int
     height: int
     channels: int
@@ -689,6 +694,7 @@ class StackSnapshot:
     def write_fits(self, path: str | Path) -> None: ...
 
 class DrizzleResult:
+    def report(self, context: Mapping[str, Any] | None = None) -> dict[str, Any]: ...
     width: int
     height: int
     channels: int
@@ -731,6 +737,7 @@ class CanvasChannel:
     def dark_exposure_seconds(self) -> float | None: ...
 
 class LiveStacker:
+    def report_context(self) -> dict[str, Any]: ...
     def __init__(
         self,
         reference: str | Path,
@@ -2252,3 +2259,6 @@ def master_flat_stability_images(
     dark_exposure_seconds: float | None = None,
     dark_bias_subtracted: bool = False,
 ) -> FlatSetStability: ...
+
+
+def stack_collection_html(report: Mapping[str, Any]) -> str: ...

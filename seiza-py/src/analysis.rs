@@ -38,8 +38,32 @@ fn analysis_html(report: &Bound<'_, PyAny>) -> PyResult<String> {
     let report = serde_json::from_str(&json).map_err(|e| PyValueError::new_err(e.to_string()))?;
     seiza_analysis::render_html(&report).map_err(|e| PyValueError::new_err(e.to_string()))
 }
+#[pyfunction]
+fn stack_report_html(report: &Bound<'_, PyAny>) -> PyResult<String> {
+    let json: String = report
+        .py()
+        .import("json")?
+        .call_method1("dumps", (report,))?
+        .extract()?;
+    let report = serde_json::from_str(&json).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    seiza_analysis::render_stack_html(&report).map_err(|e| PyValueError::new_err(e.to_string()))
+}
+/// Render a schema-1 collection of labeled completed-stack reports.
+#[pyfunction]
+fn stack_collection_html(report: &Bound<'_, PyAny>) -> PyResult<String> {
+    let json: String = report
+        .py()
+        .import("json")?
+        .call_method1("dumps", (report,))?
+        .extract()?;
+    let report = serde_json::from_str(&json).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    seiza_analysis::render_stack_collection_html(&report)
+        .map_err(|e| PyValueError::new_err(e.to_string()))
+}
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(analyze_project, m)?)?;
     m.add_function(wrap_pyfunction!(analysis_html, m)?)?;
+    m.add_function(wrap_pyfunction!(stack_report_html, m)?)?;
+    m.add_function(wrap_pyfunction!(stack_collection_html, m)?)?;
     Ok(())
 }

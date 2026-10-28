@@ -37,6 +37,7 @@ mod setup;
 mod sky_map;
 mod solve_field;
 mod stack;
+mod stack_report;
 mod stretch_command;
 mod worker;
 
@@ -410,6 +411,8 @@ impl From<DetectionBackendArg> for DetectBackend {
 enum Command {
     /// Measure a mono FITS/XISF project without producing a stack
     Analyze(analyze::AnalyzeArgs),
+    /// Combine saved stack reports without opening source images
+    StackReport(stack_report::StackReportArgs),
     /// Inspect JPEG EXIF metadata and display-oriented raster dimensions as JSON
     ImageInfo {
         /// Raster image file (JPEG, PNG, TIFF)
@@ -1300,6 +1303,7 @@ fn main() -> Result<()> {
         Command::Setup(args) => setup::run(args),
         Command::InstallSolveField { dir } => solve_field::install_layout(&dir),
         Command::Analyze(args) => analyze::run(args),
+        Command::StackReport(args) => stack_report::run(args),
         Command::ImageInfo { image } => {
             anyhow::ensure!(
                 !is_astronomy_image_path(&image),

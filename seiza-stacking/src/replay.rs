@@ -31,6 +31,9 @@ use std::path::{Path, PathBuf};
 /// calibration.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct FrameSource {
+    /// Reporting only; absent after restoring a saved context.
+    #[serde(skip)]
+    exposure_seconds: Option<f64>,
     path: PathBuf,
     /// The full scale a declared `0:1` range was mapped onto before
     /// calibration, when the source declared one.
@@ -51,6 +54,7 @@ impl FrameSource {
             .filter(|(low, high)| *low == 0.0 && high.is_finite() && *high > 0.0)
             .map(|(_, high)| high as f32);
         Some(Self {
+            exposure_seconds: frame.exposure_seconds.filter(|v| v.is_finite() && *v > 0.0),
             stamp: SourceStamp::of(&path),
             path,
             rescale_to,
@@ -179,6 +183,28 @@ pub(crate) struct Ledger {
 }
 
 impl Ledger {
+    pub(crate) fn report_records(&self) -> (Vec<crate::StackReportFrame>, Vec<serde_json::Value>) {
+        let frames = self
+            .frames
+            .iter()
+            .map(|f| crate::StackReportFrame {
+                source: f.source.as_ref().map(|s| s.path.clone()),
+                exposure_seconds: f.source.as_ref().and_then(|s| s.exposure_seconds),
+                calibration_index: f.calibration,
+                registration_rms_pixels: f.registration_rms_pixels,
+                weight: f.weighting.weight.clone(),
+                noise: f.weighting.noise.clone(),
+                mapping: serde_json::to_value(&f.mapping).expect("mapping serializes"),
+            })
+            .collect();
+        let calibrations = self
+            .calibrations
+            .iter()
+            .map(|c| serde_json::to_value(c).expect("calibration serializes"))
+            .collect();
+        (frames, calibrations)
+    }
+
     /// A ledger holding the reference frame, admitted under the first
     /// calibration set and `tolerances`.
     pub(crate) fn new(
@@ -3572,6 +3598,7 @@ mod tests {
                 .unwrap();
                 AdmittedFrame {
                     source: Some(FrameSource {
+                        exposure_seconds: None,
                         path: paths[source].clone(),
                         rescale_to: None,
                         stamp: SourceStamp::of(&paths[source]),
@@ -3700,6 +3727,7 @@ mod tests {
                 });
                 AdmittedFrame {
                     source: Some(FrameSource {
+                        exposure_seconds: None,
                         stamp: SourceStamp::of(&path),
                         path,
                         rescale_to: None,

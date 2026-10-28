@@ -1745,3 +1745,49 @@ and stellar SNR, plus gain-normalized noise. Raw noise/background retain native
 input units; normalized noise uses reference units. Missing measurements are
 null/None. See [measurement definitions](../seiza-analysis/README.md#measurements-and-physical-meaning)
 for population, units and limitations. Thresholds and rejection remain caller-owned.
+
+### Completed-stack reports
+
+Capture context at the same point as the result, before finishing or adding
+more frames. Reporting reads the result's existing maps; it does not reread
+images or run star detection.
+
+```python
+context = stacker.report_context()
+snapshot = stacker.reintegrate()  # or stacker.snapshot()
+report = snapshot.report(context)
+Path("stack.html").write_text(seiza.stack_report_html(report), encoding="utf-8")
+Path("stack.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+```
+
+`DrizzleResult.report(context)` uses accumulated drop area times frame weight,
+not frame counts. Final sample decisions refer to the reintegration grid.
+Both `report` methods accept no context when input history is unavailable.
+Use context from the same run; matching counts alone cannot establish identity.
+Restored contexts can lack exposures and registration measurements. In-memory
+inputs without file provenance have unknown exposures. The admitted ledger
+does not retain failed attempts; preserve push outcomes separately if needed.
+The standalone HTML has light/dark themes, bounded per-channel support maps,
+expandable input records, and a download of its embedded JSON.
+
+### Combining completed stacks
+
+Report generation is optional. A collection contains independent stack results; it
+never re-registers images or infers shared sky coverage. Labels are nonempty and
+unique (ignoring case and surrounding whitespace), and input order determines the
+initial selection. Missing filters and different output sizes are supported. RGB
+components remain inside their own stack, distinct from collection labels.
+
+The collection JSON is `{ "schema_version": 1, "title": "SHO", "stacks":
+[{ "label": "S", "report": <PostStackReport> }, ...] }`.
+The HTML embeds the validated collection for download, uses no network resources, and
+supports keyboard controls, search, 100-row pagination and printing all stacks.
+Rejected attempts appear when supplied in host provenance. Empty context remains
+unknown, not zero exposure. Maps are bounded summaries; this is not a crop tool.
+
+Rendering saved JSON does not reread images or compute checksums. Building the
+original post-stack report scans existing support maps and copies ledger metadata;
+CLI provenance additionally hashes input/output files. Reporting never enables
+reintegration by itself.
+
+Python: `html = seiza.stack_collection_html(collection)` returns a string and raises `ValueError` for invalid collections or nested reports.

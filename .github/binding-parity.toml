@@ -492,6 +492,11 @@ objects = [
 # ("solve_blind", "ParallaxVideo") or "Class.member" ("ParallaxVideo.reconfigure",
 # "LiveStacker.accepted_frames") — or why Python has none.
 [functions]
+seiza_live_stacker_report_context_json = "LiveStacker.report_context"
+seiza_stack_snapshot_report_json = "StackSnapshot.report"
+seiza_drizzle_result_report_json = "DrizzleResult.report"
+seiza_stack_report_html = "stack_report_html"
+seiza_stack_collection_html = "stack_collection_html"
 seiza_analyze_project_json = "analyze_project"
 seiza_analysis_html = "analysis_html"
 

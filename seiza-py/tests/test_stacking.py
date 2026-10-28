@@ -1891,3 +1891,46 @@ def test_a_rejected_cosmic_ray_cannot_spread_into_the_background():
     # These pixels lie outside the overlap and never saw the cosmic ray.
     halo = float(np.max(abs(error[70:102, 80:96])))
     assert halo < 0.1, f"rejected cosmic ray left a {halo:.3f} ADU background halo"
+
+
+def test_completed_stack_reports_preserve_output_and_final_decisions(tmp_path):
+    import json
+    paths = []
+    for index in range(3):
+        path = tmp_path / f"light-{index}.fits"
+        header = fits.Header()
+        header["EXPTIME"] = 60.0
+        fits.writeto(path, synthetic_star_field(), header)
+        paths.append(path)
+    stacker = seiza.LiveStacker(paths[0], options=no_adjustment_options())
+    for path in paths[1:]:
+        assert stacker.push_fits(path).accepted
+    context = stacker.report_context()
+    assert context["reference_image"] == str(paths[0])
+    assert len(context["frames"]) == 3
+    assert context["frames"][0]["exposure_seconds"] == 60.0
+    snapshot = stacker.snapshot()
+    before = snapshot.image.copy()
+    report = snapshot.report(context)
+    np.testing.assert_array_equal(snapshot.image, before)
+    assert report["stage"] == "online"
+    assert report["final_samples"] is None
+    assert len(report["support_map"]["values"]) <= 128 * 128
+    html = seiza.stack_report_html(report)
+    assert "Completed stack" in html
+    embedded = html.split('<script id="data" type="application/json">', 1)[1].split("</script>", 1)[0]
+    assert json.loads(embedded) == report
+    report["warnings"].append("</script><img onerror=alert(1)>")
+    assert "<img onerror" not in seiza.stack_report_html(report)
+    final = stacker.reintegrate()
+    final_report = final.report(context)
+    assert final_report["stage"] == "batch"
+    assert len(final_report["final_samples"]) == 3
+    _, drizzle = stacker.reintegrate_drizzled(scale=1)
+    drizzle_report = drizzle.report(context)
+    assert drizzle_report["support_map"]["quantity"] == "drop_area_times_frame_weight"
+    assert drizzle_report["rejection_map"] is None
+    assert len(drizzle_report["final_samples"]) == 3
+    context["accepted_frames"] += 1
+    with pytest.raises(seiza.StackError, match="counts"):
+        snapshot.report(context)
