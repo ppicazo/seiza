@@ -71,4 +71,4 @@ def test_report_levels_skip_reads_preserve_result_and_validate(tmp_path):
     assert seiza.prepare_stack_report(rich, level="cheap")["provenance"]["reporting"]["analysis"] is None
     assert REPORT["provenance"] is None
     html = seiza.stack_report_html(rich)
-    assert "Source analysis" in html and "__CHART_SCRIPT__" not in html
+    assert "Image quality & integration depth" in html and "__CHART_SCRIPT__" not in html
